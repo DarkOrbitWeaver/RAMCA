@@ -1,0 +1,13 @@
+  Determining projects to restore...
+/app/LocalIdeBridge/tests/LocalIdeBridge.Tests/LocalIdeBridge.Tests.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.11 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q [/app/LocalIdeBridge/LocalIdeBridge.sln]
+/app/LocalIdeBridge/src/LocalIdeBridge/LocalIdeBridge.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.11 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q [/app/LocalIdeBridge/LocalIdeBridge.sln]
+  All projects are up-to-date for restore.
+/app/LocalIdeBridge/tests/LocalIdeBridge.Tests/LocalIdeBridge.Tests.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.11 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q
+/app/LocalIdeBridge/src/LocalIdeBridge/LocalIdeBridge.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.11 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q
+  LocalIdeBridge -> /app/LocalIdeBridge/src/LocalIdeBridge/bin/Release/net10.0/LocalIdeBridge.dll
+  LocalIdeBridge.Tests -> /app/LocalIdeBridge/tests/LocalIdeBridge.Tests/bin/Release/net10.0/LocalIdeBridge.Tests.dll
+Test run for /app/LocalIdeBridge/tests/LocalIdeBridge.Tests/bin/Release/net10.0/LocalIdeBridge.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:    17, Skipped:     0, Total:    17, Duration: 7 s - LocalIdeBridge.Tests.dll (net10.0)
+VSTEST_ARTIFACTS_DIRECTORY environment variable was not found, falling back to a user-private temporary directory. This is most likely caused by an outdated Microsoft.NET.Test.Sdk package reference in the test project.

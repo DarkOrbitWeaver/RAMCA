@@ -1,0 +1,72 @@
+{
+  "measuredAtUtc": "2026-11-15T20:34:13.5957015+00:00",
+  "environment": {
+    "os": "Debian GNU/Linux 12 (bookworm)",
+    "architecture": "X64",
+    "dotnetVersion": "10.0.15",
+    "processorCount": 4,
+    "serverGc": false
+  },
+  "startup": {
+    "hostInitAndBindMs": 329.1
+  },
+  "idle": {
+    "sampleWindowMs": 3000,
+    "workingSetMb": 90.01,
+    "managedHeapMb": 1.23,
+    "cpuPercent": 0.258
+  },
+  "syntheticOperationScales": [
+    {
+      "cumulativeOperations": 100,
+      "batchOperations": 100,
+      "batchDurationMs": 424,
+      "opsPerSecond": 235.9,
+      "workingSetMb": 94.77,
+      "workingSetAfterGcMb": 94.77,
+      "managedHeapMb": 7.55,
+      "liveManagedHeapAfterGcMb": 1.29,
+      "sqliteStateDbMb": 0.14
+    },
+    {
+      "cumulativeOperations": 1000,
+      "batchOperations": 900,
+      "batchDurationMs": 3421.8,
+      "opsPerSecond": 263,
+      "workingSetMb": 121.27,
+      "workingSetAfterGcMb": 121.27,
+      "managedHeapMb": 7.21,
+      "liveManagedHeapAfterGcMb": 1.31,
+      "sqliteStateDbMb": 0.5
+    },
+    {
+      "cumulativeOperations": 10000,
+      "batchOperations": 9000,
+      "batchDurationMs": 31749.2,
+      "opsPerSecond": 283.5,
+      "workingSetMb": 140.47,
+      "workingSetAfterGcMb": 134.28,
+      "managedHeapMb": 14.08,
+      "liveManagedHeapAfterGcMb": 1.24,
+      "sqliteStateDbMb": 3.14
+    }
+  ],
+  "activeBuildOverhead": {
+    "dotnetBuildDurationMs": 1556,
+    "hostWorkingSetAfterBuildMb": 134.82,
+    "hostLiveManagedHeapMb": 1.28
+  },
+  "sessionSwitching": {
+    "sessionsTested": 25,
+    "avgSwitchAndInspectMs": 11.56,
+    "liveManagedHeapAfterSwitchesMb": 1.3
+  },
+  "logRetrieval10kLines": {
+    "readFirst100LinesMs": 2,
+    "readLast100LinesMs": 8.15
+  },
+  "shutdown": {
+    "cleanShutdownMs": 21.2,
+    "listenerClosedImmediately": true
+  }
+}

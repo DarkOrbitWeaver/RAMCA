@@ -1,0 +1,62 @@
+{
+  "name": "inspect-build-test-commit",
+  "maxParallelism": 4,
+  "steps": [
+    {
+      "id": "discover_projects",
+      "tool": "project_discover",
+      "arguments": {}
+    },
+    {
+      "id": "inspect_tree",
+      "tool": "repo_tree",
+      "arguments": { "maxDepth": 3, "maxEntries": 150 }
+    },
+    {
+      "id": "inspect_deps",
+      "tool": "dependency_inspect",
+      "arguments": {}
+    },
+    {
+      "id": "build",
+      "tool": "dotnet_build",
+      "arguments": { "configuration": "Debug" },
+      "dependsOn": ["discover_projects", "inspect_tree", "inspect_deps"],
+      "timeoutSeconds": 180
+    },
+    {
+      "id": "focused_tests",
+      "tool": "dotnet_test",
+      "arguments": { "noBuild": true, "filter": "Category!=Slow" },
+      "dependsOn": ["build"],
+      "runIf": "on_success",
+      "timeoutSeconds": 180
+    },
+    {
+      "id": "regression_tests",
+      "tool": "dotnet_test",
+      "arguments": { "noBuild": true },
+      "dependsOn": ["focused_tests"],
+      "runIf": "step_succeeded:focused_tests",
+      "timeoutSeconds": 300
+    },
+    {
+      "id": "commit_changes",
+      "tool": "git_commit",
+      "arguments": {
+        "message": "chore: verified automated build and regression tests",
+        "stageAll": true
+      },
+      "dependsOn": ["regression_tests"],
+      "runIf": "step_succeeded:regression_tests",
+      "checkpointAfter": true
+    },
+    {
+      "id": "collect_failure_status",
+      "tool": "git_status",
+      "arguments": { "recentCommits": 3 },
+      "dependsOn": ["build", "focused_tests"],
+      "runIf": "on_failure"
+    }
+  ]
+}

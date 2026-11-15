@@ -1,0 +1,14 @@
+[PASS] 0. Subprocess Cold Start: Host online at http://127.0.0.1:39551 in 527ms
+[PASS] 1. MCP Connect: Connected via official @modelcontextprotocol/sdk (sessionId=mcp_13b9aac7e9fac9a065ed316a197bf440073f3741e93849a5)
+[PASS] 2. MCP Discover: 52 tools, 3 resources, 1 prompts
+[PASS] 3. Select Workspace: Selected workspace '/tmp/lib-indep-mcp-lNhZ36/DisposableApp'.
+[PASS] 4. Read Source: Slugifier.cs sha256=bba51fabbf2f...
+[PASS] 5. Semantic Search: engine=roslyn-semantic, refs=1
+[PASS] 6. Apply Patch: Applied patch across 1 file(s) (+1/-2 lines).
+[PASS] 7. Compile: dotnet build succeeded in 1732ms (0 warning(s)).
+[PASS] 8. Run Verification: Program exited 0 with 'VERIFIED_OK: hello-local-ide-bridge'
+[PASS] 9. Local Git Commit: Committed 00ee1565 on main
+[PASS] 10. Final Status (MCP + HTTP + OpenAPI + CLI): clean tree, branch=main, totalCalls=10, openApiPaths=61
+[PASS] 11. Listener Shutdown: Server terminated cleanly and released port immediately
+
+ALL INDEPENDENT COMPATIBILITY CHECKS PASSED.

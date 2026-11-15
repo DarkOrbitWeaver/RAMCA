@@ -1,0 +1,25 @@
+# Build outputs
+bin/
+obj/
+publish/
+dist/
+
+# Runtime portable state (never commit secrets or runtime logs)
+config.json
+data/
+logs/
+cache/
+temp/
+sandbox/
+tools/*
+!tools/.gitkeep
+
+# Release archives built from source
+releases/*.zip
+
+# OS / editor artifacts
+.vs/
+*.user
+*.suo
+Thumbs.db
+.DS_Store

@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "setupCompleted": false,
+  "trustedWorkspaces": [],
+  "defaultWorkspace": null,
+  "connection": {
+    "mode": "localhost",
+    "listenHost": "127.0.0.1",
+    "port": 43170,
+    "useHttps": false,
+    "autoGenerateSelfSignedTls": false,
+    "tunnelProvider": "none",
+    "tunnelArguments": []
+  },
+  "autonomy": {
+    "allowFileWrites": true,
+    "allowFileDeletes": true,
+    "allowCommands": true,
+    "allowShellScripts": true,
+    "allowDependencyInstall": true,
+    "allowGitCommits": true,
+    "allowGitWorktrees": true,
+    "gitPushPolicy": "deny",
+    "redirectChildTempToPortable": false,
+    "allowedExecutables": [
+      "dotnet",
+      "git",
+      "msbuild",
+      "vstest.console",
+      "powershell",
+      "pwsh",
+      "cmd",
+      "npm",
+      "npx",
+      "node",
+      "nuget",
+      "csc"
+    ],
+    "blockedCommandPatterns": [
+      "format ",
+      "diskpart",
+      "bcdedit",
+      "cipher /w",
+      "reg delete",
+      "reg add hklm",
+      "sc create",
+      "sc delete",
+      "schtasks /create",
+      "netsh advfirewall",
+      "New-NetFirewallRule",
+      "Set-MpPreference",
+      "Add-MpPreference",
+      "DisableRealtimeMonitoring",
+      "Stop-Computer",
+      "Restart-Computer",
+      "shutdown ",
+      "Remove-Item -Recurse -Force C:\\",
+      "rm -rf /"
+    ]
+  },
+  "security": {
+    "requestsPerMinute": 600,
+    "failedAuthPerMinute": 20,
+    "maxRequestBodyBytes": 4194304,
+    "requireHttpsForRemote": true,
+    "allowedOrigins": []
+  },
+  "retention": {
+    "maxLogAgeDays": 14,
+    "maxSessionCount": 100,
+    "maxSingleLogBytes": 16777216,
+    "maxToolOutputChars": 16000,
+    "editJournalMaxEntries": 250
+  },
+  "resources": {
+    "maxConcurrentJobs": 4,
+    "maxParallelReadSteps": 4,
+    "defaultCommandTimeoutSeconds": 180,
+    "maxCommandTimeoutSeconds": 1800,
+    "childProcessMemoryLimitMb": 0,
+    "memoryCacheMaxEntries": 64,
+    "memoryCacheMaxBytes": 4194304,
+    "tuiEventBufferSize": 200
+  },
+  "tui": {
+    "theme": "minimal",
+    "refreshIntervalMs": 500
+  },
+  "integrations": {
+    "enableRoslynSemantic": true,
+    "enableOpenApi": true,
+    "enableMcpSseStream": true
+  }
+}

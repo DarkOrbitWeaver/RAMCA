@@ -1,0 +1,13 @@
+# OpenAI Codex CLI / IDE / Desktop configuration (~/.codex/config.toml)
+# Never paste the secret key into committed files. Set an environment variable first:
+#   PowerShell: $env:LOCALIDEBRIDGE_KEY = "<key-from-Copy-Key>"
+
+# Option A: Streamable HTTP against a running LocalIdeBridge supervisor (local or remote HTTPS)
+[mcp_servers.localidebridge]
+url = "http://127.0.0.1:43170/mcp"
+bearer_token_env_var = "LOCALIDEBRIDGE_KEY"
+
+# Option B: Local stdio spawn (comment out Option A if using Option B)
+# [mcp_servers.localidebridge]
+# command = "C:\\Tools\\LocalIdeBridge\\LocalIdeBridge.exe"
+# args = ["mcp-stdio", "--home", "C:\\Tools\\LocalIdeBridge"]
