@@ -1315,6 +1315,90 @@ public static partial class EditingTools
         return null;
     }
 
+    private static string RecoveryDisplacementPath(string full)
+        => Path.Combine(Path.GetDirectoryName(full)!, $".ramca-recovery-{Guid.NewGuid():N}.bak");
+
+    /// <summary>
+    /// Restores verified pre-image while first preserving the ACTUAL overwritten
+    /// target bytes in a same-volume file. If a late external edit wins the race,
+    /// restore the displaced bytes and fail closed; never delete the evidence.
+    /// </summary>
+    internal static void RestoreTrackedBackupSafely(string verifiedBackup, string target,
+        string expectedBeforeHash, string expectedAfterHash)
+    {
+        var dir = Path.GetDirectoryName(target) ?? throw new IOException("Recovery target has no parent.");
+        Directory.CreateDirectory(dir);
+        var staged = Path.Combine(dir, $".ramca-restore-{Guid.NewGuid():N}.tmp");
+        var displaced = RecoveryDisplacementPath(target);
+        try
+        {
+            using (var source = new FileStream(verifiedBackup, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var dest = new FileStream(staged, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 81920, FileOptions.WriteThrough))
+            {
+                source.CopyTo(dest, 81920);
+                dest.Flush(flushToDisk: true);
+            }
+            if (!string.Equals(ComputeFileSha256(staged), expectedBeforeHash, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Recovery snapshot changed while being staged; original remains untouched.");
+
+            if (!File.Exists(target))
+            {
+                // If an external editor creates the target here, this must fail,
+                // not overwrite a file created after preflight.
+                File.Move(staged, target, overwrite: false);
+                return;
+            }
+
+            if (OperatingSystem.IsWindows())
+                File.Replace(staged, target, displaced, ignoreMetadataErrors: false);
+            else
+            {
+                // Unix compatibility does not offer an atomic multi-name compare/
+                // replace primitive; preserve displaced content if the move fails.
+                File.Move(target, displaced, overwrite: false);
+                try { File.Move(staged, target, overwrite: false); }
+                catch
+                {
+                    try { File.Move(displaced, target, overwrite: false); } catch { }
+                    throw;
+                }
+            }
+
+            var displacedHash = ComputeFileSha256(displaced);
+            if (string.Equals(displacedHash, expectedAfterHash, StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(displaced);
+                return;
+            }
+
+            // A late save changed the bytes after the preflight. Restore the
+            // displaced human file, retaining the RAMCA preimage as forensic
+            // evidence if another writer races our corrective replacement.
+            var savedPreimage = RecoveryDisplacementPath(target);
+            try
+            {
+                if (OperatingSystem.IsWindows())
+                    File.Replace(displaced, target, savedPreimage, ignoreMetadataErrors: false);
+                else
+                {
+                    File.Move(target, savedPreimage, overwrite: false);
+                    File.Move(displaced, target, overwrite: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new IOException($"Recovery conflict: late external content preserved at '{displaced}', but could not be moved back to '{target}': {ex.Message}", ex);
+            }
+
+            throw new IOException($"Recovery conflict: '{target}' changed during rollback; external content was restored. Verified RAMCA snapshot retained at '{verifiedBackup}' and '{savedPreimage}'.");
+        }
+        finally
+        {
+            if (File.Exists(staged)) try { File.Delete(staged); } catch (IOException) { }
+        }
+    }
+
     private static void RecoverTransaction(PortablePaths paths, WorkspaceGuard guard, PatchTransaction tx, StateDatabase db)
     {
         using var workspaceLease = guard.UseInvocationWorkspace(tx.Workspace);
@@ -1349,10 +1433,25 @@ public static partial class EditingTools
                 item.BeforeHash == "none" && actual == "deleted")
                 continue;
             if (item.BeforeHash == "none")
-                File.Delete(full);
+            {
+                // Move first, verify displaced bytes, and only then delete.
+                // A late external save must never be irreversibly removed.
+                if (actual != "deleted")
+                {
+                    var displaced = RecoveryDisplacementPath(full);
+                    File.Move(full, displaced, overwrite: false);
+                    if (!string.Equals(ComputeFileSha256(displaced), item.AfterHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { File.Move(displaced, full, overwrite: false); } catch { }
+                        throw new IOException($"Recovery encountered a late external modification of '{item.RelativePath}'. Preserved displaced bytes at '{displaced}' if restoration failed.");
+                    }
+                    File.Delete(displaced);
+                }
+            }
             else
-                PortablePaths.AtomicRestoreBackupFile(
-                    ResolvePendingBackupPath(paths, tx, item) ?? throw new IOException("Recovery snapshot not found."), full);
+                RestoreTrackedBackupSafely(
+                    ResolvePendingBackupPath(paths, tx, item) ?? throw new IOException("Recovery snapshot not found."),
+                    full, item.BeforeHash, item.AfterHash);
         }
         foreach (var (item, _) in targets)
             if (db.GetEdit(item.EditId) is not null)
