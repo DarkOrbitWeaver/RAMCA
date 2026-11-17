@@ -241,6 +241,10 @@ public sealed class StateDatabase : IDisposable
                 );
                 CREATE INDEX IF NOT EXISTS idx_edit_journal_session ON edit_journal(session_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS edit_reversal_links (
+                    original_edit_id TEXT PRIMARY KEY,
+                    inverse_edit_id TEXT NOT NULL UNIQUE
+                );
                 CREATE TABLE IF NOT EXISTS git_checkpoints (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -898,6 +902,83 @@ public sealed class StateDatabase : IDisposable
                 del.Parameters.AddWithValue("$id", item.Id);
                 del.ExecuteNonQuery();
             }
+        }
+    }
+
+    /// <summary>
+    /// Inverse record + original reverted flag are one SQLite transaction.
+    /// Filesystem recovery still relies on the durable edit manifest.
+    /// </summary>
+    public void RecordEditAndRevert(EditJournalRecord inverse, string originalEditId)
+    {
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var tx = conn.BeginTransaction();
+            using (var insert = conn.CreateCommand())
+            {
+                insert.Transaction = tx;
+                insert.CommandText = """
+                    INSERT INTO edit_journal(edit_id,session_id,workspace,relative_path,operation,
+                        before_sha256,after_sha256,existed_before,backup_file_path,lines_added,
+                        lines_removed,reverted,created_at)
+                    VALUES($id,$sid,$ws,$path,$op,$before,$after,$existed,$backup,$add,$rem,0,$now);
+                    """;
+                insert.Parameters.AddWithValue("$id", inverse.EditId);
+                insert.Parameters.AddWithValue("$sid", inverse.SessionId);
+                insert.Parameters.AddWithValue("$ws", inverse.Workspace);
+                insert.Parameters.AddWithValue("$path", inverse.RelativePath);
+                insert.Parameters.AddWithValue("$op", inverse.Operation);
+                insert.Parameters.AddWithValue("$before", inverse.BeforeSha256);
+                insert.Parameters.AddWithValue("$after", inverse.AfterSha256);
+                insert.Parameters.AddWithValue("$existed", inverse.ExistedBefore ? 1 : 0);
+                insert.Parameters.AddWithValue("$backup", inverse.BackupFilePath is null ? DBNull.Value : inverse.BackupFilePath);
+                insert.Parameters.AddWithValue("$add", inverse.LinesAdded);
+                insert.Parameters.AddWithValue("$rem", inverse.LinesRemoved);
+                insert.Parameters.AddWithValue("$now", inverse.CreatedAtUtc.ToString("O"));
+                insert.ExecuteNonQuery();
+            }
+            using (var mark = conn.CreateCommand())
+            {
+                mark.Transaction = tx;
+                mark.CommandText = "UPDATE edit_journal SET reverted=1 WHERE edit_id=$id AND reverted=0;";
+                mark.Parameters.AddWithValue("$id", originalEditId);
+                if (mark.ExecuteNonQuery() != 1)
+                    throw new InvalidOperationException($"Original edit '{originalEditId}' already reverted or unavailable.");
+            }
+            using (var link = conn.CreateCommand())
+            {
+                link.Transaction = tx;
+                link.CommandText = "INSERT INTO edit_reversal_links(original_edit_id,inverse_edit_id) VALUES($original,$inverse);";
+                link.Parameters.AddWithValue("$original", originalEditId);
+                link.Parameters.AddWithValue("$inverse", inverse.EditId);
+                link.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
+    public void ReconcileRolledBackInverse(string inverseEditId, string originalEditId)
+    {
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var tx = conn.BeginTransaction();
+            foreach (var statement in new[]
+            {
+                "UPDATE edit_journal SET reverted=1 WHERE edit_id=$inverse;",
+                "UPDATE edit_journal SET reverted=0 WHERE edit_id=$original;",
+                "DELETE FROM edit_reversal_links WHERE original_edit_id=$original AND inverse_edit_id=$inverse;"
+            })
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = statement;
+                cmd.Parameters.AddWithValue("$original", originalEditId);
+                cmd.Parameters.AddWithValue("$inverse", inverseEditId);
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
         }
     }
 
