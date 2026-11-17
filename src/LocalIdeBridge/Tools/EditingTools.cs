@@ -372,9 +372,30 @@ public static partial class EditingTools
                 // file headers / repeated paths, compute all outputs, and preserve every source.
                 var staged = new List<(string RelPath, string FullPath, string Op, LoadedTextFile? Before, string? NewContent, Encoding Enc, int Added, int Removed)>();
                 var seen = new HashSet<string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+                if (args["expectedSha256Map"] is not null && args["expectedSha256Map"] is not JsonObject)
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "expectedSha256Map must be a JSON object."));
                 var shaMap = args["expectedSha256Map"] as JsonObject;
                 if (expectedSha is not null && (filePatches.Count != 1 || shaMap is not null))
                     return Task.FromResult(ToolResult.Fail("invalid_arguments", "A scalar expectedSha256 is permitted only for a single-file patch without expectedSha256Map."));
+                static bool ValidSha(string? value) => value is { Length: 64 } &&
+                    value.All(char.IsAsciiHexDigit);
+                if (expectedSha is not null && !ValidSha(expectedSha))
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "expectedSha256 must contain exactly 64 hex digits."));
+                var normalizedMap = new Dictionary<string, string>(
+                    OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+                if (shaMap is not null)
+                {
+                    foreach (var (key, value) in shaMap)
+                    {
+                        if (value?.GetValueKind() != JsonValueKind.String ||
+                            !ValidSha(value.GetValue<string>()))
+                            return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Invalid expected SHA-256 for '{key}'."));
+                        var resolved = guard.ResolvePath(key);
+                        var cleanKey = guard.GetRelativePathUnix(ws, resolved);
+                        if (!normalizedMap.TryAdd(cleanKey, value.GetValue<string>()))
+                            return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Duplicate normalized SHA-256 key '{cleanKey}'."));
+                    }
+                }
 
                 foreach (var fp in filePatches)
                 {
@@ -399,7 +420,7 @@ public static partial class EditingTools
                     {
                         if (File.Exists(full))
                             return Task.FromResult(ToolResult.Fail("precondition_failed", $"File '{cleanRel}' already exists."));
-                        if (shaMap is not null && shaMap.ContainsKey(cleanRel))
+                        if (normalizedMap.ContainsKey(cleanRel))
                             return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Cannot supply a prior hash for new file '{cleanRel}'."));
                         var applied = ApplyHunksToLines([], fp.Hunks, cleanRel, out var added, out var removed, out var err);
                         if (err is not null) return Task.FromResult(ToolResult.Fail("precondition_failed", err));
@@ -412,8 +433,8 @@ public static partial class EditingTools
                             return Task.FromResult(ToolResult.Fail("not_found", $"File '{cleanRel}' does not exist."));
                         var before = LoadTextFile(full);
                         var requiredSha = filePatches.Count == 1 ? expectedSha : null;
-                        if (shaMap is not null && shaMap.TryGetPropertyValue(cleanRel, out var mapHash))
-                            requiredSha = mapHash?.GetValue<string>();
+                        if (normalizedMap.TryGetValue(cleanRel, out var mapHash))
+                            requiredSha = mapHash;
                         if (!string.IsNullOrWhiteSpace(requiredSha) &&
                             !string.Equals(before.Sha256, requiredSha, StringComparison.OrdinalIgnoreCase))
                             return Task.FromResult(ToolResult.Fail("stale_file", $"File '{cleanRel}' no longer matches SHA-256 precondition."));
@@ -425,6 +446,14 @@ public static partial class EditingTools
                         staged.Add((cleanRel, full, isDelete ? "patch_delete" : "apply_patch", before, newContent, before.Encoding, added, removed));
                     }
                 }
+
+                // Reject unused map keys before any backup or filesystem write.
+                var patchTargets = new HashSet<string>(staged.Select(s => s.RelPath),
+                    OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+                foreach (var key in normalizedMap.Keys)
+                    if (!patchTargets.Contains(key))
+                        return Task.FromResult(ToolResult.Fail("invalid_arguments",
+                            $"expectedSha256Map contains an unused path '{key}'."));
 
                 // Persist a recovery manifest and *all* durable backups BEFORE the first write.
                 // On crash the next startup rolls back only matching pre/post-image hashes; it
