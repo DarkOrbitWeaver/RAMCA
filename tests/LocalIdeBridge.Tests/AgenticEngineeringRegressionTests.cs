@@ -22,7 +22,7 @@ public sealed class AgenticEngineeringRegressionTests
         var patch = $"--- a/a.txt\n+++ b/a.txt\n@@ -{oldStart},0 +{newStart},1 @@\n+INSERT\n";
         var r = await sb.Host.Registry.InvokeAsync("apply_patch", new JsonObject { ["patch"] = patch });
         Assert.True(r.Success, r.ErrorMessage);
-        Assert.Equal(expected.Replace("\n", Environment.NewLine), await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "a.txt")));
+        Assert.Equal(expected, await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "a.txt")));
     }
 
     [Fact]
