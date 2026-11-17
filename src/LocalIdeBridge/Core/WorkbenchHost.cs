@@ -104,6 +104,7 @@ public sealed class WorkbenchHost : IAsyncDisposable
             Registry.RegisterRange(CodeIntel.CreateTools());
             Registry.RegisterRange(EditingTools.Create(Paths, Config, Guard, Database, CodeIntel.InvalidateFile));
             Registry.RegisterRange(ContextReadTools.Create(Guard, Config));
+            Registry.RegisterRange(ProjectContextTools.Create(Guard, Registry));
             Registry.RegisterRange(BuildGitCommandTools.Create(Paths, Config, Guard, Database, Logs, Runner, ProcessSupervisor));
             Registry.RegisterRange(JobAndWorkflowTools.Create(Guard, Database, Jobs, Workflows));
             Registry.RegisterRange(OperationLedgerTools.Create(Guard, Database, Registry));
