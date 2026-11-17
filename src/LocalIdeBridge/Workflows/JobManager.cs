@@ -195,6 +195,7 @@ public sealed class JobManager : IDisposable
         finally
         {
             SignalChange(jobId);
+            _jobSignals.TryRemove(jobId, out _); // No per-completed-job resident waiter.
             if (gateAcquired)
             {
                 try { _concurrencyGate.Release(); }

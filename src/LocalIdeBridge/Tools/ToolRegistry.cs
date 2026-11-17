@@ -10,6 +10,10 @@ namespace LocalIdeBridge.Tools;
 /// Enforces pause state, workspace write locks, structured error mapping, bounded audit persistence,
 /// and credential redaction.
 /// </summary>
+public sealed record ToolCompletionReceipt(
+    long CallId, string SessionId, string Workspace, string ToolName,
+    ToolResult Result, long DurationMs, DateTimeOffset CompletedAtUtc);
+
 public sealed class ToolRegistry
 {
     private readonly Dictionary<string, ToolDefinition> _tools = new(StringComparer.OrdinalIgnoreCase);
@@ -37,6 +41,7 @@ public sealed class ToolRegistry
     public IReadOnlyList<ToolDefinition> All => _ordered;
 
     public event Action<string, ToolResult, long>? OnToolCompleted;
+    public event Action<ToolCompletionReceipt>? OnToolCompletedExact;
 
     public ToolRegistry(WorkspaceGuard guard, StateDatabase db, RedactingLogger logger, CredentialStore credentials)
     {
@@ -147,9 +152,10 @@ public sealed class ToolRegistry
             Interlocked.Increment(ref _totalErrors);
 
         var ws = workspace ?? "";
+        long recordedCallId;
         try
         {
-            _db.RecordToolCall(tool.Name, tool.Category, ws, result.Success, sw.ElapsedMilliseconds, result.Summary, result.ErrorCode, ctx.SessionId);
+            recordedCallId = _db.RecordToolCall(tool.Name, tool.Category, ws, result.Success, sw.ElapsedMilliseconds, result.Summary, result.ErrorCode, ctx.SessionId);
         }
         catch (Exception ex)
         {
@@ -167,6 +173,8 @@ public sealed class ToolRegistry
         else
             _logger.Error(tool.Category, $"{tool.Name} failed [{result.ErrorCode}]: {result.ErrorMessage}", null, sw.ElapsedMilliseconds);
 
+        try { OnToolCompletedExact?.Invoke(new ToolCompletionReceipt(
+            recordedCallId, ctx.SessionId, ws, tool.Name, result, sw.ElapsedMilliseconds, DateTimeOffset.UtcNow)); } catch { }
         try { OnToolCompleted?.Invoke(tool.Name, result, sw.ElapsedMilliseconds); } catch { }
         return result;
     }

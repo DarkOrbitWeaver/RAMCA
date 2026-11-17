@@ -501,7 +501,7 @@ public sealed class StateDatabase : IDisposable
         return list;
     }
 
-    public void RecordToolCall(string toolName, string category, string workspace, bool success, long durationMs, string summary, string? errorCode = null, string? sessionId = null)
+    public long RecordToolCall(string toolName, string category, string workspace, bool success, long durationMs, string summary, string? errorCode = null, string? sessionId = null)
     {
         var safeSummary = _credentials.Redact(summary);
         if (safeSummary.Length > 500) safeSummary = safeSummary[..500] + "...";
@@ -533,6 +533,9 @@ public sealed class StateDatabase : IDisposable
             cmd.Parameters.AddWithValue("$errInc", success ? 0 : 1);
             cmd.Parameters.AddWithValue("$now", now);
             cmd.ExecuteNonQuery();
+            using var identity = conn.CreateCommand();
+            identity.CommandText = "SELECT last_insert_rowid();";
+            return Convert.ToInt64(identity.ExecuteScalar());
         }
     }
 

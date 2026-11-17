@@ -71,6 +71,10 @@ public static class SessionChangeProjection
                     { unknown++; continue; }
                 }
                 var after = fileExists ? ReadSmallBytes(full, maxFileBytes) : [];
+                if (fileExists && !string.Equals(
+                    Convert.ToHexStringLower(SHA256.HashData(after)), last.AfterSha256,
+                    StringComparison.OrdinalIgnoreCase))
+                { unknown++; continue; } // File changed during the comparison.
                 if (before.AsSpan().SequenceEqual(after)) continue; // Reverts count as zero net.
 
                 var beforeLines = DecodeTextLines(before);
@@ -137,7 +141,9 @@ public static class SessionChangeProjection
             new UTF8Encoding(false, true), detectEncodingFromByteOrderMarks: true);
         var text = reader.ReadToEnd();
         if (text.Length == 0) return [];
-        return text.Replace("\r\n", "\n").Replace('\r', '\n').TrimEnd('\n').Split('\n');
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        var lines = normalized.Split('\n');
+        return normalized.EndsWith('\n') ? lines[..^1] : lines;
     }
 
     private static int LongestCommonSubsequence(string[] a, string[] b, CancellationToken ct)

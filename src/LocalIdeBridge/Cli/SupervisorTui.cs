@@ -115,17 +115,17 @@ public sealed class SupervisorTui
         }
 
         void OnActivity(Core.ActivityEvent _) => SignalRedraw();
-        void OnToolCompleted(string name, ToolResult result, long elapsed)
+        void OnToolCompleted(ToolCompletionReceipt receipt)
         {
-            CaptureToolResult(name, result, elapsed);
-            if (name is "create_file" or "replace_range" or "apply_patch" or
+            CaptureExactToolResult(receipt);
+            if (receipt.ToolName is "create_file" or "replace_range" or "apply_patch" or
                 "delete_file" or "revert_edit" or "rename_file" or "run_command" or
                 "dotnet_build" or "dotnet_test" or "git_commit")
                 QueueChangeSummaryRefresh(SignalRedraw);
             SignalRedraw();
         }
         _host.Logger.OnEvent += OnActivity;
-        _host.Registry.OnToolCompleted += OnToolCompleted;
+        _host.Registry.OnToolCompletedExact += OnToolCompleted;
 
         // Enter alternate screen buffer and hide cursor for clean, flicker-free rendering.
         Console.Write("\x1b[?1049h\x1b[?25l");
@@ -138,6 +138,10 @@ public sealed class SupervisorTui
 
             while (!ct.IsCancellationRequested)
             {
+                // An explicit session switch changes the viewed session but does
+                // not reassign any in-flight operation's immutable owner.
+                if (_sessionSummary?.SessionId != _host.Database.ActiveSessionId)
+                    QueueChangeSummaryRefresh(SignalRedraw);
                 // Process any buffered user keystrokes immediately.
                 while (Console.KeyAvailable)
                 {
@@ -170,7 +174,7 @@ public sealed class SupervisorTui
         finally
         {
             _host.Logger.OnEvent -= OnActivity;
-            _host.Registry.OnToolCompleted -= OnToolCompleted;
+            _host.Registry.OnToolCompletedExact -= OnToolCompleted;
             Console.Write("\x1b[0m\x1b[?25h\x1b[?1049l");
         }
     }
@@ -381,23 +385,33 @@ public sealed class SupervisorTui
         catch { return null; }
     }
 
+    // Legacy testing hook: only use a temporal match if the caller has no
+    // exact durable receipt. Real host events supply the inserted call ID.
     private void CaptureToolResult(string name, ToolResult result, long durationMs)
+    {
+        if (!HasInterestingResult(name)) return;
+        var now = DateTimeOffset.UtcNow;
+        var summary = _host.Credentials.Redact(result.Summary);
+        var matches = _host.Database.ListToolCalls(null, 30)
+            .Where(c => c.ToolName.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                c.Summary == summary && Math.Abs(c.DurationMs - durationMs) <= 2 &&
+                (now - c.CreatedAtUtc).Duration() <= TimeSpan.FromSeconds(5))
+            .ToArray();
+        if (matches.Length != 1) return;
+        StoreCapturedResult(name, result, durationMs, matches[0].Id, matches[0].CreatedAtUtc);
+    }
+
+    private void CaptureExactToolResult(ToolCompletionReceipt receipt) =>
+        StoreCapturedResult(receipt.ToolName, receipt.Result, receipt.DurationMs,
+            receipt.CallId, receipt.CompletedAtUtc);
+
+    private void StoreCapturedResult(string name, ToolResult result, long durationMs,
+        long recordedCallId, DateTimeOffset timestamp)
     {
         if (!HasInterestingResult(name)) return;
         try
         {
-            // RecordToolCall runs before OnToolCompleted. Match an unambiguous
-            // durable row by tool, summary and elapsed time. Never attribute a
-            // result to a guessed call when concurrent operations look alike.
-            var now = DateTimeOffset.UtcNow;
             var summary = _host.Credentials.Redact(result.Summary);
-            var matches = _host.Database.ListToolCalls(null, 30)
-                .Where(c => c.ToolName.Equals(name, StringComparison.OrdinalIgnoreCase) &&
-                    c.Summary == summary && Math.Abs(c.DurationMs - durationMs) <= 2 &&
-                    (now - c.CreatedAtUtc).Duration() <= TimeSpan.FromSeconds(5))
-                .ToArray();
-            if (matches.Length != 1) return;
-
             string? Safe(string? value, int max = 5000)
             {
                 if (value is null) return null;
@@ -409,7 +423,7 @@ public sealed class SupervisorTui
             var passed = ReadResultField(data, "passed");
             if (passed is not null)
                 tests = $"{passed} passed, {ReadResultField(data, "failed") ?? "?"} failed, {ReadResultField(data, "skipped") ?? "?"} skipped";
-            var capture = new CapturedOperation(matches[0].Id, matches[0].CreatedAtUtc,
+            var capture = new CapturedOperation(recordedCallId, timestamp,
                 name, result.Success, summary,
                 Safe(ReadResultField(data, "outputExcerpt")),
                 Safe(ReadResultField(data, "diff")),
