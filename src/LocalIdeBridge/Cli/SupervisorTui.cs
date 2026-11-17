@@ -44,6 +44,41 @@ public sealed class SupervisorTui
     private readonly object _resultsLock = new();
     private readonly Queue<CapturedOperation> _recentResults = new();
     private const int MaxCapturedOperations = 48;
+    private SessionChangeSummary? _sessionSummary;
+    private int _changeGeneration;
+    private int _changeWorkerRunning;
+
+    private void QueueChangeSummaryRefresh(Action notify)
+    {
+        Interlocked.Increment(ref _changeGeneration);
+        if (Interlocked.CompareExchange(ref _changeWorkerRunning, 1, 0) != 0) return;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                for (var iterations = 0; iterations < 4; iterations++)
+                {
+                    var generation = Volatile.Read(ref _changeGeneration);
+                    var session = _host.Database.ActiveSessionId;
+                    var snapshot = SessionChangeProjection.Compute(
+                        _host.Paths, _host.Guard, _host.Database, session);
+                    _host.Database.SaveSessionChangeSummary(snapshot);
+                    _sessionSummary = snapshot;
+                    notify();
+                    if (generation == Volatile.Read(ref _changeGeneration)) break;
+                }
+            }
+            catch (Exception ex)
+            {
+                _statusBanner = "Session diff unavailable: " + ex.GetType().Name;
+                notify();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _changeWorkerRunning, 0);
+            }
+        });
+    }
 
     private string _statusBanner = "Ready. Press [I] to copy AI instructions, [E] endpoint, [K] key, or [Q] to quit.";
     private string? _cachedGitBranch;
@@ -83,6 +118,10 @@ public sealed class SupervisorTui
         void OnToolCompleted(string name, ToolResult result, long elapsed)
         {
             CaptureToolResult(name, result, elapsed);
+            if (name is "create_file" or "replace_range" or "apply_patch" or
+                "delete_file" or "revert_edit" or "rename_file" or "run_command" or
+                "dotnet_build" or "dotnet_test" or "git_commit")
+                QueueChangeSummaryRefresh(SignalRedraw);
             SignalRedraw();
         }
         _host.Logger.OnEvent += OnActivity;
@@ -93,6 +132,8 @@ public sealed class SupervisorTui
         try
         {
             RefreshGitBranchIfStale(force: true);
+            _sessionSummary = _host.Database.GetSessionChangeSummary(_host.Database.ActiveSessionId);
+            QueueChangeSummaryRefresh(SignalRedraw);
             RenderFrame();
 
             while (!ct.IsCancellationRequested)
@@ -300,6 +341,7 @@ public sealed class SupervisorTui
         try
         {
             _host.Guard.SelectWorkspace(next.Path);
+            _sessionSummary = null;
             RefreshGitBranchIfStale(force: true);
             _statusBanner = $"Switched active workspace to {next.Path}.";
         }
@@ -530,13 +572,25 @@ public sealed class SupervisorTui
         Line($"Endpoint  : {Style(_host.Instructions.GetMcpEndpoint(), UiTone.Accent)}");
         Line($"Key       : {_host.Credentials.GetMasked()}  Session: {currentSession}");
         Line($"Workspace : {workspace}  Branch: {_cachedGitBranch ?? "-"}");
+        var sessionDiff = _sessionSummary?.SessionId == currentSession ? _sessionSummary : null;
+        if (sessionDiff is null)
+        {
+            Line(Style("Session changes: not yet observed / baseline unavailable", UiTone.Warning));
+            Line(Style("  First-touch coverage only; shell and external edits are not attributed.", UiTone.Muted));
+        }
+        else
+        {
+            var count = sessionDiff.ChangedFiles;
+            Line($"Session tracked diff  {count} files   {Style($"+{sessionDiff.AddedLines}", UiTone.Good)}   {Style($"-{sessionDiff.RemovedLines}", UiTone.Error)}   Net {Style($"{sessionDiff.AddedLines - sessionDiff.RemovedLines:+#;-#;0}", UiTone.Accent)}  {Style("[PARTIAL]", UiTone.Warning)}");
+            Line(Style($"  Created {sessionDiff.CreatedFiles}  Modified {sessionDiff.ModifiedFiles}  Deleted {sessionDiff.DeletedFiles}  Unknown {sessionDiff.UnknownFiles}  ·  {sessionDiff.RecordedOperations} edits  ·  As of {sessionDiff.ObservedAtUtc.ToLocalTime():HH:mm:ss} (first touch only)", UiTone.Muted));
+        }
         Line(Style(new string('─', Math.Max(1, w - 1)), UiTone.Muted));
         string Tab(ViewTab tab, string label) =>
             _activeTab == tab ? (_useColor ? $"\x1b[1m[{label}]\x1b[0m" : $"[{label}]")
                               : Style($" {label} ", UiTone.Muted);
         Line($"{Tab(ViewTab.Overview, "1:Activity")} {Tab(ViewTab.Edits, "2:Changes")} {Tab(ViewTab.Jobs, "3:Commands")} {Tab(ViewTab.GitAndSessions, "4:Git")} {Tab(ViewTab.Errors, "5:Errors")}");
 
-        var bodyRows = Math.Max(1, h - 11);
+        var bodyRows = Math.Max(1, h - 13);
         var rows = BuildVisibleRows(bodyRows, w - 2);
         for (var i = 0; i < bodyRows; i++)
         {

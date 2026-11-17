@@ -267,6 +267,12 @@ public sealed class StateDatabase : IDisposable
                 );
                 CREATE INDEX IF NOT EXISTS idx_workflows_session ON workflow_runs(session_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS session_change_summaries (
+                    session_id TEXT PRIMARY KEY,
+                    summary_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS operation_ledger (
                     operation_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -949,6 +955,61 @@ public sealed class StateDatabase : IDisposable
         return list;
     }
 
+    /// <summary>Finite edit history for verified first-touch session diffs (oldest first).</summary>
+    public IReadOnlyList<EditJournalRecord> ListSessionEdits(string sessionId, int maxRows = 2500)
+    {
+        maxRows = Math.Clamp(maxRows, 1, 5001);
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT edit_id, session_id, workspace, relative_path, operation, before_sha256, after_sha256,
+                   existed_before, backup_file_path, lines_added, lines_removed, reverted, created_at
+            FROM edit_journal WHERE session_id = $sid ORDER BY rowid ASC LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$sid", sessionId);
+        cmd.Parameters.AddWithValue("$limit", maxRows);
+        var entries = new List<EditJournalRecord>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            entries.Add(new EditJournalRecord(
+                reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4),
+                reader.GetString(5), reader.GetString(6), reader.GetInt32(7) == 1,
+                reader.IsDBNull(8) ? null : reader.GetString(8),
+                reader.GetInt32(9), reader.GetInt32(10), reader.GetInt32(11) == 1,
+                DateTimeOffset.Parse(reader.GetString(12))));
+        return entries;
+    }
+
+    public void SaveSessionChangeSummary(SessionChangeSummary summary)
+    {
+        var json = JsonSerializer.Serialize(summary, AppConfig.JsonOptions);
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO session_change_summaries(session_id, summary_json, observed_at)
+                VALUES($sid, $json, $now)
+                ON CONFLICT(session_id) DO UPDATE
+                SET summary_json = excluded.summary_json, observed_at = excluded.observed_at;
+                """;
+            cmd.Parameters.AddWithValue("$sid", summary.SessionId);
+            cmd.Parameters.AddWithValue("$json", json);
+            cmd.Parameters.AddWithValue("$now", summary.ObservedAtUtc.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public SessionChangeSummary? GetSessionChangeSummary(string sessionId)
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT summary_json FROM session_change_summaries WHERE session_id = $sid;";
+        cmd.Parameters.AddWithValue("$sid", sessionId);
+        var json = cmd.ExecuteScalar() as string;
+        return json is null ? null : JsonSerializer.Deserialize<SessionChangeSummary>(json, AppConfig.JsonOptions);
+    }
+
     public void RecordGitCheckpoint(GitCheckpointRecord cp)
     {
         lock (_writeLock)
@@ -1108,6 +1169,7 @@ public sealed class StateDatabase : IDisposable
                 DELETE FROM tool_calls WHERE session_id = $sid;
                 DELETE FROM edit_journal WHERE session_id = $sid;
                 DELETE FROM git_checkpoints WHERE session_id = $sid;
+                DELETE FROM session_change_summaries WHERE session_id = $sid;
                 DELETE FROM workflow_runs WHERE session_id = $sid;
                 DELETE FROM log_index WHERE session_id = $sid;
                 DELETE FROM sessions WHERE id = $sid;
