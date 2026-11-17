@@ -355,6 +355,9 @@ public sealed class SearchAndIntelTools
                 if (string.IsNullOrWhiteSpace(file) && string.IsNullOrWhiteSpace(symbolName))
                     throw new ArgumentException("Provide either 'symbolName' or ('file', 'line', 'column').");
 
+                if (!_config.Integrations.EnableRoslynSemantic)
+                    return Task.FromResult(ToolResult.Fail("semantic_disabled",
+                        "Roslyn semantic analysis is disabled by integrations.enableRoslynSemantic; no semantic compilation was constructed."));
                 var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct);
                 if (treeMap.Count > 0)
                 {
@@ -444,6 +447,9 @@ public sealed class SearchAndIntelTools
                 if (string.IsNullOrWhiteSpace(file) && string.IsNullOrWhiteSpace(symbolName))
                     throw new ArgumentException("Provide either 'symbolName' or ('file', 'line', 'column').");
 
+                if (!_config.Integrations.EnableRoslynSemantic)
+                    return Task.FromResult(ToolResult.Fail("semantic_disabled",
+                        "Roslyn semantic analysis is disabled by integrations.enableRoslynSemantic; no semantic compilation was constructed."));
                 var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct);
                 if (treeMap.Count > 0)
                 {
@@ -544,6 +550,9 @@ public sealed class SearchAndIntelTools
                 var symbolName = args.RequireString("symbolName");
                 var maxResults = Math.Clamp(args.OptionalInt("maxResults", 50), 1, 100);
 
+                if (!_config.Integrations.EnableRoslynSemantic)
+                    return Task.FromResult(ToolResult.Fail("semantic_disabled",
+                        "Roslyn semantic analysis is disabled by integrations.enableRoslynSemantic; no semantic compilation was constructed."));
                 var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct);
                 if (treeMap.Count == 0)
                     return Task.FromResult(ToolResult.Ok("No C# source files in workspace for semantic implementation analysis.",
@@ -646,6 +655,9 @@ public sealed class SearchAndIntelTools
                 var typeName = args.RequireString("typeName");
                 var memberName = args.OptionalString("memberName");
 
+                if (!_config.Integrations.EnableRoslynSemantic)
+                    return Task.FromResult(ToolResult.Fail("semantic_disabled",
+                        "Roslyn semantic analysis is disabled by integrations.enableRoslynSemantic."));
                 var (compilation, _) = BuildWorkspaceCompilation(ws, ct);
                 var match = compilation.GetTypeByMetadataName(typeName)
                     ?? EnumerateAllSourceTypes(compilation.GlobalNamespace, ct).FirstOrDefault(t =>
@@ -719,6 +731,9 @@ public sealed class SearchAndIntelTools
 
                 if (mode == "roslyn")
                 {
+                    if (!_config.Integrations.EnableRoslynSemantic)
+                        return ToolResult.Fail("semantic_disabled",
+                            "Roslyn semantic compilation is disabled. Use compiler_diagnostics mode='build' instead.");
                     var (comp, treeMap) = BuildWorkspaceCompilation(ws, ct);
                     var diags = comp.GetDiagnostics(ct)
                         .Where(d => d.Severity == DiagnosticSeverity.Error || (includeWarnings && d.Severity == DiagnosticSeverity.Warning))
