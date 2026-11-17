@@ -92,21 +92,36 @@ public static class WorkspaceTools
                 {
                     try
                     {
-                        var br = await runner.RunAsync("git", "git", ["symbolic-ref", "--quiet", "--short", "HEAD"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 5000);
-                        if (br.ExitCode != 0 || br.StdoutCaptureTruncated || string.IsNullOrWhiteSpace(br.StdoutCapture))
-                        {
-                            // Detached HEAD has no symbolic ref; unborn HEAD *does*.
-                            var detached = await runner.RunAsync("git", "git", ["rev-parse", "--short", "HEAD"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 5000);
-                            if (detached.ExitCode != 0 || detached.StdoutCaptureTruncated || string.IsNullOrWhiteSpace(detached.StdoutCapture))
-                                return ToolResult.Fail("git_status_unavailable", "Could not determine Git branch or detached HEAD reliably.");
-                            gitBranch = "HEAD@" + detached.StdoutCapture.Trim();
-                        }
-                        else gitBranch = br.StdoutCapture.Trim();
-
-                        var st = await runner.RunAsync("git", "git", ["status", "--porcelain=v1"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 2_000_000);
+                        // One Git process for both branch and exact dirty count.
+                        // -z preserves unusual/unicode filenames and avoids display
+                        // quoting. Unborn repos have a valid branch even without HEAD.
+                        var st = await runner.RunAsync("git", "git",
+                            ["status", "--porcelain=v1", "-b", "-z"], ws,
+                            timeoutSeconds: 15, ct: ct, stdoutCaptureLimit: 2_000_000);
                         if (st.ExitCode != 0 || st.StdoutCaptureTruncated || st.StdoutCapture is null)
-                            return ToolResult.Fail("git_status_incomplete", "Git status failed or exceeded bounded output; repository cleanliness is unknown.");
-                        dirtyCount = st.StdoutCapture.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
+                            return ToolResult.Fail("git_status_incomplete",
+                                "Git status failed or exceeded bounded output; repository cleanliness is unknown.");
+                        var entries = st.StdoutCapture.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+                        if (entries.Length == 0 || !entries[0].StartsWith("## ", StringComparison.Ordinal))
+                            return ToolResult.Fail("git_status_incomplete", "Git status did not return its expected branch header.");
+                        var head = entries[0][3..];
+                        const string unbornPrefix = "No commits yet on ";
+                        gitBranch = head.StartsWith(unbornPrefix, StringComparison.Ordinal)
+                            ? head[unbornPrefix.Length..]
+                            : head.StartsWith("Initial commit on ", StringComparison.Ordinal)
+                                ? head["Initial commit on ".Length..]
+                                : head.StartsWith("HEAD (", StringComparison.Ordinal)
+                                    ? "HEAD"
+                                    : head.Split("...", 2, StringSplitOptions.None)[0];
+                        for (var i = 1; i < entries.Length; i++)
+                        {
+                            var value = entries[i];
+                            if (value.Length < 4 || value[2] != ' ')
+                                return ToolResult.Fail("git_status_incomplete", "Unexpected Git porcelain record; refusing a false clean status.");
+                            dirtyCount++;
+                            if ((value[0] is 'R' or 'C' || value[1] is 'R' or 'C') && i + 1 < entries.Length)
+                                i++; // old path follows a rename/copy record in -z mode.
+                        }
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (Exception ex)
