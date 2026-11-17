@@ -209,6 +209,12 @@ public sealed class WorkbenchHost : IAsyncDisposable
 
         Logger.Info("host", $"Listener online at {BoundLocalUrl} (mode={conn.Mode}, tools={Registry.All.Count}).");
 
+        if (ChatGptTunnelSetup.IsConfigured(Paths))
+        {
+            try { await Tunnel.StartChatGptIfConfiguredAsync(BoundLocalUrl, ct).ConfigureAwait(false); }
+            catch (Exception ex) { Logger.Warn("tunnel", $"Private ChatGPT tunnel could not start: {ex.Message}"); }
+        }
+
         if (conn.Mode.Equals("tunnel", StringComparison.OrdinalIgnoreCase))
         {
             var tunnelUrl = await Tunnel.StartIfConfiguredAsync(BoundLocalUrl, ct).ConfigureAwait(false);

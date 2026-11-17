@@ -39,6 +39,10 @@ Do not treat historical reports in `artifacts/` as proof that the current source
 - **Target OS:** Windows 11 x64 (self-contained `LocalIdeBridge.exe` requires no separate .NET runtime installation to run the host itself).
 - **Optional developer tools on PATH (for project work):** Git, .NET SDK / MSBuild, PowerShell (`pwsh` or Windows PowerShell), plus optional `cloudflared.exe` or OpenSSH (`ssh.exe`) only if using tunnel mode.
 
+## ChatGPT with one-time setup
+
+RAMCA can manage the official OpenAI Secure MCP Tunnel automatically; press **C** in the TUI once to configure it, then simply start RAMCA on later uses. See [One-click ChatGPT connection](docs/ONE_CLICK_CHATGPT.md). This keeps the MCP server private and authenticated.
+
 ## Quick Start
 
 1. Extract `LocalIdeBridge-win-x64-portable.zip` to any user-writable folder (for example `C:\Tools\LocalIdeBridge`).
