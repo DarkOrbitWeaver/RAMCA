@@ -78,10 +78,12 @@ public sealed class WorkbenchHost : IAsyncDisposable
 
             Guard = new WorkspaceGuard(Paths, Config);
             Database = new StateDatabase(Paths, Credentials, Config.Retention);
-            RecoveredInterruptedItems = Database.Initialize(Guard.ActiveWorkspace ?? "");
+            RecoveredInterruptedItems = Database.Initialize(Guard.ActiveWorkspace ?? "", deferPruning: true);
             // Crash recovery is resolved before any command or network tool is exposed.
             // Unknown third-party changes intentionally block startup instead of being overwritten.
             EditingTools.RecoverPendingPatchTransactions(Paths, Guard, Database);
+            // Only prune obsolete session snapshots after every incomplete edit has recovered.
+            Database.PruneOldSessions();
             if (RecoveredInterruptedItems > 0)
             {
                 Logger.Warn("recovery", $"Recovered {RecoveredInterruptedItems} interrupted item(s) from prior run without replaying non-idempotent commands.");

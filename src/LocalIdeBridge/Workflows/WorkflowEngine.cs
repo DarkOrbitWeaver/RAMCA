@@ -149,9 +149,16 @@ public sealed class WorkflowEngine
                 wfCts.Token.ThrowIfCancellationRequested();
 
                 // Collect all steps whose dependencies are now terminal.
+                // Global on_failure handlers have no dependencies, but must run only
+                // after ordinary steps have finished, not in the first wave.
+                static bool IsGlobalFailureHandler(WorkflowStepSpec s) =>
+                    s.DependsOn.Count == 0 &&
+                    string.Equals(s.RunIf?.Trim(), "on_failure", StringComparison.OrdinalIgnoreCase);
                 var ready = remaining
                     .Select(id => specMap[id])
                     .Where(s => s.DependsOn.All(d => !remaining.Contains(d)))
+                    .Where(s => !IsGlobalFailureHandler(s) ||
+                        remaining.All(id => IsGlobalFailureHandler(specMap[id])))
                     .ToList();
 
                 if (ready.Count == 0)
@@ -290,6 +297,9 @@ public sealed class WorkflowEngine
             {
                 lastResult = await _registry.InvokeAsync(spec.Tool, argsClone,
                     new ToolExecutionContext(sessionId, WorkspaceRoot: _guard.RequireActiveWorkspace()), stepCts.Token).ConfigureAwait(false);
+                if (!lastResult.Success && lastResult.ErrorCode == "cancelled" &&
+                    stepCts.IsCancellationRequested && !wfCt.IsCancellationRequested)
+                    lastResult = ToolResult.Fail("timeout", $"Step '{spec.Id}' exceeded timeout of {spec.TimeoutSeconds}s.");
             }
             catch (OperationCanceledException) when (!wfCt.IsCancellationRequested)
             {

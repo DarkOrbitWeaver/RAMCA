@@ -107,6 +107,20 @@ public sealed class StateDatabase : IDisposable
     private readonly string _connectionString;
     private readonly object _writeLock = new();
     private string _activeSessionId = "";
+    // Invocation-scoped session attribution for commands launched by background jobs
+    // and workflows while another client switches the host's active session.
+    private readonly AsyncLocal<string?> _invocationSession = new();
+    public string InvocationSessionId => _invocationSession.Value ?? ActiveSessionId;
+    public IDisposable UseInvocationSession(string sessionId)
+    {
+        var previous = _invocationSession.Value;
+        _invocationSession.Value = sessionId;
+        return new InvocationSessionLease(_invocationSession, previous);
+    }
+    private sealed class InvocationSessionLease(AsyncLocal<string?> current, string? previous) : IDisposable
+    {
+        public void Dispose() => current.Value = previous;
+    }
     private bool _disposed;
 
     public string ActiveSessionId
@@ -149,7 +163,7 @@ public sealed class StateDatabase : IDisposable
         return conn;
     }
 
-    public int Initialize(string initialWorkspace)
+    public int Initialize(string initialWorkspace, bool deferPruning = false)
     {
         lock (_writeLock)
         {
@@ -281,7 +295,7 @@ public sealed class StateDatabase : IDisposable
 
             var recovered = RecoverInterruptedStateLocked(conn);
             _activeSessionId = CreateSessionInternalLocked(conn, initialWorkspace);
-            PruneOldSessionsLocked(conn);
+            if (!deferPruning) PruneOldSessionsLocked(conn);
             return recovered;
         }
     }
@@ -1055,6 +1069,15 @@ public sealed class StateDatabase : IDisposable
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
         return (r.GetString(0), r.GetString(1), r.GetInt32(2), r.GetInt64(3), r.GetInt32(4) == 1, r.GetString(5));
+    }
+
+    public void PruneOldSessions()
+    {
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            PruneOldSessionsLocked(conn);
+        }
     }
 
     private void PruneOldSessionsLocked(SqliteConnection conn)

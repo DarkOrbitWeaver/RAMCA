@@ -230,8 +230,8 @@ public static class BuildGitCommandTools
                     logReference = new { execId = res.ExecutionId, totalLines = res.TotalLogLines, totalBytes = res.TotalLogBytes }
                 };
 
-                if (res.ExitCode == 0 && reportFiles == 0)
-                    return ToolResult.Fail("test_results_missing", "dotnet test exited 0 but produced no TRX reports; cannot verify test counts.", payload, res.ExecutionId);
+                if (res.ExitCode == 0 && (reportFiles == 0 || summary.Total == 0))
+                    return ToolResult.Fail("test_results_missing", "dotnet test exited 0 but produced no test counts; cannot verify tests actually executed.", payload, res.ExecutionId);
 
                 return res.ExitCode == 0
                     ? ToolResult.Ok($"Tests passed: {summary.Passed}/{summary.Total} passed, {summary.Failed} failed, {summary.Skipped} skipped ({res.DurationMs}ms).", payload, res.ExecutionId)

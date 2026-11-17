@@ -111,7 +111,7 @@ public sealed partial class ProcessRunner
             _config.Resources.MaxCommandTimeoutSeconds);
 
         var execId = $"exec_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
-        var sessionId = _db.ActiveSessionId;
+        var sessionId = _db.InvocationSessionId;
         var startedAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
         var diagnostics = new List<CompilerDiagnostic>();
@@ -457,12 +457,19 @@ public sealed partial class ProcessRunner
         var counters = doc.Descendants(ns + "Counters").FirstOrDefault()
             ?? throw new InvalidDataException($"TRX report has no test counters: {trxPath}");
 
-        int Attr(string name) => int.TryParse(counters?.Attribute(name)?.Value, out var v) ? v : 0;
+        int Attr(string name, bool required = false)
+        {
+            if (int.TryParse(counters.Attribute(name)?.Value, out var value) && value >= 0)
+                return value;
+            if (required)
+                throw new InvalidDataException($"TRX report has missing/invalid '{name}' counter: {trxPath}");
+            return 0;
+        }
 
-        var total = Attr("total");
-        var passed = Attr("passed");
-        var failed = Attr("failed") + Attr("error") + Attr("timeout");
-        var executed = Attr("executed");
+        var total = Attr("total", required: true);
+        var passed = Attr("passed", required: true);
+        var failed = Attr("failed", required: true) + Attr("error") + Attr("timeout");
+        var executed = Attr("executed", required: true);
         var notExecuted = Attr("notExecuted");
         var skipped = notExecuted > 0 ? notExecuted : Math.Max(0, total - executed);
 

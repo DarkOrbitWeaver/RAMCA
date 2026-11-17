@@ -70,9 +70,12 @@ public static class OperationLedgerTools
                 // remains alive while the RAMCA host process is alive; process shutdown
                 // still terminates owned children and startup marks an unknown outcome.
                 // For explicit cancellation, launch a cancellable job_start operation.
+                // Detached HTTP calls must survive client disconnects, but explicitly
+                // cancellable background jobs must honor their own cancellation token.
+                var executionToken = ctx.JobId is null ? CancellationToken.None : ct;
                 var result = await registry.InvokeAsync(name, (JsonObject)inner.DeepClone(),
                     new ToolExecutionContext(ctx.SessionId, ctx.JobId, ctx.ReportProgress, WorkspaceRoot: workspace),
-                    CancellationToken.None).ConfigureAwait(false);
+                    executionToken).ConfigureAwait(false);
                 db.CompleteOperation(opId, result);
                 return result;
             });

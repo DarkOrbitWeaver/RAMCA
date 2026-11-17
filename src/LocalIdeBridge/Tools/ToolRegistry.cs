@@ -86,6 +86,7 @@ public sealed class ToolRegistry
 
         var args = arguments ?? new JsonObject();
         var ctx = context ?? new ToolExecutionContext(_db.ActiveSessionId);
+        using var sessionScope = _db.UseInvocationSession(ctx.SessionId);
         var workspace = ctx.WorkspaceRoot ?? _guard.ActiveWorkspace;
         ToolResult result;
 
