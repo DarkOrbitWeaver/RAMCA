@@ -70,7 +70,7 @@ public sealed class ModernMcpAndJobResilienceTests
             Assert.Equal("private", body["result"]!["cacheScope"]!.GetValue<string>());
             var tools = body["result"]!["tools"]!.AsArray();
             Assert.Contains(tools, t => t?["name"]?.GetValue<string>() == "execute_once");
-            var command = Assert.Single(tools.Where(t => t?["name"]?.GetValue<string>() == "run_command"));
+            var command = Assert.Single(tools, t => t?["name"]?.GetValue<string>() == "run_command");
             Assert.True(command!["annotations"]!["destructiveHint"]!.GetValue<bool>());
         }
 

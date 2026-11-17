@@ -159,7 +159,7 @@ public sealed class PortablePaths
                 sw.Flush();
                 fs.Flush(flushToDisk: true);
             }
-            if (unixMode is not null)
+            if (!OperatingSystem.IsWindows() && unixMode is not null)
                 File.SetUnixFileMode(tmpPath, unixMode.Value);
             if (OperatingSystem.IsWindows() && File.Exists(targetPath))
                 File.Replace(tmpPath, targetPath, null);
@@ -196,7 +196,7 @@ public sealed class PortablePaths
                 source.CopyTo(destination, 81920);
                 destination.Flush(flushToDisk: true);
             }
-            if (unixMode is not null) File.SetUnixFileMode(temporary, unixMode.Value);
+            if (!OperatingSystem.IsWindows() && unixMode is not null) File.SetUnixFileMode(temporary, unixMode.Value);
             if (OperatingSystem.IsWindows() && File.Exists(targetPath))
                 File.Replace(temporary, targetPath, null);
             else
@@ -224,7 +224,7 @@ public sealed class PortablePaths
                 stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
-            if (unixMode is not null) File.SetUnixFileMode(temporary, unixMode.Value);
+            if (!OperatingSystem.IsWindows() && unixMode is not null) File.SetUnixFileMode(temporary, unixMode.Value);
             if (OperatingSystem.IsWindows() && File.Exists(targetPath))
                 File.Replace(temporary, targetPath, null);
             else

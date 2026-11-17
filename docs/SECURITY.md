@@ -27,14 +27,14 @@ LocalIdeBridge exposes real development commands on a personal workstation. Its 
 - Canonicalizes every relative or absolute path and rejects `..` traversal, drive switches, and NUL bytes.
 - Inspects **every existing path segment** for NTFS reparse points (directory junctions and symlinks) and resolves final link targets, rejecting reads, writes, file creation, tree listings, and searches that escape the trusted workspace.
 - Blocks agent writes to `.git/hooks/*`, `.git/config`, and `.localidebridge.json` to prevent silent hook persistence or self-escalation.
-- Blocks external `git_push` by default until explicitly enabled in `config.json`.
+- Blocks the dedicated `git_push` tool by default and rejects direct Git push commands (including straightforward shell invocations) when the policy denies pushes. This is command inspection, **not a security sandbox for arbitrary scripts**.
 
 ## 4. Honest Limitations of Command Execution
 
 Do not mistake workspace path validation for a hardware VM sandbox:
 
 - When `autonomy.allowCommands` / `allowShellScripts` is enabled (the default for productive software engineering), approved tools such as `dotnet build` (which executes MSBuild targets and NuGet build tasks), `dotnet test` (which runs project test code), and `pwsh`/`powershell` run under your Windows user account.
-- LocalIdeBridge restricts executable names, blocks common administrative/destructive command patterns, enforces working directories, applies timeouts, and kills spawned process trees via a Windows Job Object—but arbitrary code inside a project build, test suite, or PowerShell command can still access files readable by your Windows user account.
+- LocalIdeBridge restricts executable names, blocks common administrative/destructive command patterns, enforces working directories, applies timeouts, and kills spawned process trees via a Windows Job Object—but arbitrary code inside a project build, test suite, or PowerShell command can still access files and network services available to your Windows user account. A determined script may evade literal Git-push inspection. To guarantee the absence of unattended pushes, do not grant arbitrary command execution to untrusted agents.
 - **Practical guidance:**
   - If you want strictly file-confined editing with zero arbitrary shell execution, set `"allowShellScripts": false` (or `"allowCommands": false`) in `config.json` or `.localidebridge.json`.
   - Keep `LocalIdeBridge.exe` closed when you are not actively using it; closing immediately stops the listener and any owned tunnel.

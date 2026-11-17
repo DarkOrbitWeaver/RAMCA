@@ -126,6 +126,47 @@ public sealed class AuditNovember17FixRegressionTests
     }
 
     [Fact]
+    public async Task PendingPatchRecovery_PrecedesOldSessionSnapshotPruning()
+    {
+        await using var sb = await TestSandbox.CreateAsync(
+            cfg => cfg.Retention.MaxSessionCount = 5, startListener: false);
+        var firstSession = sb.Host.Database.ActiveSessionId;
+        const string before = "precious-original\\n";
+        const string after = "interrupted-agent-edit\\n";
+        var full = Path.Combine(sb.WorkspaceDir, "recovery_order.txt");
+        await File.WriteAllTextAsync(full, after);
+
+        var backup = Path.Combine(sb.Paths.GetSessionEditsDir(firstSession), "edit_recovery_order.bak");
+        await File.WriteAllTextAsync(backup, before);
+        var shaBefore = Convert.ToHexStringLower(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(before)));
+        var shaAfter = Convert.ToHexStringLower(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(after)));
+        var pendingDir = Path.Combine(sb.Paths.DataDir, "pending-patches");
+        Directory.CreateDirectory(pendingDir);
+        var manifest = Path.Combine(pendingDir, "patch_recovery_order.json");
+        File.WriteAllText(manifest, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            id = "patch_recovery_order", workspace = sb.WorkspaceDir,
+            sessionId = firstSession, committed = false,
+            items = new[] { new {
+                relativePath = "recovery_order.txt", editId = "edit_recovery_order",
+                backupPath = backup, beforeHash = shaBefore, afterHash = shaAfter
+            } }
+        }, AppConfig.JsonOptions));
+
+        // Four more sessions fill the retention allowance; restart creates the
+        // sixth. The first session has no edit-journal record yet: only a
+        // recovery manifest and its backup, which must be used before pruning.
+        for (var i = 0; i < 4; i++)
+            sb.Host.Database.CreateAndActivateSession(sb.WorkspaceDir);
+        await sb.Host.DisposeAsync();
+        await using var recovered = new WorkbenchHost(sb.Paths, sb.Config);
+        Assert.Equal(before, await File.ReadAllTextAsync(full));
+        Assert.False(File.Exists(manifest));
+    }
+
+    [Fact]
     public async Task McpCancellationNotification_StopsRunningHttpToolCall()
     {
         await using var sb = await TestSandbox.CreateAsync();
