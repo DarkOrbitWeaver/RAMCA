@@ -57,7 +57,14 @@ While running interactively, LocalIdeBridge stays quiet and updates only on even
 - `S` — Start a new session
 - `P` — Pause/resume write and execution tools (read-only inspection stays online)
 - `N` — Set a session steering note readable via `workspace_status` / `bridge://session/active`
-- `1`..`5` — Switch virtualized views (Recent Calls, Edits/Diffs, Jobs/Builds, Git/Sessions, Errors)
+- `1`..`5` — Switch views (Activity, Changes, Commands, Git, Errors)
+- `Up` / `Down` — Select recent items without loading an unbounded history
+- `PageUp` / `PageDown` — Move through available items or the selected diff/log output in bounded pages
+- `Enter` — Expand the selected operation, file diff, or command output
+- `Esc` — Return to the compact list view
+- **Changes:** Green = added lines, red = removed lines. Diffs are shown only when verified pre/post-image content remains available (up to 256 KiB per file); otherwise the view explains why it cannot safely reconstruct the old edit.
+- **Commands:** Displays durable job logs and recent direct-command output while the supervisor is running. Older direct tool calls retain their recorded summaries but not a full argument/output replay. Logs and pages are loaded on demand, not continuously kept in memory.
+- **Durations:** Displayed in seconds, minutes, and hours; timestamps still use local clock time.
 - `Q` or `Ctrl+C` — Stop listener, terminate all owned child processes, and exit
 
 For headless operation: `.\LocalIdeBridge.exe host`.
