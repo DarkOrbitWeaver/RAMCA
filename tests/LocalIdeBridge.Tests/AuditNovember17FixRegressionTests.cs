@@ -46,7 +46,7 @@ public sealed class AuditNovember17FixRegressionTests
             "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
         await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "Dummy.cs"),
             "public sealed class Dummy { }\n");
-        var mutex = await sb.Host.Guard.AcquireWriteLockAsync(sb.WorkspaceDir);
+        var mutex = await sb.Host.Guard.AcquireWriteLockAsync(sb.WorkspaceDir, CancellationToken.None);
         Task<ToolResult>? inFlight = null;
         try
         {
