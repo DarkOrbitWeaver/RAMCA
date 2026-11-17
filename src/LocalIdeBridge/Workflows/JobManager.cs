@@ -98,17 +98,19 @@ public sealed class JobManager : IDisposable
             var result = await _registry.InvokeAsync(toolName, args, ctx, cts.Token).ConfigureAwait(false);
             var json = JsonSerializer.Serialize(result, AppConfig.JsonOptions);
 
-            if (result.Success)
+            // A cancellation requested while a tool is finishing must take precedence
+            // over a subprocess exit/error caused by termination. Keep timeout distinct.
+            if (timeoutCts.IsCancellationRequested)
             {
-                _db.UpdateJobStatus(jobId, "succeeded", resultJson: json, logExecId: result.ExecutionId, eventMessage: result.Summary);
+                _db.UpdateJobStatus(jobId, "timed_out", resultJson: json, errorMessage: result.ErrorMessage, logExecId: result.ExecutionId, eventMessage: "Job deadline reached.");
             }
-            else if (timeoutCts.IsCancellationRequested)
-            {
-                _db.UpdateJobStatus(jobId, "timed_out", resultJson: json, errorMessage: result.ErrorMessage, logExecId: result.ExecutionId, eventMessage: "Job timed out; not safe to assume a command had no side effects.");
-            }
-            else if (result.ErrorCode == "cancelled" || cts.IsCancellationRequested)
+            else if (cts.IsCancellationRequested || result.ErrorCode == "cancelled")
             {
                 _db.UpdateJobStatus(jobId, "cancelled", resultJson: json, errorMessage: result.ErrorMessage, logExecId: result.ExecutionId, eventMessage: "Job cancelled.");
+            }
+            else if (result.Success)
+            {
+                _db.UpdateJobStatus(jobId, "succeeded", resultJson: json, logExecId: result.ExecutionId, eventMessage: result.Summary);
             }
             else
             {
@@ -124,7 +126,12 @@ public sealed class JobManager : IDisposable
         }
         catch (Exception ex)
         {
-            _db.UpdateJobStatus(jobId, "failed", errorMessage: ex.Message, eventMessage: $"Unhandled error: {ex.Message}");
+            // Killing a child process can surface as IOException/InvalidOperationException
+            // rather than OperationCanceledException. Preserve the requested outcome.
+            var status = timeoutCts.IsCancellationRequested ? "timed_out"
+                : cts.IsCancellationRequested ? "cancelled" : "failed";
+            _db.UpdateJobStatus(jobId, status, errorMessage: ex.Message,
+                eventMessage: status == "failed" ? $"Unhandled error: {ex.Message}" : $"Job {status} while unwinding: {ex.GetType().Name}.");
         }
         finally
         {
