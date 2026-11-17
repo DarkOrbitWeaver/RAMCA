@@ -557,7 +557,9 @@ public static partial class EditingTools
                 new("path", "string", "File path (when previewing a range replacement instead of a patch)."),
                 new("startLine", "integer", "1-based start line (for range preview)."),
                 new("endLine", "integer", "1-based end line (for range preview)."),
-                new("newText", "string", "Proposed replacement text (for range preview).")
+                new("newText", "string", "Proposed replacement text (for range preview)."),
+                new("expectedSha256", "string", "Optional expected file SHA-256 (single file patch or range)."),
+                new("expectedSha256Map", "object", "Optional file-to-SHA map (multi-file patch preview).")
             ],
             Handler: (args, _, _) =>
             {
@@ -569,17 +571,62 @@ public static partial class EditingTools
                     if (fps.Count == 0)
                         return Task.FromResult(ToolResult.Fail("invalid_patch", "No valid unified diff hunks found."));
 
+                    var expectedSha = args.OptionalString("expectedSha256");
+                    var mapNode = args["expectedSha256Map"];
+                    if (mapNode is not null && mapNode is not JsonObject)
+                        return Task.FromResult(ToolResult.Fail("invalid_arguments", "expectedSha256Map must be an object."));
+                    if (expectedSha is not null && (fps.Count != 1 || mapNode is not null))
+                        return Task.FromResult(ToolResult.Fail("invalid_arguments", "Scalar expectedSha256 is only valid for a single-file patch."));
+                    static bool ValidSha(string? value) => value is { Length: 64 } && value.All(char.IsAsciiHexDigit);
+                    if (expectedSha is not null && !ValidSha(expectedSha))
+                        return Task.FromResult(ToolResult.Fail("invalid_arguments", "Expected SHA-256 must be 64 hex digits."));
+                    var map = new Dictionary<string, string>(
+                        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+                    if (mapNode is JsonObject mapObject)
+                        foreach (var (key, value) in mapObject)
+                        {
+                            if (value?.GetValueKind() != JsonValueKind.String || !ValidSha(value.GetValue<string>()))
+                                return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Invalid hash for '{key}'."));
+                            var keyRel = guard.GetRelativePathUnix(ws, guard.ResolvePath(key));
+                            if (!map.TryAdd(keyRel, value.GetValue<string>()))
+                                return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Duplicate hash key '{keyRel}'."));
+                        }
+
                     var previews = new List<object>();
+                    var usedPaths = new HashSet<string>(
+                        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
                     foreach (var fp in fps)
                     {
                         var isCreate = fp.OldPath is null or "/dev/null";
-                        var target = fp.NewPath is null or "/dev/null" ? fp.OldPath! : fp.NewPath!;
-                        var full = guard.ResolvePath(target);
+                        var isDelete = fp.NewPath is null or "/dev/null";
+                        if (!isCreate && !isDelete && !string.Equals(fp.OldPath, fp.NewPath, StringComparison.Ordinal))
+                            return Task.FromResult(ToolResult.Fail("unsupported_patch", "Rename patches require rename_file."));
+                        var target = isDelete ? fp.OldPath! : fp.NewPath!;
+                        var full = guard.ResolvePath(target, forWrite: !isDelete, forDelete: isDelete);
                         var rel = guard.GetRelativePathUnix(ws, full);
-                        var oldLines = isCreate ? [] : LoadTextFile(full).Lines;
+                        if (!usedPaths.Add(rel))
+                            return Task.FromResult(ToolResult.Fail("invalid_patch", $"Duplicate patch target '{rel}'."));
+                        if (File.Exists(Path.Combine(ws, "a", target)) || File.Exists(Path.Combine(ws, "b", target)))
+                            return Task.FromResult(ToolResult.Fail("ambiguous_patch_path", $"Patch path '{rel}' is ambiguous with a/ or b/ directories."));
+                        if (Directory.Exists(full))
+                            return Task.FromResult(ToolResult.Fail("invalid_patch", $"Patch target '{rel}' is a directory."));
+                        if (isCreate && File.Exists(full))
+                            return Task.FromResult(ToolResult.Fail("precondition_failed", $"File '{rel}' already exists."));
+                        if (!isCreate && !File.Exists(full))
+                            return Task.FromResult(ToolResult.Fail("not_found", $"File '{rel}' does not exist."));
+                        if (isCreate && map.ContainsKey(rel))
+                            return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Cannot require prior SHA for newly created '{rel}'."));
+                        var before = isCreate ? null : LoadTextFile(full);
+                        var requiredSha = map.TryGetValue(rel, out var mapped) ? mapped : fps.Count == 1 ? expectedSha : null;
+                        if (requiredSha is not null &&
+                            !string.Equals(before?.Sha256, requiredSha, StringComparison.OrdinalIgnoreCase))
+                            return Task.FromResult(ToolResult.Fail("stale_file", $"File '{rel}' differs from expected SHA-256."));
+                        var oldLines = before?.Lines ?? [];
                         var applied = ApplyHunksToLines(oldLines, fp.Hunks, rel, out var add, out var rem, out var err);
                         if (err is not null)
                             return Task.FromResult(ToolResult.Fail("precondition_failed", err));
+                        if (isDelete && applied!.Count != 0)
+                            return Task.FromResult(ToolResult.Fail("invalid_patch", $"Deletion patch for '{rel}' did not remove all lines."));
                         previews.Add(new
                         {
                             path = rel,
@@ -589,6 +636,9 @@ public static partial class EditingTools
                             diff = BuildCompactUnifiedDiff(rel, oldLines, applied!)
                         });
                     }
+                    foreach (var key in map.Keys)
+                        if (!usedPaths.Contains(key))
+                            return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Unconsumed expectedSha256Map key '{key}'."));
                     return Task.FromResult(ToolResult.Ok($"Patch preview succeeded for {previews.Count} file(s).", new { previews }));
                 }
 
@@ -597,6 +647,12 @@ public static partial class EditingTools
                 if (!File.Exists(fullFile))
                     throw new FileNotFoundException($"File not found: {path}");
                 var loaded = LoadTextFile(fullFile);
+                var expectedRangeSha = args.OptionalString("expectedSha256");
+                if (expectedRangeSha is not null &&
+                    !string.Equals(loaded.Sha256, expectedRangeSha, StringComparison.OrdinalIgnoreCase))
+                    return Task.FromResult(ToolResult.Fail("stale_file", "Range preview does not match expected SHA-256."));
+                if (args["expectedSha256Map"] is not null)
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "expectedSha256Map is only valid for patch preview."));
                 var start = args.OptionalInt("startLine", 0);
                 var end = args.OptionalInt("endLine", 0);
                 if (start < 1 || end < start || end > loaded.Lines.Length)
