@@ -43,49 +43,72 @@ public sealed class WorkbenchHost : IAsyncDisposable
     private WebApplication? _webApp;
     private X509Certificate2? _tlsCert;
     private int _disposed;
+    // An OS-managed exclusive file lease prevents concurrent hosts from modifying one portable state DB.
+    private readonly FileStream _instanceLock;
 
     public WorkbenchHost(PortablePaths paths, AppConfig? explicitConfig = null)
     {
         Paths = paths;
         Paths.EnsureDirectories();
-        Paths.CleanTempDirectory();
-
-        Config = explicitConfig ?? AppConfig.Load(Paths);
-        Config.Normalize();
-
-        Credentials = new CredentialStore(Paths);
-        CreatedNewCredential = Credentials.EnsureInitialized();
-
-        Logger = new RedactingLogger(Paths, Credentials, Config.Retention, Config.Resources.TuiEventBufferSize);
-        Logger.PruneExpiredLogs();
-
-        Guard = new WorkspaceGuard(Paths, Config);
-        Database = new StateDatabase(Paths, Credentials, Config.Retention);
-        RecoveredInterruptedItems = Database.Initialize(Guard.ActiveWorkspace ?? "");
-        if (RecoveredInterruptedItems > 0)
+        // Acquire BEFORE cleanup, recovery, credential initialization, and logging.
+        // FileShare.None is released by the OS even if the process crashes.
+        try
         {
-            Logger.Warn("recovery", $"Recovered {RecoveredInterruptedItems} interrupted item(s) from prior run without replaying non-idempotent commands.");
+            _instanceLock = new FileStream(Path.Combine(Paths.DataDir, "host.lock"),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException ex)
+        {
+            throw new InvalidOperationException(
+                "RAMCA is already running against this portable folder. Connect to its MCP/HTTP listener instead of starting another host.", ex);
         }
 
-        Logs = new LogStore(Paths, Database, Credentials, Config.Retention);
-        ProcessSupervisor = new ChildProcessSupervisor(Config.Resources.ChildProcessMemoryLimitMb);
-        Runner = new ProcessRunner(Paths, Config, Guard, Database, Logs, ProcessSupervisor, Logger);
-        Tunnel = new TunnelManager(Paths, Config, ProcessSupervisor, Logger);
-        CodeIntel = new SearchAndIntelTools(Config, Guard, Runner);
+        try
+        {
+            Paths.CleanTempDirectory();
 
-        Registry = new ToolRegistry(Guard, Database, Logger, Credentials);
-        Jobs = new JobManager(Config, Guard, Database, Registry, Logger);
-        Workflows = new WorkflowEngine(Config, Guard, Database, Registry, Logger);
+            Config = explicitConfig ?? AppConfig.Load(Paths);
+            Config.Normalize();
 
-        // Register all authoritative tools once for MCP, HTTPS API, CLI, and Workflows.
-        Registry.RegisterRange(WorkspaceTools.Create(Paths, Config, Guard, Database, Runner, Registry));
-        Registry.RegisterRange(CodeIntel.CreateTools());
-        Registry.RegisterRange(EditingTools.Create(Paths, Config, Guard, Database, CodeIntel.InvalidateFile));
-        Registry.RegisterRange(BuildGitCommandTools.Create(Paths, Config, Guard, Database, Logs, Runner, ProcessSupervisor));
-        Registry.RegisterRange(JobAndWorkflowTools.Create(Guard, Database, Jobs, Workflows));
+            Credentials = new CredentialStore(Paths);
+            CreatedNewCredential = Credentials.EnsureInitialized();
 
-        Instructions = new ConnectionInstructions(Config, Guard, Registry, Tunnel);
-        Mcp = new McpServer(Config, Guard, Database, Registry, Instructions, Logger);
+            Logger = new RedactingLogger(Paths, Credentials, Config.Retention, Config.Resources.TuiEventBufferSize);
+            Logger.PruneExpiredLogs();
+
+            Guard = new WorkspaceGuard(Paths, Config);
+            Database = new StateDatabase(Paths, Credentials, Config.Retention);
+            RecoveredInterruptedItems = Database.Initialize(Guard.ActiveWorkspace ?? "");
+            if (RecoveredInterruptedItems > 0)
+            {
+                Logger.Warn("recovery", $"Recovered {RecoveredInterruptedItems} interrupted item(s) from prior run without replaying non-idempotent commands.");
+            }
+
+            Logs = new LogStore(Paths, Database, Credentials, Config.Retention);
+            ProcessSupervisor = new ChildProcessSupervisor(Config.Resources.ChildProcessMemoryLimitMb);
+            Runner = new ProcessRunner(Paths, Config, Guard, Database, Logs, ProcessSupervisor, Logger);
+            Tunnel = new TunnelManager(Paths, Config, ProcessSupervisor, Logger);
+            CodeIntel = new SearchAndIntelTools(Config, Guard, Runner);
+
+            Registry = new ToolRegistry(Guard, Database, Logger, Credentials);
+            Jobs = new JobManager(Config, Guard, Database, Registry, Logger);
+            Workflows = new WorkflowEngine(Config, Guard, Database, Registry, Logger);
+
+            // Register all authoritative tools once for MCP, HTTPS API, CLI, and Workflows.
+            Registry.RegisterRange(WorkspaceTools.Create(Paths, Config, Guard, Database, Runner, Registry));
+            Registry.RegisterRange(CodeIntel.CreateTools());
+            Registry.RegisterRange(EditingTools.Create(Paths, Config, Guard, Database, CodeIntel.InvalidateFile));
+            Registry.RegisterRange(BuildGitCommandTools.Create(Paths, Config, Guard, Database, Logs, Runner, ProcessSupervisor));
+            Registry.RegisterRange(JobAndWorkflowTools.Create(Guard, Database, Jobs, Workflows));
+
+            Instructions = new ConnectionInstructions(Config, Guard, Registry, Tunnel);
+            Mcp = new McpServer(Config, Guard, Database, Registry, Instructions, Logger);
+        }
+        catch
+        {
+            _instanceLock.Dispose();
+            throw;
+        }
     }
 
     public async Task StartNetworkListenerAsync(CancellationToken ct = default)
@@ -118,6 +141,9 @@ public sealed class WorkbenchHost : IAsyncDisposable
                 _tlsCert = TunnelManager.GetOrCreateSelfSignedTlsCert(Paths, conn.ListenHost);
             }
         }
+
+        if (conn.UseHttps && _tlsCert is null)
+            throw new InvalidOperationException("connection.useHttps=true requires a configured TLS certificate or autoGenerateSelfSignedTls=true. Refusing silent HTTP downgrade.");
 
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
         {
@@ -238,5 +264,7 @@ public sealed class WorkbenchHost : IAsyncDisposable
         Guard.Dispose();
         Database.Dispose();
         Logger.Dispose();
+        // Hold the exclusive state lease until *all* state handles have closed.
+        _instanceLock.Dispose();
     }
 }

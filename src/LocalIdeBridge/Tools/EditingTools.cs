@@ -544,7 +544,7 @@ public static partial class EditingTools
         yield return new ToolDefinition(
             Name: "rename_file",
             Category: "editing",
-            Description: "Renames or moves a file inside the trusted workspace.",
+            Description: "Moves a file within the workspace if the destination does not exist. Replacing an existing destination is blocked until reversible rename journaling is implemented.",
             IsReadOnly: false,
             IsIdempotent: false,
             SideEffects: "Moves file within trusted workspace.",
@@ -552,22 +552,24 @@ public static partial class EditingTools
             [
                 new("sourcePath", "string", "Existing relative file path.", Required: true),
                 new("destinationPath", "string", "New relative file path inside workspace.", Required: true),
-                new("overwrite", "boolean", "Overwrite destination if it exists.", Default: false)
+                new("overwrite", "boolean", "Reserved for a future reversible overwrite; overwriting an existing destination is not yet supported.", Default: false)
             ],
             Handler: (args, _, _) =>
             {
                 var ws = guard.RequireActiveWorkspace();
                 var src = guard.ResolvePath(args.RequireString("sourcePath"), forDelete: true);
                 var dst = guard.ResolvePath(args.RequireString("destinationPath"), forWrite: true);
-                var overwrite = args.OptionalBool("overwrite", false);
+                // Read the legacy flag so old callers receive a clear fail-closed result if the target exists.
+                _ = args.OptionalBool("overwrite", false);
 
                 if (!File.Exists(src))
                     throw new FileNotFoundException($"Source file not found: {args.RequireString("sourcePath")}");
-                if (File.Exists(dst) && !overwrite)
-                    return Task.FromResult(ToolResult.Fail("already_exists", $"Destination '{args.RequireString("destinationPath")}' already exists."));
+                if (File.Exists(dst))
+                    return Task.FromResult(ToolResult.Fail("unsafe_overwrite_blocked",
+                        $"Destination '{args.RequireString("destinationPath")}' exists. RAMCA cannot safely undo an overwritten rename yet; choose an unused destination instead."));
 
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                File.Move(src, dst, overwrite);
+                File.Move(src, dst);
                 onFileMutated?.Invoke(src);
                 onFileMutated?.Invoke(dst);
 
@@ -781,8 +783,7 @@ public static partial class EditingTools
         // Reject obvious binary files (NUL byte outside UTF-16).
         if (!encName.StartsWith("utf-16", StringComparison.Ordinal))
         {
-            var checkLen = Math.Min(bytes.Length, 8192);
-            for (var i = bomLen; i < checkLen; i++)
+            for (var i = bomLen; i < bytes.Length; i++)
             {
                 if (bytes[i] == 0)
                     throw new InvalidOperationException("File appears to be binary (contains NUL bytes).");
@@ -812,12 +813,12 @@ public static partial class EditingTools
     private static (Encoding Enc, string Name, int BomLen) DetectEncoding(byte[] bytes)
     {
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-            return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: true), "utf-8-bom", 3);
+            return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: true, throwOnInvalidBytes: true), "utf-8-bom", 3);
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
-            return (new UnicodeEncoding(bigEndian: false, byteOrderMark: true), "utf-16-le", 2);
+            return (new UnicodeEncoding(bigEndian: false, byteOrderMark: true, throwOnInvalidBytes: true), "utf-16-le", 2);
         if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
-            return (new UnicodeEncoding(bigEndian: true, byteOrderMark: true), "utf-16-be", 2);
-        return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), "utf-8", 0);
+            return (new UnicodeEncoding(bigEndian: true, byteOrderMark: true, throwOnInvalidBytes: true), "utf-16-be", 2);
+        return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true), "utf-8", 0);
     }
 
     public static string ComputeFileSha256(string path)

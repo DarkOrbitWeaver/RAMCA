@@ -77,7 +77,8 @@ public sealed class ToolRegistry
             return ToolResult.Fail("unknown_tool", $"Unknown tool '{toolName}'. Discover available tools via tools/list or GET /api/v1/tools.");
         }
 
-        if (_isPaused && !tool.IsReadOnly)
+        if (_isPaused && !tool.IsReadOnly &&
+            tool.Name is not ("job_cancel" or "workflow_cancel" or "revert_edit"))
         {
             Interlocked.Increment(ref _totalErrors);
             return ToolResult.Fail("host_paused", "LocalIdeBridge execution is currently paused by the local supervisor. Read-only inspection remains available.");

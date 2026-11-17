@@ -459,7 +459,7 @@ public static class BuildGitCommandTools
                 }
                 else if (action == "remove")
                 {
-                    gitArgs = ["worktree", "remove", "--force", wtPath];
+                    gitArgs = ["worktree", "remove", wtPath]; // Git refuses to remove a dirty worktree. Never force-delete user changes.
                 }
                 else
                 {

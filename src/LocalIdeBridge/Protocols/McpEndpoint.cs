@@ -257,11 +257,28 @@ public sealed class McpServer
                     await ctx.Response.Body.FlushAsync(ct);
 
                 var waiter = RegisterSseWaiter();
-                var completed = await Task.WhenAny(waiter, Task.Delay(TimeSpan.FromSeconds(20), ct));
-                if (completed != waiter && !ct.IsCancellationRequested)
+                if (waiter is null)
                 {
-                    await ctx.Response.WriteAsync(": keepalive\n\n", ct);
-                    await ctx.Response.Body.FlushAsync(ct);
+                    await ctx.Response.WriteAsync(": notification stream capacity reached; reconnect later\n\n", ct);
+                    break;
+                }
+                try
+                {
+                    // A notification may arrive between SnapshotAfter() and subscription.
+                    if (_sseNotifications.LatestSequence > cursor)
+                        continue;
+
+                    var completed = await Task.WhenAny(waiter.Task, Task.Delay(TimeSpan.FromSeconds(20), ct));
+                    if (completed != waiter.Task && !ct.IsCancellationRequested)
+                    {
+                        await ctx.Response.WriteAsync(": keepalive\n\n", ct);
+                        await ctx.Response.Body.FlushAsync(ct);
+                    }
+                }
+                finally
+                {
+                    // Timed-out/disconnected requests must not occupy the bounded waiter list.
+                    lock (_sseSubLock) _sseWaiters.Remove(waiter);
                 }
             }
         }
@@ -565,17 +582,16 @@ public sealed class McpServer
         }
     }
 
-    private Task RegisterSseWaiter()
+    private TaskCompletionSource? RegisterSseWaiter()
     {
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_sseSubLock)
         {
-            if (_sseWaiters.Count < 32)
-                _sseWaiters.Add(tcs);
-            else
-                tcs.TrySetResult();
+            if (_sseWaiters.Count >= 32)
+                return null; // Fail closed: no busy-loop for a 33rd streaming connection.
+            _sseWaiters.Add(tcs);
         }
-        return tcs.Task;
+        return tcs;
     }
 
     private void SignalSseWaiters()
