@@ -124,6 +124,29 @@ public sealed class CodeIntelAndExecutionTests
     }
 
     [Fact]
+    public async Task SemanticReferencesIncludeGenericTypeNameSyntax()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "GenericUse.cs"), """
+            namespace Demo;
+            public sealed class Repository<T> { public T Echo(T item) => item; }
+            public sealed class Consumer
+            {
+                private Repository<int> _repo = new();
+                public int Read() => _repo.Echo(1);
+            }
+            """);
+        var references = await sb.Host.Registry.InvokeAsync("find_references",
+            new JsonObject { ["symbolName"] = "Repository" });
+        Assert.True(references.Success, references.ErrorMessage);
+        var data = JsonSerializer.SerializeToElement(references.Data);
+        Assert.Equal("roslyn-semantic", data.GetProperty("engine").GetString());
+        Assert.True(data.GetProperty("count").GetInt32() > 0,
+            "GenericNameSyntax references must not disappear from semantic results.");
+        Assert.Contains("GenericUse.cs", JsonSerializer.Serialize(references.Data));
+    }
+
+    [Fact]
     public async Task CommandExecution_HandlesTimeouts_Cancellation_ChildCleanup_AndBoundedLongLogPaging()
     {
         await using var sb = await TestSandbox.CreateAsync();
