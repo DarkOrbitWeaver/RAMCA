@@ -179,7 +179,14 @@ public sealed class CodeIntelAndExecutionTests
             if (j.Status == "cancelled") break;
             await Task.Delay(100);
         }
-        Assert.Equal("cancelled", sb.Host.Database.GetJob(jobId)!.Status);
+        var finalJob = sb.Host.Database.GetJob(jobId)!;
+        // Include the persisted failure details: a subprocess can fail *before*
+        // job_cancel arrives, and a status-only assertion hides the real cause.
+        Assert.True(finalJob.Status == "cancelled",
+            $"Expected cancelled, got {finalJob.Status}. " +
+            $"Error: {finalJob.ErrorMessage ?? "<none>"}. " +
+            $"Result: {finalJob.ResultJson ?? "<none>"}. " +
+            $"Events: {JsonSerializer.Serialize(sb.Host.Database.ListJobEvents(jobId, 0, 30))}");
         Assert.Equal(0, sb.Host.ProcessSupervisor.ActiveProcessCount);
 
         // 4. Long command output (3,000 lines) is bounded in response excerpt and fully pageable via read_log.
