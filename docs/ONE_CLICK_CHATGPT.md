@@ -9,10 +9,10 @@ PowerShell window, firewall rule, Cloudflare account, public URL, or always-on s
 1. On [OpenAI Platform > Tunnels](https://platform.openai.com/settings/organization/tunnels),
    create or select **your own** tunnel. Create a **runtime API key** with Tunnels Read + Use.
    Do not use an admin key for everyday connection.
-2. Keep the official `tunnel-client.exe` under `RAMCA/tools/tunnel-client/`. When running the
-   published app in a checkout's `portable/` folder, RAMCA also recognizes the parent checkout's
-   `tools/tunnel-client/` folder.
-3. Run RAMCA and press **C**. Paste your tunnel ID and runtime key once; the key entry is hidden.
+2. Press **C** in RAMCA. If `tunnel-client.exe` isn't installed, RAMCA downloads the pinned,
+   SHA-256-verified official Windows x64 release automatically into its portable `tools/` folder.
+   It also recognizes an existing client inside the parent source checkout's `tools/` folder.
+3. Paste your tunnel ID and runtime key once when prompted; the key entry is hidden.
    Or run `LocalIdeBridge.exe connect-chatgpt` in a terminal; the prompts are identical.
 4. RAMCA launches and supervises the tunnel automatically. In ChatGPT choose **Add custom MCP**,
    **Tunnel**, select the existing tunnel, choose **No authentication**, and create the connection.
@@ -29,8 +29,8 @@ Running `LocalIdeBridge.exe connect-chatgpt --disable` removes this local config
 ### What this does not do
 
 - It does **not** create a new OpenAI tunnel or runtime API key without an OpenAI account.
-- It does **not** install the tunnel client automatically or set up your friend's installation;
-  each person gets their own keys and tunnel configuration.
+- It does **not** set up your friend's installation; each person gets their own keys and tunnel
+  configuration. It **does** download the verified official Windows x64 client if needed.
 - Starting a child process is **not** proof the ChatGPT connection is healthy. Test MCP discovery
   and a read-only call first.
 - ChatGPT write-tool access and availability are governed by account/workspace permissions.

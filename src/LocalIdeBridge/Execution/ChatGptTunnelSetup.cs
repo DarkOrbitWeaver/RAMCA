@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -100,8 +102,14 @@ public static class ChatGptTunnelSetup
         var binary = FindBinary(paths);
         if (binary is null)
         {
-            Console.Error.WriteLine("tunnel-client.exe not found. Place it in RAMCA/tools/tunnel-client/, then retry.");
-            return 2;
+            Console.WriteLine("Downloading verified official tunnel-client for Windows x64...");
+            try { binary = InstallOfficialClientAsync(paths).GetAwaiter().GetResult(); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Could not install tunnel-client: {ex.Message}");
+                Console.Error.WriteLine("You can still extract the official Windows x64 ZIP into RAMCA/tools/tunnel-client/ and retry.");
+                return 2;
+            }
         }
 
         PortablePaths.AtomicWriteAllText(KeyFile(paths), key + Environment.NewLine);
@@ -117,6 +125,75 @@ public static class ChatGptTunnelSetup
         Console.WriteLine("RAMCA will start its tunnel automatically on launch, or press C in the running RAMCA window.");
         Console.WriteLine("In ChatGPT: Add custom MCP > Tunnel > select your existing tunnel > No authentication.");
         return 0;
+    }
+
+    /// <summary>
+    /// First-run convenience download only. Never execute an unverified binary.
+    /// The pinned SHA-256 belongs to the official OpenAI v0.0.21 windows-amd64 release asset.
+    /// </summary>
+    public static async Task<string> InstallOfficialClientAsync(PortablePaths paths, CancellationToken ct = default)
+    {
+        if (!OperatingSystem.IsWindows() || System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture !=
+            System.Runtime.InteropServices.Architecture.X64)
+            throw new PlatformNotSupportedException("Automatic tunnel-client installation supports Windows x64 only.");
+
+        const string url = "https://github.com/openai/tunnel-client/releases/download/v0.0.21/tunnel-client-v0.0.21-windows-amd64.zip";
+        const string sha = "2faf80ae62b58485fcef534cd3f78cd8b82e71cb04d14c2a5c73dbb4eb6c575a";
+        var destinationDir = Path.Combine(paths.ToolsDir, "tunnel-client");
+        var destination = Path.Combine(destinationDir, "tunnel-client.exe");
+        if (File.Exists(destination)) return destination;
+
+        paths.EnsureDirectories();
+        Directory.CreateDirectory(destinationDir);
+        var archivePath = Path.Combine(paths.TempDir, $"tunnel-client-{Guid.NewGuid():N}.zip");
+        var stagingExe = Path.Combine(destinationDir, $".tunnel-client-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
+            using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            await using (var output = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write,
+                             FileShare.None, 81920, FileOptions.Asynchronous))
+            await using (var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
+            {
+                // Do not allow an unexpectedly large release archive to consume the drive.
+                var buffer = new byte[81920];
+                long count = 0;
+                int read;
+                while ((read = await source.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false)) > 0)
+                {
+                    count += read;
+                    if (count > 85L * 1024 * 1024)
+                        throw new InvalidDataException("Tunnel-client archive exceeds the expected size limit.");
+                    await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                }
+            }
+            await using (var stream = File.OpenRead(archivePath))
+            {
+                var digest = Convert.ToHexString(await SHA256.HashDataAsync(stream, ct).ConfigureAwait(false));
+                if (!string.Equals(digest, sha, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Downloaded tunnel-client SHA-256 does not match the pinned official asset.");
+            }
+
+            using (var zip = ZipFile.OpenRead(archivePath))
+            {
+                var entry = zip.Entries.SingleOrDefault(e =>
+                    string.Equals(Path.GetFileName(e.FullName), "tunnel-client.exe", StringComparison.OrdinalIgnoreCase));
+                if (entry is null || entry.Length is <= 0 or > 120L * 1024 * 1024)
+                    throw new InvalidDataException("Verified archive does not contain the expected tunnel-client.exe.");
+                await using var input = entry.Open();
+                await using var output = new FileStream(stagingExe, FileMode.CreateNew, FileAccess.Write,
+                    FileShare.None, 81920, FileOptions.Asynchronous);
+                await input.CopyToAsync(output, ct).ConfigureAwait(false);
+            }
+            File.Move(stagingExe, destination, overwrite: false);
+            return destination;
+        }
+        finally
+        {
+            try { File.Delete(archivePath); } catch { }
+            try { File.Delete(stagingExe); } catch { }
+        }
     }
 
     public static string? FindBinary(PortablePaths paths)
