@@ -175,7 +175,7 @@ public sealed class McpServer
         // identify calls within a transport request, not across all clients.
         // Legacy session-bearing clients keep their stable cancellation scope.
         var dispatchScope = reqSessionId ??
-            (isStateless2026 ? $"stateless-{Guid.NewGuid():N}" : "http-" + ctx.Connection.Id);
+            (isStateless2026 ? $"stateless-{Guid.NewGuid():N}" : "http");
 
         if (parsed is JsonArray batch)
         {
