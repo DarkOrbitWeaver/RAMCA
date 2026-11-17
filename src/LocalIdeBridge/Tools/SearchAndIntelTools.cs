@@ -467,7 +467,7 @@ public sealed class SearchAndIntelTools
                             var model = compilation.GetSemanticModel(tree);
                             var root = tree.GetRoot(ct);
 
-                            foreach (var idNode in root.DescendantNodes().OfType<IdentifierNameSyntax>())
+                            foreach (var idNode in root.DescendantNodes().OfType<SimpleNameSyntax>())
                             {
                                 ct.ThrowIfCancellationRequested();
                                 if (!targetNames.Contains(idNode.Identifier.ValueText))
