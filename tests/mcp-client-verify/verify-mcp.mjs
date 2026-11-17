@@ -142,7 +142,7 @@ try {
   const patch = [
     "--- a/Slugifier.cs",
     "+++ b/Slugifier.cs",
-    "@@ -4,7 +4,7 @@",
+    "@@ -4,7 +4,6 @@",
     " {",
     "     public static string ToSlug(string input)",
     "     {",
