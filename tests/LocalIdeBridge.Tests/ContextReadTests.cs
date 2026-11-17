@@ -53,6 +53,21 @@ public sealed class ContextReadTests
     }
 
     [Fact]
+    public async Task NumberedSingleLineReadNeverExceedsRequestedCap()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "one.txt"), new string('x', 8192));
+        var read = await sb.Host.Registry.InvokeAsync("read_file", new JsonObject
+        {
+            ["path"] = "one.txt", ["maxChars"] = 256, ["includeLineNumbers"] = true
+        });
+        Assert.True(read.Success, read.ErrorMessage);
+        var data = Data(read.Data);
+        Assert.True(data.GetProperty("truncated").GetBoolean());
+        Assert.True(data.GetProperty("content").GetString()!.Length <= 256);
+    }
+
+    [Fact]
     public async Task RejectsTooManyRangesBeforeAnyRead()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);
