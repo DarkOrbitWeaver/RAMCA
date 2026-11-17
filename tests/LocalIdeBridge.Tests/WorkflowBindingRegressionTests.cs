@@ -107,6 +107,6 @@ public sealed class WorkflowBindingRegressionTests
             ]
         });
         Assert.Equal("succeeded", result.Status);
-        Assert.Equal("source\n", await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "b.txt")));
+        Assert.Equal("source" + Environment.NewLine, await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "b.txt")));
     }
 }
