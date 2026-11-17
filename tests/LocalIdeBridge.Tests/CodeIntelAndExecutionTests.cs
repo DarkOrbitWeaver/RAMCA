@@ -147,6 +147,32 @@ public sealed class CodeIntelAndExecutionTests
     }
 
     [Fact]
+    public async Task SemanticDisabledSettingIsHonoredByAllSemanticTools()
+    {
+        await using var sb = await TestSandbox.CreateAsync(
+            cfg => cfg.Integrations.EnableRoslynSemantic = false, startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "Demo.cs"),
+            "public class Demo { public int M() => 1; }\n");
+        var checks = new[]
+        {
+            ("go_to_definition", new JsonObject { ["symbolName"] = "Demo" }),
+            ("find_references", new JsonObject { ["symbolName"] = "Demo" }),
+            ("find_implementations", new JsonObject { ["symbolName"] = "Demo" }),
+            ("inspect_type", new JsonObject { ["typeName"] = "Demo" }),
+            ("compiler_diagnostics", new JsonObject { ["mode"] = "roslyn" })
+        };
+        foreach (var (name, arguments) in checks)
+        {
+            var result = await sb.Host.Registry.InvokeAsync(name, arguments);
+            Assert.False(result.Success, name);
+            Assert.Equal("semantic_disabled", result.ErrorCode);
+        }
+        var textResult = await sb.Host.Registry.InvokeAsync("text_search",
+            new JsonObject { ["query"] = "Demo" });
+        Assert.True(textResult.Success, textResult.ErrorMessage);
+    }
+
+    [Fact]
     public async Task CommandExecution_HandlesTimeouts_Cancellation_ChildCleanup_AndBoundedLongLogPaging()
     {
         await using var sb = await TestSandbox.CreateAsync();
