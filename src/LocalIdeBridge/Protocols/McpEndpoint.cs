@@ -231,7 +231,11 @@ public sealed class McpServer
             var seq = 1;
             foreach (var r in responses)
             {
-                var frame = $"event: message\nid: {seq++}\ndata: {r.ToJsonString()}\n\n";
+                // Modern 2026 MCP removed SSE event-ID replay. Durable operation
+                // status is provided by execute_once/operation_status instead.
+                var frame = isStateless2026
+                    ? $"event: message\ndata: {r.ToJsonString()}\n\n"
+                    : $"event: message\nid: {seq++}\ndata: {r.ToJsonString()}\n\n";
                 await ctx.Response.WriteAsync(frame, ct);
             }
             await ctx.Response.Body.FlushAsync(ct);
@@ -648,7 +652,13 @@ public sealed class McpServer
                         ["mimeType"] = "text/markdown"
                     }
                 };
-                return (MakeResult(idNode, new JsonObject { ["resources"] = resources }), null, DefaultProtocolVersion);
+                var resourceList = new JsonObject { ["resources"] = resources };
+                if (isStateless2026)
+                {
+                    resourceList["ttlMs"] = 10000;
+                    resourceList["cacheScope"] = "private";
+                }
+                return (MakeResult(idNode, resourceList), null, DefaultProtocolVersion);
             }
 
             case "resources/read":
@@ -684,7 +694,9 @@ public sealed class McpServer
                     ["contents"] = new JsonArray
                     {
                         new JsonObject { ["uri"] = uri, ["mimeType"] = mime, ["text"] = text }
-                    }
+                    },
+                    ["ttlMs"] = isStateless2026 ? 0 : null,
+                    ["cacheScope"] = isStateless2026 ? "private" : null
                 }), null, DefaultProtocolVersion);
             }
 
@@ -702,7 +714,13 @@ public sealed class McpServer
                         }
                     }
                 };
-                return (MakeResult(idNode, new JsonObject { ["prompts"] = prompts }), null, DefaultProtocolVersion);
+                var promptList = new JsonObject { ["prompts"] = prompts };
+                if (isStateless2026)
+                {
+                    promptList["ttlMs"] = 60000;
+                    promptList["cacheScope"] = "private";
+                }
+                return (MakeResult(idNode, promptList), null, DefaultProtocolVersion);
             }
 
             case "prompts/get":

@@ -64,10 +64,15 @@ public static class OperationLedgerTools
                         new { operationId = opId, operation.Status, operation.ToolName, operation.Workspace });
                 }
 
-                // ToolRegistry owns workspace write locking, cancellation and supervision.
-                // The ledger remains 'running' until the result is durably recorded.
+                // The client request can be cancelled by network loss even though the
+                // local operation is still valid. After reserving a durable operation ID,
+                // do not bind the underlying execution to RequestAborted. This Task
+                // remains alive while the RAMCA host process is alive; process shutdown
+                // still terminates owned children and startup marks an unknown outcome.
+                // For explicit cancellation, launch a cancellable job_start operation.
                 var result = await registry.InvokeAsync(name, (JsonObject)inner.DeepClone(),
-                    new ToolExecutionContext(ctx.SessionId, ctx.JobId, ctx.ReportProgress, WorkspaceRoot: workspace), ct);
+                    new ToolExecutionContext(ctx.SessionId, ctx.JobId, ctx.ReportProgress, WorkspaceRoot: workspace),
+                    CancellationToken.None).ConfigureAwait(false);
                 db.CompleteOperation(opId, result);
                 return result;
             });

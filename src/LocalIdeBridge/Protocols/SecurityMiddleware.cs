@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using LocalIdeBridge.Core;
 
 namespace LocalIdeBridge.Protocols;
@@ -71,8 +72,12 @@ public sealed class SecurityMiddleware
             }
         }
 
-        // Enforce request payload cap early.
+        // Enforce the configured cap even on chunked uploads with no Content-Length.
+        // The length header alone is not a memory limit; Kestrel must stop reads.
         var maxBytes = _config.Security.MaxRequestBodyBytes;
+        var requestSize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (requestSize is { IsReadOnly: false })
+            requestSize.MaxRequestBodySize = maxBytes;
         if (context.Request.ContentLength.HasValue && context.Request.ContentLength.Value > maxBytes)
         {
             await WriteJsonError(context, StatusCodes.Status413PayloadTooLarge, "payload_too_large",

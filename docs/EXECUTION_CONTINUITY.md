@@ -4,7 +4,7 @@ Remote tool calls can finish locally while the AI client loses the HTTP/MCP resp
 
 RAMCA now exposes two additional tools (subject to clean Windows build/tests):
 
-- `execute_once`: pass `operationId` (a stable, unique value), `tool` (ordinary engineering tool name) and `arguments` (its JSON parameters). RAMCA persists a `running` record **before** invoking the tool. Retrying with the same operation ID never invokes it again.
+- `execute_once`: pass `operationId` (a stable, unique value), `tool` (ordinary engineering tool name) and `arguments` (its JSON parameters). RAMCA persists a `running` record **before** invoking the tool. After reservation, loss of the HTTP request no longer cancels the local execution. Retrying with the same operation ID never invokes it again.
 - `operation_status`: read the persisted `running`, `succeeded`, `failed`, or `interrupted_unknown` state and recorded response.
 
 Suggested flow for a non-idempotent operation:
@@ -16,6 +16,6 @@ Suggested flow for a non-idempotent operation:
 5. If RAMCA crashed mid-execution it changes lingering `running` to `interrupted_unknown`. This is intentionally **not auto-replayed**. Inspect the workspace, changed files and logs, decide whether remediation is needed, and then use a new operation ID only for a deliberately new action.
 6. An operation ID reused with different arguments, target tool, or workspace is rejected.
 
-**Limitations:** This requires clients to use `execute_once`; ordinary raw tool invocations without operation IDs are not deduplicated. An `interrupted_unknown` state cannot prove whether execution completed. Crash consistency of file operations is handled separately by the edit transaction manifests. This does not preserve an AI model's reasoning state or guarantee continuing a ChatGPT conversation.
+**Limitations:** A long `execute_once` operation continues only while the RAMCA host process remains alive. Host exit or machine crash moves an incomplete operation to `interrupted_unknown`; it must be inspected rather than blindly replayed. Explicit cancellation for lengthy work is better handled through a separately tracked `job_start` operation. This requires clients to use `execute_once`; ordinary raw tool invocations without operation IDs are not deduplicated. An `interrupted_unknown` state cannot prove whether execution completed. Crash consistency of file operations is handled separately by the edit transaction manifests. This does not preserve an AI model's reasoning state or guarantee continuing a ChatGPT conversation.
 
 **Do not use on valuable repositories until .NET tests, Windows tests, and reconnect fault injection pass.**

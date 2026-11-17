@@ -32,6 +32,15 @@ The auditor's **5.6/10** was a rating of the original source, not the quality of
 13. Added targeted regression tests to disposable workspaces for crash-recovery conflict rules, patch correctness, deletion safety, unpruned backups, Git metadata protection, large job-result fidelity, and TRX aggregation.
 14. Added a durable `operation_ledger` with explicit `execute_once` and `operation_status` tools. An interrupted operation becomes `interrupted_unknown` at startup and is not automatically replayed; documented client contract in [Execution Continuity](EXECUTION_CONTINUITY.md). This is **opt-in** and does not yet deduplicate ordinary raw MCP calls.
 
+### Additional continuity and protocol source hardening (2026-11-17)
+
+- `revert_edit` now uses the same write-ahead transaction path as ordinary edits, and produces a journaled undo-of-undo operation. An uninterrupted Windows rebuild and real power-loss tests remain required.
+- Recovery now locates pending transaction backups by portable session/edit IDs and streams large restores without buffering entire files in RAM.
+- Modern MCP `2026-07-28` handling uses discovery and request metadata, rejects incompatible batches and routing headers, and avoids removed SSE event IDs on modern request-scoped streams. External client compatibility has NOT been proven.
+- `execute_once` no longer delegates HTTP RequestAborted cancellation to the reserved operation. A client disconnect alone should not cancel an already-reserved tool call. The host itself must remain running. Added a regression test, unexecuted here.
+- Background jobs distinguish timeout from user cancellation in durable status. Request-body limits now apply to chunked transfers through the HTTP server feature.
+- GitHub CI was expanded to Windows and Linux, but its runs failed before exposing usable job steps; **a passing build and test suite has not been established**.
+
 ### Implementation != verification
 
 The above statements describe **source changes**. As of this draft, no .NET SDK was available in the editing container; consequently **no new build or test has been independently executed there**. GitHub Actions has previously returned `failure` without usable job-step logs, so do not treat CI as green until a successful run can be inspected.

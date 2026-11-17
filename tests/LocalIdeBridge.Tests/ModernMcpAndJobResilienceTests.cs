@@ -138,6 +138,41 @@ public sealed class ModernMcpAndJobResilienceTests
     }
 
     [Fact]
+    public async Task ExecuteOnceContinuesAfterCallerLosesConnection()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var target = Path.Combine(sb.WorkspaceDir, "detached-completion.txt");
+        sb.Host.Registry.Register(new LocalIdeBridge.Tools.ToolDefinition(
+            Name: "test_delayed_write", Category: "editing", Description: "Disposable delayed edit test.",
+            IsReadOnly: false, IsIdempotent: false, SideEffects: "Test-only disposable file.", Parameters: [],
+            Handler: async (_, _, ct) =>
+            {
+                await Task.Delay(300, ct);
+                await File.WriteAllTextAsync(target, "completed", ct);
+                return LocalIdeBridge.Tools.ToolResult.Ok("Test completed.");
+            }));
+        using var requestGone = new CancellationTokenSource();
+        var id = "test_detached_" + Guid.NewGuid().ToString("N");
+        var invocation = sb.Host.Registry.InvokeAsync("execute_once", new JsonObject
+        {
+            ["operationId"] = id, ["tool"] = "test_delayed_write", ["arguments"] = new JsonObject()
+        }, ct: requestGone.Token);
+        await Task.Delay(80);
+        requestGone.Cancel(); // Equivalent to HTTP client disconnecting mid-call.
+        var completed = await invocation;
+        Assert.True(completed.Success, completed.ErrorMessage);
+        Assert.Equal("completed", await File.ReadAllTextAsync(target));
+        var status = await sb.Host.Registry.InvokeAsync("operation_status", new JsonObject { ["operationId"] = id });
+        Assert.True(status.Success);
+        Assert.Contains("succeeded", JsonSerializer.Serialize(status.Data));
+        var replay = await sb.Host.Registry.InvokeAsync("execute_once", new JsonObject
+        {
+            ["operationId"] = id, ["tool"] = "test_delayed_write", ["arguments"] = new JsonObject()
+        });
+        Assert.True(replay.Success);
+    }
+
+    [Fact]
     public async Task UndoIsJournaledAndItsOwnUndoRestoresThePriorFile()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);
