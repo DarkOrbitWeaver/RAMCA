@@ -42,7 +42,9 @@ public sealed record CommandExecutionResult(
     int TotalLogLines,
     long TotalLogBytes,
     bool LogTruncated,
-    IReadOnlyList<CompilerDiagnostic> Diagnostics);
+    IReadOnlyList<CompilerDiagnostic> Diagnostics,
+    string? StdoutCapture = null,
+    bool StdoutCaptureTruncated = false);
 
 /// <summary>
 /// Policy-enforced, cancellable, bounded-memory command runner with disk-backed streaming logs,
@@ -88,7 +90,8 @@ public sealed partial class ProcessRunner
         int? timeoutSeconds = null,
         bool parseCompilerDiagnostics = false,
         bool allowWorkspaceExecutable = false,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int stdoutCaptureLimit = 0)
     {
         if (!_config.Autonomy.AllowCommands)
             throw new WorkspaceViolationException("Command execution is disabled by autonomy configuration.");
@@ -112,6 +115,10 @@ public sealed partial class ProcessRunner
         var startedAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
         var diagnostics = new List<CompilerDiagnostic>();
+        stdoutCaptureLimit = Math.Clamp(stdoutCaptureLimit, 0, 2_000_000);
+        // Bounded structured capture only when a caller needs exact stdout, e.g. git status.
+        var capturedStdout = stdoutCaptureLimit > 0 ? new StringBuilder(Math.Min(4096, stdoutCaptureLimit)) : null;
+        var stdoutCaptureTruncated = false;
         var diagSeen = new HashSet<string>(StringComparer.Ordinal);
 
         using var logWriter = _logs.OpenWriter(execId, sessionId, category);
@@ -137,6 +144,10 @@ public sealed partial class ProcessRunner
         // Never leak interactive prompts during unattended automation.
         psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
         psi.Environment["GCM_INTERACTIVE"] = "never";
+        psi.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        psi.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
+        if (!string.IsNullOrWhiteSpace(_config.Connection.TlsCertPasswordEnvVar))
+            psi.Environment.Remove(_config.Connection.TlsCertPasswordEnvVar);
 
         // On Linux/macOS test hosts, wrap long child execution cleanly; on Windows, Job Objects kill the full tree.
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -144,7 +155,12 @@ public sealed partial class ProcessRunner
             throw new InvalidOperationException($"Failed to start process '{executable}'.");
 
         var pid = proc.Id;
-        _supervisor.Register(proc);
+        try { _supervisor.Register(proc); }
+        catch
+        {
+            ChildProcessSupervisor.TryKillTree(proc);
+            throw;
+        }
         try { proc.StandardInput.Close(); } catch { }
 
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(effectiveTimeout));
@@ -154,38 +170,66 @@ public sealed partial class ProcessRunner
         var cancelled = false;
         int exitCode;
 
-        Task PumpStreamAsync(StreamReader reader, string prefix) => Task.Run(async () =>
+        async Task PumpStreamAsync(StreamReader reader, string prefix)
         {
+            // Read fixed-size chunks; StreamReader.ReadLineAsync allocates one enormous
+            // string if a compiler or malicious child prints a newline-free 50MB line.
+            var buffer = new char[4096];
+            var current = new StringBuilder(4096);
+            void Emit(string line)
+            {
+                logWriter.WriteLine(prefix, line);
+                if (!parseCompilerDiagnostics || diagnostics.Count >= 100) return;
+                var m = MsBuildDiagRegex().Match(line.Trim());
+                if (!m.Success) return;
+                var d = new CompilerDiagnostic(m.Groups["file"].Value.Trim(),
+                    int.TryParse(m.Groups["line"].Value, out var ln) ? ln : 0,
+                    int.TryParse(m.Groups["col"].Value, out var col) ? col : 0,
+                    m.Groups["sev"].Value.ToLowerInvariant(), m.Groups["code"].Value,
+                    m.Groups["msg"].Value.Trim());
+                var key = $"{d.File}:{d.Line}:{d.Column}:{d.Code}";
+                lock (diagnostics)
+                {
+                    if (diagnostics.Count < 100 && diagSeen.Add(key)) diagnostics.Add(d);
+                }
+            }
             try
             {
-                string? line;
-                while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) is not null)
+                int count;
+                while ((count = await reader.ReadAsync(buffer.AsMemory(), linkedCts.Token).ConfigureAwait(false)) > 0)
                 {
-                    logWriter.WriteLine(prefix, line);
-                    if (parseCompilerDiagnostics && diagnostics.Count < 100)
+                    // Capture exact chars BEFORE formatting long log lines with
+                    // "[continued]" markers. Git diff must never contain log decorations.
+                    if (prefix == "out" && capturedStdout is not null)
                     {
-                        var m = MsBuildDiagRegex().Match(line.Trim());
-                        if (m.Success)
+                        var remaining = stdoutCaptureLimit - capturedStdout.Length;
+                        if (count > remaining) stdoutCaptureTruncated = true;
+                        if (remaining > 0)
+                            capturedStdout.Append(buffer.AsSpan(0, Math.Min(count, remaining)));
+                    }
+                    for (var i = 0; i < count; i++)
+                    {
+                        if (buffer[i] == '\n')
                         {
-                            var d = new CompilerDiagnostic(
-                                m.Groups["file"].Value.Trim(),
-                                int.TryParse(m.Groups["line"].Value, out var ln) ? ln : 0,
-                                int.TryParse(m.Groups["col"].Value, out var col) ? col : 0,
-                                m.Groups["sev"].Value.ToLowerInvariant(),
-                                m.Groups["code"].Value,
-                                m.Groups["msg"].Value.Trim());
-                            var key = $"{d.File}:{d.Line}:{d.Column}:{d.Code}";
-                            lock (diagnostics)
+                            Emit(current.ToString().TrimEnd('\r'));
+                            current.Clear();
+                        }
+                        else
+                        {
+                            current.Append(buffer[i]);
+                            if (current.Length >= 4096)
                             {
-                                if (diagnostics.Count < 100 && diagSeen.Add(key))
-                                    diagnostics.Add(d);
+                                Emit(current.ToString() + " [continued]");
+                                current.Clear();
                             }
                         }
                     }
                 }
+                if (current.Length > 0) Emit(current.ToString());
             }
-            catch { }
-        }, CancellationToken.None);
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+        }
 
         var stdoutTask = PumpStreamAsync(proc.StandardOutput, "out");
         var stderrTask = PumpStreamAsync(proc.StandardError, "err");
@@ -231,7 +275,9 @@ public sealed partial class ProcessRunner
             logWriter.TotalLines,
             logWriter.TotalBytes,
             logWriter.WasTruncated,
-            diagnostics);
+            diagnostics,
+            capturedStdout?.ToString(),
+            stdoutCaptureTruncated || (capturedStdout is not null && (!stdoutTask.IsCompletedSuccessfully || !stderrTask.IsCompletedSuccessfully)));
 
         if (exitCode != 0)
             _logger.Warn("exec", $"{category} '{Path.GetFileName(resolvedExe)}' exited with {exitCode}", $"execId={execId}", sw.ElapsedMilliseconds);
@@ -292,14 +338,30 @@ public sealed partial class ProcessRunner
                 throw new WorkspaceViolationException("Shell script execution is disabled by policy.");
         }
 
+        if (baseName.Equals("git", StringComparison.OrdinalIgnoreCase) &&
+            _config.Autonomy.GitPushPolicy.Equals("deny", StringComparison.OrdinalIgnoreCase) &&
+            arguments.Any(arg => arg.Equals("push", StringComparison.OrdinalIgnoreCase)))
+            throw new WorkspaceViolationException("Direct git push is disabled by gitPushPolicy. Use an explicitly authorized Git workflow.");
+
         // Check if executable is an explicit path inside the workspace.
         if (executable.Contains('/') || executable.Contains('\\'))
         {
             // Allow explicitly resolved system shell/dotnet path passed internally, or approved workspace binary.
             if (Path.IsPathRooted(executable) && File.Exists(executable))
             {
-                if (IsAllowedToolName(baseName, repoPolicy))
+                // Only portable tools are a trusted path-based exception. Otherwise
+                // a workspace executable must be explicitly opted into by this call.
+                if (WorkspaceGuard.IsEqualOrInside(executable, _paths.ToolsDir) && IsAllowedToolName(baseName, repoPolicy))
                     return executable;
+                var foundOnPath = FindOnPath(Path.GetFileName(executable));
+                if (!string.IsNullOrWhiteSpace(foundOnPath) &&
+                    string.Equals(Path.GetFullPath(foundOnPath), Path.GetFullPath(executable),
+                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) &&
+                    !WorkspaceGuard.IsEqualOrInside(executable, wsRoot) &&
+                    IsAllowedToolName(baseName, repoPolicy))
+                    return executable;
+                if (!WorkspaceGuard.IsEqualOrInside(executable, wsRoot) && !allowWorkspaceExecutable)
+                    throw new WorkspaceViolationException("Untrusted absolute executable path. Use an approved executable name on PATH.");
             }
 
             if (!allowWorkspaceExecutable)
@@ -322,7 +384,12 @@ public sealed partial class ProcessRunner
         if (portableTool is not null) return portableTool;
 
         var onPath = FindOnPath(executable);
-        if (onPath is not null) return onPath;
+        if (onPath is not null)
+        {
+            if (WorkspaceGuard.IsEqualOrInside(onPath, wsRoot))
+                throw new WorkspaceViolationException("PATH resolved a program inside the workspace. Supply allowWorkspaceExecutable explicitly.");
+            return onPath;
+        }
 
         if (baseName.Equals("dotnet", StringComparison.OrdinalIgnoreCase))
         {
@@ -364,7 +431,8 @@ public sealed partial class ProcessRunner
 
         var doc = XDocument.Load(trxPath);
         var ns = doc.Root?.Name.Namespace ?? XNamespace.None;
-        var counters = doc.Descendants(ns + "Counters").FirstOrDefault();
+        var counters = doc.Descendants(ns + "Counters").FirstOrDefault()
+            ?? throw new InvalidDataException($"TRX report has no test counters: {trxPath}");
 
         int Attr(string name) => int.TryParse(counters?.Attribute(name)?.Value, out var v) ? v : 0;
 
@@ -395,6 +463,24 @@ public sealed partial class ProcessRunner
         }
 
         return new TestRunSummary(total, passed, failed, skipped, failures);
+    }
+
+    public static (TestRunSummary Summary, int ReportFiles) ParseTrxDirectory(string directory)
+    {
+        if (!Directory.Exists(directory)) return (new TestRunSummary(0, 0, 0, 0, []), 0);
+        var files = Directory.GetFiles(directory, "*.trx", SearchOption.AllDirectories);
+        var total = 0; var passed = 0; var failed = 0; var skipped = 0;
+        var failures = new List<TestCaseFailure>();
+        foreach (var file in files)
+        {
+            var report = ParseTrxFile(file); // malformed files must fail, not report 0 passing tests
+            total += report.Total;
+            passed += report.Passed;
+            failed += report.Failed;
+            skipped += report.Skipped;
+            foreach (var item in report.Failures.Take(Math.Max(0, 50 - failures.Count))) failures.Add(item);
+        }
+        return (new TestRunSummary(total, passed, failed, skipped, failures), files.Length);
     }
 
     public static string? FindOnPath(string exeName)

@@ -17,6 +17,7 @@ public sealed partial class CredentialStore
     private string _currentKey = "";
     private byte[] _currentHash = [];
     private string? _previousKeyForRedaction;
+    private long _lastFileCheckMs;
     public DateTimeOffset LastRotatedUtc { get; private set; } = DateTimeOffset.UtcNow;
 
     [GeneratedRegex(@"lib_[A-Za-z0-9\-_]{16,}", RegexOptions.Compiled)]
@@ -80,7 +81,7 @@ public sealed partial class CredentialStore
 
         _currentKey = key;
         _currentHash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
-        LastRotatedUtc = DateTimeOffset.UtcNow;
+        LastRotatedUtc = File.GetLastWriteTimeUtc(_paths.SecretKeyFile);
         return key;
     }
 
@@ -89,6 +90,7 @@ public sealed partial class CredentialStore
         if (string.IsNullOrWhiteSpace(candidate) || candidate.Length > 256)
             return false;
 
+        RefreshRotatedKeyFromDisk();
         var candidateHash = SHA256.HashData(Encoding.UTF8.GetBytes(candidate.Trim()));
         byte[] expectedHash;
         lock (_sync)
@@ -100,6 +102,36 @@ public sealed partial class CredentialStore
             return false;
 
         return CryptographicOperations.FixedTimeEquals(candidateHash, expectedHash);
+    }
+
+    private void RefreshRotatedKeyFromDisk()
+    {
+        var now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _lastFileCheckMs) < 250) return;
+        lock (_sync)
+        {
+            if (now - _lastFileCheckMs < 250) return;
+            _lastFileCheckMs = now;
+            try
+            {
+                var lastWrite = File.GetLastWriteTimeUtc(_paths.SecretKeyFile);
+                if (lastWrite <= LastRotatedUtc.UtcDateTime) return;
+                var newKey = File.ReadAllText(_paths.SecretKeyFile, Encoding.UTF8).Trim();
+                if (newKey.StartsWith(KeyPrefix, StringComparison.Ordinal) && newKey.Length >= 36)
+                {
+                    _previousKeyForRedaction = _currentKey;
+                    _currentKey = newKey;
+                    _currentHash = SHA256.HashData(Encoding.UTF8.GetBytes(newKey));
+                    LastRotatedUtc = lastWrite;
+                }
+                else
+                {
+                    // A missing/invalid key file must not leave an old valid key online.
+                    _currentHash = [];
+                }
+            }
+            catch { _currentHash = []; }
+        }
     }
 
     public string GetSecretForExplicitCopy()

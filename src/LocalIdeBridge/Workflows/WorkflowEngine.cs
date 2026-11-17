@@ -97,6 +97,7 @@ public sealed class WorkflowEngine
         var wfId = $"wf_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
         var sid = sessionId ?? _db.ActiveSessionId;
         var ws = _guard.RequireActiveWorkspace();
+        using var invocationScope = _guard.UseInvocationWorkspace(ws);
         var createdAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
 
@@ -266,8 +267,9 @@ public sealed class WorkflowEngine
         CancellationToken wfCt)
     {
         var tool = _registry.Find(spec.Tool)!;
-        // Safety rule: only retry idempotent/read-only tools unless retries explicitly bounded (max 3).
-        var maxAttempts = 1 + Math.Clamp(spec.Retries, 0, tool.IsIdempotent || tool.IsReadOnly ? 5 : 2);
+        // Retrying an edit/command/commit after a timeout can execute it TWICE.
+        // Retry only explicit idempotent operations; the caller can inspect and resume.
+        var maxAttempts = 1 + (tool.IsIdempotent || tool.IsReadOnly ? Math.Clamp(spec.Retries, 0, 5) : 0);
         var stepSw = Stopwatch.StartNew();
         ToolResult? lastResult = null;
 
@@ -286,7 +288,8 @@ public sealed class WorkflowEngine
             var argsClone = spec.Arguments is null ? new JsonObject() : (JsonObject)spec.Arguments.DeepClone();
             try
             {
-                lastResult = await _registry.InvokeAsync(spec.Tool, argsClone, new ToolExecutionContext(sessionId), stepCts.Token).ConfigureAwait(false);
+                lastResult = await _registry.InvokeAsync(spec.Tool, argsClone,
+                    new ToolExecutionContext(sessionId, WorkspaceRoot: _guard.RequireActiveWorkspace()), stepCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!wfCt.IsCancellationRequested)
             {
@@ -360,6 +363,9 @@ public sealed class WorkflowEngine
             return states.Values.Any(s => s.Status == "failed");
         }
 
+        if (!cond.Equals("on_success", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"Unsupported workflow runIf condition '{cond}'.");
+
         // Default: on_success — every direct dependency must have succeeded (or failed with continueOnError=true).
         foreach (var dep in step.DependsOn)
         {
@@ -389,6 +395,13 @@ public sealed class WorkflowEngine
                 throw new ArgumentException($"Step '{s.Id}' references unknown tool '{s.Tool}'.");
             if (s.Tool.Equals("workflow_run", StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException("Nested workflow_run inside a workflow step is not permitted.");
+            var cond = (s.RunIf ?? "on_success").Trim();
+            if (!(cond.Equals("on_success", StringComparison.OrdinalIgnoreCase) ||
+                  cond.Equals("on_failure", StringComparison.OrdinalIgnoreCase) ||
+                  cond.Equals("always", StringComparison.OrdinalIgnoreCase) ||
+                  cond.StartsWith("step_succeeded:", StringComparison.OrdinalIgnoreCase) ||
+                  cond.StartsWith("step_failed:", StringComparison.OrdinalIgnoreCase)))
+                throw new ArgumentException($"Unknown workflow runIf condition: '{cond}'.");
         }
 
         foreach (var s in def.Steps)
@@ -400,6 +413,16 @@ public sealed class WorkflowEngine
                 if (string.Equals(dep, s.Id, StringComparison.OrdinalIgnoreCase))
                     throw new ArgumentException($"Step '{s.Id}' cannot depend on itself.");
             }
+        }
+
+        foreach (var s in def.Steps)
+        {
+            var condition = (s.RunIf ?? "").Trim();
+            var colon = condition.IndexOf(':');
+            if (colon < 0) continue;
+            var referenced = condition[(colon + 1)..].Trim();
+            if (!ids.Contains(referenced) || !s.DependsOn.Contains(referenced, StringComparer.OrdinalIgnoreCase))
+                throw new ArgumentException($"Step '{s.Id}' condition must reference one of its declared dependencies.");
         }
 
         // Cycle detection via 3-color DFS.

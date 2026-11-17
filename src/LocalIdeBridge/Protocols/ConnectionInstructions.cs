@@ -87,11 +87,12 @@ public sealed class ConnectionInstructions
     }
 
     public string BuildClientTemplate(string clientName)
-    {
-        var baseUrl = GetEffectiveBaseUrl();
-        var mcpUrl = $"{baseUrl}/mcp";
-        var exePath = Environment.ProcessPath ?? @"C:\LocalIdeBridge\LocalIdeBridge.exe";
+        => BuildClientTemplateOffline(clientName, GetEffectiveBaseUrl(), Environment.ProcessPath ?? @"C:\LocalIdeBridge\LocalIdeBridge.exe");
 
+    // Safe to call from the CLI while a separate host owns the portable state.
+    public static string BuildClientTemplateOffline(string clientName, string baseUrl, string exePath)
+    {
+        var mcpUrl = $"{baseUrl}/mcp";
         return clientName.Trim().ToLowerInvariant() switch
         {
             "codex" => $"""
@@ -128,7 +129,7 @@ public sealed class ConnectionInstructions
                   "mcpServers": {
                     "localidebridge": {
                       "type": "http",
-                      "url": "{{mcpUrl}}",
+                      "httpUrl": "{{mcpUrl}}",
                       "headers": {
                         "Authorization": "Bearer $LOCALIDEBRIDGE_KEY"
                       }

@@ -26,6 +26,8 @@ public sealed class ChildProcessSupervisor : IDisposable
         if (OperatingSystem.IsWindows())
         {
             _windowsJobHandle = CreateKillOnCloseWindowsJob(childMemoryLimitMb);
+            if (_windowsJobHandle == IntPtr.Zero)
+                throw new InvalidOperationException("Windows Job Object unavailable; refusing unsupervised command execution.");
         }
     }
 
@@ -181,11 +183,15 @@ public sealed class ChildProcessSupervisor : IDisposable
         {
             // On Windows 8+ and Windows 11, nested Job Objects are natively supported,
             // so this works cleanly even when LocalIdeBridge itself runs inside Windows Terminal or CI.
-            Win32.AssignProcessToJobObject(hJob, process.Handle);
+            if (!Win32.AssignProcessToJobObject(hJob, process.Handle) && !process.HasExited)
+            {
+                TryKillTree(process);
+                throw new InvalidOperationException("Unable to register child in Windows Job Object; process terminated to prevent orphaned descendants.");
+            }
         }
-        catch
+        catch (Exception) when (process.HasExited)
         {
-            // Ignore race if child exited prior to handle assignment.
+            // Child finished before it could be assigned.
         }
     }
 

@@ -130,7 +130,11 @@ public static class Program
         {
             var full = Path.GetFullPath(wsOverride);
             if (Directory.Exists(full))
+            {
+                using var guard = new WorkspaceGuard(paths, config);
+                guard.ValidateTrustableDirectory(full);
                 config.AddTrustedWorkspace(full, setAsDefault: true);
+            }
         }
 
         await using var host = new WorkbenchHost(paths, config);
@@ -234,14 +238,28 @@ public static class Program
         return 0;
     }
 
-    private static async Task<int> HandleInstructionsCommandAsync(PortablePaths paths, IReadOnlyList<string> args)
+    private static Task<int> HandleInstructionsCommandAsync(PortablePaths paths, IReadOnlyList<string> args)
     {
-        paths.EnsureDirectories();
-        await using var host = new WorkbenchHost(paths);
+        // Instructions must never create a WorkbenchHost: a second host would recover/close
+        // the first host's active jobs, clear its temporary files, and delete its PID file.
+        var config = AppConfig.Load(paths);
+        var baseUrl = config.GetEffectiveBaseUrl();
         var client = SetupWizard.GetOpt(args, "--client");
         var text = string.IsNullOrWhiteSpace(client)
-            ? host.Instructions.BuildAgentInstructions()
-            : host.Instructions.BuildClientTemplate(client);
+            ? $"""
+              # RAMCA — AI Client Connection Instructions
+
+              MCP Streamable HTTP: {baseUrl}/mcp
+              HTTP tools: {baseUrl}/api/v1
+              Tools are discoverable through the live MCP tools/list method.
+              See docs/CONNECTING_AI_CLIENTS.md and docs/TOOLS.md for details.
+              Authentication: Authorization: Bearer <LOCALIDEBRIDGE_KEY>.
+              Copy the key using `LocalIdeBridge key copy` (never paste it into untrusted prompts).
+              Connecting an AI website still requires actual MCP integration/tool permission from that client.
+              The URL is a configured default and may differ from the running host/tunnel endpoint.
+              """
+            : ConnectionInstructions.BuildClientTemplateOffline(
+                client, baseUrl, Environment.ProcessPath ?? Path.Combine(paths.RootDir, "LocalIdeBridge.exe"));
 
         if (SetupWizard.HasFlag(args, "--copy"))
         {
@@ -249,7 +267,7 @@ public static class Program
             Console.Error.WriteLine(msg);
         }
         Console.WriteLine(text);
-        return 0;
+        return Task.FromResult(0);
     }
 
     private static int HandleWorkspaceCommand(PortablePaths paths, IReadOnlyList<string> args)

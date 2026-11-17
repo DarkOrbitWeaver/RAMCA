@@ -167,7 +167,8 @@ public static class BuildGitCommandTools
             {
                 var ws = guard.RequireActiveWorkspace();
                 Directory.CreateDirectory(paths.TempDir);
-                var trxFile = Path.Combine(paths.TempDir, $"test_{Guid.NewGuid():N}.trx");
+                var trxDir = Path.Combine(paths.TempDir, $"test_{Guid.NewGuid():N}");
+                Directory.CreateDirectory(trxDir);
 
                 var cmdArgs = new List<string> { "test", "--nologo" };
                 var target = args.OptionalString("target");
@@ -187,22 +188,24 @@ public static class BuildGitCommandTools
                 }
 
                 cmdArgs.Add("--logger");
-                cmdArgs.Add($"trx;LogFileName={trxFile}");
+                cmdArgs.Add("trx");
+                cmdArgs.Add("--results-directory");
+                cmdArgs.Add(trxDir);
 
                 int? timeout = args.ContainsKey("timeoutSeconds") ? args.OptionalInt("timeoutSeconds", config.Resources.DefaultCommandTimeoutSeconds) : null;
                 CommandExecutionResult res;
                 TestRunSummary summary;
+                int reportFiles;
                 try
                 {
                     res = await runner.RunAsync("test", "dotnet", cmdArgs, ws, timeout, parseCompilerDiagnostics: true, ct: ct);
-                    summary = ProcessRunner.ParseTrxFile(trxFile);
+                    var reports = ProcessRunner.ParseTrxDirectory(trxDir);
+                    summary = reports.Summary;
+                    reportFiles = reports.ReportFiles;
                 }
                 finally
                 {
-                    if (File.Exists(trxFile))
-                    {
-                        try { File.Delete(trxFile); } catch { }
-                    }
+                    try { Directory.Delete(trxDir, recursive: true); } catch { }
                 }
 
                 var payload = new
@@ -216,6 +219,8 @@ public static class BuildGitCommandTools
                     timedOut = res.TimedOut,
                     cancelled = res.Cancelled,
                     total = summary.Total,
+                    reportFiles,
+                    countsVerified = reportFiles > 0,
                     passed = summary.Passed,
                     failed = summary.Failed,
                     skipped = summary.Skipped,
@@ -224,6 +229,9 @@ public static class BuildGitCommandTools
                     outputExcerpt = res.OutputExcerpt,
                     logReference = new { execId = res.ExecutionId, totalLines = res.TotalLogLines, totalBytes = res.TotalLogBytes }
                 };
+
+                if (res.ExitCode == 0 && reportFiles == 0)
+                    return ToolResult.Fail("test_results_missing", "dotnet test exited 0 but produced no TRX reports; cannot verify test counts.", payload, res.ExecutionId);
 
                 return res.ExitCode == 0
                     ? ToolResult.Ok($"Tests passed: {summary.Passed}/{summary.Total} passed, {summary.Failed} failed, {summary.Skipped} skipped ({res.DurationMs}ms).", payload, res.ExecutionId)
@@ -307,11 +315,14 @@ public static class BuildGitCommandTools
             Handler: async (args, _, ct) =>
             {
                 var ws = guard.RequireActiveWorkspace();
-                var statusRes = await runner.RunAsync("git", "git", ["status", "--porcelain=v1", "-b"], ws, timeoutSeconds: 20, ct: ct);
+                var statusRes = await runner.RunAsync("git", "git", ["status", "--porcelain=v1", "-b"], ws, timeoutSeconds: 20, ct: ct, stdoutCaptureLimit: 2_000_000);
                 if (statusRes.ExitCode != 0)
                     return FormatCommandResult(statusRes);
 
-                var lines = ExtractStdOutLines(statusRes.OutputExcerpt);
+                if (statusRes.StdoutCaptureTruncated || statusRes.StdoutCapture is null)
+                    return ToolResult.Fail("status_incomplete", "Git status output exceeded the bounded capture or was interrupted. Nothing about repository cleanliness is assumed; inspect the execution log.", new { executionId = statusRes.ExecutionId });
+                var lines = statusRes.StdoutCapture.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(line => line.TrimEnd('\r')).ToList();
                 var branchLine = lines.FirstOrDefault(l => l.StartsWith("## ", StringComparison.Ordinal))?[3..] ?? "unknown";
                 var files = lines.Where(l => !l.StartsWith("## ", StringComparison.Ordinal) && l.Length >= 3)
                     .Select(l => new { status = l[..2].Trim(), path = l[3..].Trim() })
@@ -321,10 +332,10 @@ public static class BuildGitCommandTools
                 var commits = new List<object>();
                 if (commitLimit > 0)
                 {
-                    var logRes = await runner.RunAsync("git", "git", ["log", $"-n{commitLimit}", "--pretty=format:%H|%h|%an|%aI|%s"], ws, timeoutSeconds: 15, ct: ct);
-                    if (logRes.ExitCode == 0)
+                    var logRes = await runner.RunAsync("git", "git", ["log", $"-n{commitLimit}", "--pretty=format:%H|%h|%an|%aI|%s"], ws, timeoutSeconds: 15, ct: ct, stdoutCaptureLimit: 50000);
+                    if (logRes.ExitCode == 0 && !logRes.StdoutCaptureTruncated && logRes.StdoutCapture is not null)
                     {
-                        foreach (var cl in ExtractStdOutLines(logRes.OutputExcerpt))
+                        foreach (var cl in logRes.StdoutCapture.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                         {
                             var parts = cl.Split('|', 5);
                             if (parts.Length == 5)
@@ -367,13 +378,17 @@ public static class BuildGitCommandTools
                     gitArgs.Add(guard.GetRelativePathUnix(ws, full));
                 }
 
-                var res = await runner.RunAsync("git", "git", gitArgs, ws, timeoutSeconds: 30, ct: ct);
+                var res = await runner.RunAsync("git", "git", gitArgs, ws, timeoutSeconds: 30, ct: ct, stdoutCaptureLimit: 512_000);
                 if (res.ExitCode != 0) return FormatCommandResult(res);
 
-                var diffText = string.Join('\n', ExtractStdOutLines(res.OutputExcerpt));
+                if (res.StdoutCaptureTruncated || res.StdoutCapture is null)
+                    return ToolResult.Fail("diff_incomplete",
+                        "Git diff exceeded the bounded capture or was interrupted. Read the complete paginated execution log rather than trusting a truncated diff.",
+                        new { partialDiff = res.StdoutCapture, truncated = true, executionId = res.ExecutionId, totalLogLines = res.TotalLogLines }, res.ExecutionId);
+
                 return ToolResult.Ok(
-                    $"Retrieved Git diff ({res.TotalLogLines} log line(s)).",
-                    new { diff = diffText, executionId = res.ExecutionId, totalLogLines = res.TotalLogLines },
+                    $"Retrieved complete Git diff ({res.TotalLogLines} log line(s)).",
+                    new { diff = res.StdoutCapture, truncated = false, executionId = res.ExecutionId, totalLogLines = res.TotalLogLines },
                     res.ExecutionId);
             });
 
@@ -453,13 +468,15 @@ public static class BuildGitCommandTools
                 if (action == "add")
                 {
                     var branch = args.OptionalString("branch");
+                    if (branch is not null && branch.StartsWith('-', StringComparison.Ordinal))
+                        throw new ArgumentException("A Git worktree branch name may not begin with '-'.");
                     gitArgs = string.IsNullOrWhiteSpace(branch)
                         ? ["worktree", "add", "--detach", wtPath]
                         : ["worktree", "add", "-b", branch, wtPath];
                 }
                 else if (action == "remove")
                 {
-                    gitArgs = ["worktree", "remove", "--force", wtPath];
+                    gitArgs = ["worktree", "remove", wtPath]; // Git refuses to remove a dirty worktree. Never force-delete user changes.
                 }
                 else
                 {

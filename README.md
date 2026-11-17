@@ -1,5 +1,8 @@
 # LocalIdeBridge
 
+> **Safety notice (2026-11-17):** RAMCA is undergoing a high-priority recovery/security audit repair. The branch `fix/audit-p0-safety-first-pass` is **not an approved release**. Read [Audit Repair Tracker](docs/AUDIT_REPAIR_TRACKER_2026-11-17.md) before attempting remote access or use on valuable workspaces.
+
+
 **Release status:** This repository contains source code and earlier test/benchmark artifacts. Security and recovery fixes made on November 15, 2026 have **not** been rebuilt or tested on Windows. Run the validation commands below before enabling remote access. See [Fixes and validation](FIXES_AND_VALIDATION.md) and [Outstanding work](OUTSTANDING_WORK.md).
 
 **LocalIdeBridge** is a portable Windows 11 development-tool server written in C# and .NET 10. You choose a workspace and connect a compatible AI client through MCP, HTTP, or the command-line client. The same tools handle code navigation, editing, builds, tests, Git, and long-running jobs; a small terminal interface shows their progress.

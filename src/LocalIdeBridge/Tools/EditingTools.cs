@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using LocalIdeBridge.Core;
 using LocalIdeBridge.Storage;
@@ -223,14 +224,14 @@ public static partial class EditingTools
                 else if (leMode.Equals("LF", StringComparison.OrdinalIgnoreCase)) targetNewLine = "\n";
 
                 var normalized = NormalizeLineEndings(content, targetNewLine);
-                PortablePaths.AtomicWriteAllText(full, normalized, encoding);
-                var afterSha = ComputeFileSha256(full);
+                var afterSha = Convert.ToHexStringLower(SHA256.HashData(EncodeText(normalized, encoding)));
                 var newLineCount = CountLines(normalized);
                 var rel = guard.GetRelativePathUnix(ws, full);
-
-                db.RecordEdit(new EditJournalRecord(
-                    editId, ctx.SessionId, ws, rel, existed ? "overwrite_file" : "create_file",
-                    beforeSha, afterSha, existed, backupPath, newLineCount, oldLineCount, false, DateTimeOffset.UtcNow));
+                var transactionResult = CommitSingleFileEdit(paths, guard, db, ctx.SessionId, ws, rel, full,
+                    editId, existed ? "overwrite_file" : "create_file", beforeSha, afterSha,
+                    backupPath, existed, newLineCount, oldLineCount,
+                    () => PortablePaths.AtomicWriteAllText(full, normalized, encoding));
+                if (transactionResult is not null) return Task.FromResult(transactionResult);
 
                 onFileMutated?.Invoke(full);
                 return Task.FromResult(ToolResult.Ok(
@@ -311,16 +312,14 @@ public static partial class EditingTools
                 var joined = JoinLinesPreservingStyle(updated, current.NewLine, current.EndsWithNewLine);
                 var editId = NewEditId();
                 var backupPath = SaveBackupBytes(paths, ctx.SessionId, editId, full);
-                PortablePaths.AtomicWriteAllText(full, joined, current.Encoding);
-
-                var afterSha = ComputeFileSha256(full);
+                var afterSha = Convert.ToHexStringLower(SHA256.HashData(EncodeText(joined, current.Encoding)));
                 var rel = guard.GetRelativePathUnix(ws, full);
                 var removed = end - start + 1;
                 var added = replacementLines.Length;
-
-                db.RecordEdit(new EditJournalRecord(
-                    editId, ctx.SessionId, ws, rel, "replace_range",
-                    current.Sha256, afterSha, true, backupPath, added, removed, false, DateTimeOffset.UtcNow));
+                var transactionResult = CommitSingleFileEdit(paths, guard, db, ctx.SessionId, ws, rel, full,
+                    editId, "replace_range", current.Sha256, afterSha, backupPath, true, added, removed,
+                    () => PortablePaths.AtomicWriteAllText(full, joined, current.Encoding));
+                if (transactionResult is not null) return Task.FromResult(transactionResult);
 
                 onFileMutated?.Invoke(full);
                 return Task.FromResult(ToolResult.Ok(
@@ -349,7 +348,8 @@ public static partial class EditingTools
             Parameters:
             [
                 new("patch", "string", "Unified diff text (with --- / +++ file headers and @@ hunk headers).", Required: true),
-                new("expectedSha256", "string", "Optional SHA-256 precondition (for single-file patches).")
+                new("expectedSha256", "string", "Optional SHA-256 precondition (for single-file patches)."),
+                new("expectedSha256Map", "object", "Optional file-relative-path to SHA-256 map for multi-file optimistic concurrency.")
             ],
             Handler: (args, ctx, _) =>
             {
@@ -361,107 +361,151 @@ public static partial class EditingTools
                 if (filePatches.Count == 0)
                     return Task.FromResult(ToolResult.Fail("invalid_patch", "No valid unified diff file hunks found. Include --- a/file, +++ b/file, and @@ -l,c +l,c @@ headers."));
 
-                // Phase 1: Validate every file and compute full post-patch content in memory before touching disk.
+                // A patch is a transaction, not a series of unrelated writes. Reject ambiguous
+                // file headers / repeated paths, compute all outputs, and preserve every source.
                 var staged = new List<(string RelPath, string FullPath, string Op, LoadedTextFile? Before, string? NewContent, Encoding Enc, int Added, int Removed)>();
+                var seen = new HashSet<string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+                var shaMap = args["expectedSha256Map"] as JsonObject;
+                if (shaMap is not null && filePatches.Count == 1 && expectedSha is not null)
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "Specify one SHA-256 precondition scheme, not both."));
 
                 foreach (var fp in filePatches)
                 {
                     var isCreate = fp.OldPath is null or "/dev/null";
                     var isDelete = fp.NewPath is null or "/dev/null";
+                    if (!isCreate && !isDelete && !string.Equals(fp.OldPath, fp.NewPath, StringComparison.Ordinal))
+                        return Task.FromResult(ToolResult.Fail("unsupported_patch", "Rename patches require the guarded rename_file tool, not apply_patch."));
                     var targetRel = isDelete ? fp.OldPath! : fp.NewPath!;
                     var full = guard.ResolvePath(targetRel, forWrite: !isDelete, forDelete: isDelete);
+                    // A path that exists in both `a/path` and `path` is ambiguous in
+                    // Git-format patches. Never silently target the stripped root path.
+                    if (File.Exists(Path.Combine(ws, "a", targetRel)) ||
+                        File.Exists(Path.Combine(ws, "b", targetRel)))
+                        return Task.FromResult(ToolResult.Fail("ambiguous_patch_path", $"Patch path '{targetRel}' is ambiguous with an a/ or b/ directory; use an unprefixed root-relative header."));
                     var cleanRel = guard.GetRelativePathUnix(ws, full);
+                    if (!seen.Add(full))
+                        return Task.FromResult(ToolResult.Fail("invalid_patch", $"Duplicate patch target '{cleanRel}'; combine hunks into one file section."));
+                    if (Directory.Exists(full))
+                        return Task.FromResult(ToolResult.Fail("invalid_patch", $"Patch target '{cleanRel}' is a directory."));
 
                     if (isCreate)
                     {
                         if (File.Exists(full))
-                            return Task.FromResult(ToolResult.Fail("precondition_failed", $"Patch attempts to create '{cleanRel}', but file already exists."));
+                            return Task.FromResult(ToolResult.Fail("precondition_failed", $"File '{cleanRel}' already exists."));
+                        if (shaMap is not null && shaMap.ContainsKey(cleanRel))
+                            return Task.FromResult(ToolResult.Fail("invalid_arguments", $"Cannot supply a prior hash for new file '{cleanRel}'."));
                         var applied = ApplyHunksToLines([], fp.Hunks, cleanRel, out var added, out var removed, out var err);
-                        if (err is not null)
-                            return Task.FromResult(ToolResult.Fail("precondition_failed", err));
+                        if (err is not null) return Task.FromResult(ToolResult.Fail("precondition_failed", err));
                         var nl = OperatingSystem.IsWindows() ? "\r\n" : "\n";
                         staged.Add((cleanRel, full, "patch_create", null, JoinLinesPreservingStyle(applied!, nl, true), new UTF8Encoding(false), added, removed));
                     }
                     else
                     {
                         if (!File.Exists(full))
-                            return Task.FromResult(ToolResult.Fail("not_found", $"Patch target file '{cleanRel}' does not exist."));
+                            return Task.FromResult(ToolResult.Fail("not_found", $"File '{cleanRel}' does not exist."));
                         var before = LoadTextFile(full);
-                        if (filePatches.Count == 1 && !string.IsNullOrWhiteSpace(expectedSha) &&
-                            !string.Equals(before.Sha256, expectedSha, StringComparison.OrdinalIgnoreCase))
-                        {
-                            return Task.FromResult(ToolResult.Fail("stale_file",
-                                $"File '{cleanRel}' changed since read (expected {expectedSha}, actual {before.Sha256})."));
-                        }
-
-                        if (isDelete)
-                        {
-                            var applied = ApplyHunksToLines(before.Lines, fp.Hunks, cleanRel, out var added, out var removed, out var err);
-                            if (err is not null)
-                                return Task.FromResult(ToolResult.Fail("precondition_failed", err));
-                            staged.Add((cleanRel, full, "patch_delete", before, null, before.Encoding, added, removed));
-                        }
-                        else
-                        {
-                            var applied = ApplyHunksToLines(before.Lines, fp.Hunks, cleanRel, out var added, out var removed, out var err);
-                            if (err is not null)
-                                return Task.FromResult(ToolResult.Fail("precondition_failed", err));
-                            var joined = JoinLinesPreservingStyle(applied!, before.NewLine, before.EndsWithNewLine || applied!.Count > 0);
-                            staged.Add((cleanRel, full, "apply_patch", before, joined, before.Encoding, added, removed));
-                        }
+                        var requiredSha = filePatches.Count == 1 ? expectedSha : null;
+                        if (shaMap is not null && shaMap.TryGetPropertyValue(cleanRel, out var mapHash))
+                            requiredSha = mapHash?.GetValue<string>();
+                        if (!string.IsNullOrWhiteSpace(requiredSha) &&
+                            !string.Equals(before.Sha256, requiredSha, StringComparison.OrdinalIgnoreCase))
+                            return Task.FromResult(ToolResult.Fail("stale_file", $"File '{cleanRel}' no longer matches SHA-256 precondition."));
+                        var applied = ApplyHunksToLines(before.Lines, fp.Hunks, cleanRel, out var added, out var removed, out var err);
+                        if (err is not null) return Task.FromResult(ToolResult.Fail("precondition_failed", err));
+                        if (isDelete && applied!.Count != 0)
+                            return Task.FromResult(ToolResult.Fail("invalid_patch", $"Deletion of '{cleanRel}' did not remove every source line."));
+                        var newContent = isDelete ? null : JoinLinesPreservingStyle(applied!, before.NewLine, before.EndsWithNewLine);
+                        staged.Add((cleanRel, full, isDelete ? "patch_delete" : "apply_patch", before, newContent, before.Encoding, added, removed));
                     }
                 }
 
-                // Phase 2: Commit atomically and record reversible edits.
+                // Persist a recovery manifest and *all* durable backups BEFORE the first write.
+                // On crash the next startup rolls back only matching pre/post-image hashes; it
+                // will fail closed on an external edit rather than overwrite unexpected bytes.
+                var tx = new PatchTransaction { Id = $"patch_{Guid.NewGuid():N}", Workspace = ws, SessionId = ctx.SessionId };
                 var fileResults = new List<object>();
-                int totalAdded = 0, totalRemoved = 0;
-
+                var recordedEdits = new List<string>();
+                var totalAdded = 0;
+                var totalRemoved = 0;
                 foreach (var item in staged)
                 {
                     var editId = NewEditId();
-                    string? backup = item.Before is not null ? SaveBackupBytes(paths, ctx.SessionId, editId, item.FullPath) : null;
-                    string afterSha;
-
-                    if (item.Op == "patch_delete")
+                    var backup = item.Before is null ? null : SaveBackupBytes(paths, ctx.SessionId, editId, item.FullPath);
+                    var proposedHash = item.Op == "patch_delete" ? "deleted" :
+                        Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(EncodeText(item.NewContent!, item.Enc)));
+                    tx.Items.Add(new PatchTransactionItem
                     {
-                        File.Delete(item.FullPath);
-                        afterSha = "deleted";
-                    }
-                    else
-                    {
-                        PortablePaths.AtomicWriteAllText(item.FullPath, item.NewContent!, item.Enc);
-                        afterSha = ComputeFileSha256(item.FullPath);
-                    }
-
-                    db.RecordEdit(new EditJournalRecord(
-                        editId, ctx.SessionId, ws, item.RelPath, item.Op,
-                        item.Before?.Sha256 ?? "none", afterSha, item.Before is not null,
-                        backup, item.Added, item.Removed, false, DateTimeOffset.UtcNow));
-
-                    onFileMutated?.Invoke(item.FullPath);
-                    totalAdded += item.Added;
-                    totalRemoved += item.Removed;
-                    fileResults.Add(new
-                    {
-                        editId,
-                        path = item.RelPath,
-                        operation = item.Op,
-                        beforeSha256 = item.Before?.Sha256 ?? "none",
-                        afterSha256 = afterSha,
-                        linesAdded = item.Added,
-                        linesRemoved = item.Removed
+                        RelativePath = item.RelPath, EditId = editId, BackupPath = backup,
+                        BeforeHash = item.Before?.Sha256 ?? "none", AfterHash = proposedHash
                     });
                 }
+                var txPath = GetTransactionPath(paths, tx.Id);
+                PortablePaths.AtomicWriteAllText(txPath, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+                try
+                {
+                    for (var i = 0; i < staged.Count; i++)
+                    {
+                        var item = staged[i];
+                        var t = tx.Items[i];
+                        // Recheck immediately before mutation, not only during patch parsing.
+                        var actual = File.Exists(item.FullPath) ? ComputeFileSha256(item.FullPath) : "none";
+                        if (!string.Equals(actual, t.BeforeHash, StringComparison.OrdinalIgnoreCase))
+                            throw new IOException($"Concurrent edit detected for '{item.RelPath}'; transaction must roll back.");
+                        if (item.Op == "patch_delete")
+                            File.Delete(item.FullPath);
+                        else
+                            PortablePaths.AtomicWriteAllText(item.FullPath, item.NewContent!, item.Enc);
+                        var afterSha = File.Exists(item.FullPath) ? ComputeFileSha256(item.FullPath) : "deleted";
+                        if (!string.Equals(afterSha, t.AfterHash, StringComparison.OrdinalIgnoreCase))
+                            throw new IOException($"Post-write checksum mismatch for '{item.RelPath}'.");
+                        totalAdded += item.Added;
+                        totalRemoved += item.Removed;
+                    }
+                    for (var i = 0; i < staged.Count; i++)
+                    {
+                        var item = staged[i];
+                        var t = tx.Items[i];
+                        db.RecordEdit(new EditJournalRecord(
+                            t.EditId, ctx.SessionId, ws, item.RelPath, item.Op,
+                            t.BeforeHash, t.AfterHash, item.Before is not null, t.BackupPath,
+                            item.Added, item.Removed, false, DateTimeOffset.UtcNow));
+                        recordedEdits.Add(t.EditId);
+                        fileResults.Add(new
+                        {
+                            editId = t.EditId, path = item.RelPath, operation = item.Op,
+                            beforeSha256 = t.BeforeHash, afterSha256 = t.AfterHash,
+                            linesAdded = item.Added, linesRemoved = item.Removed
+                        });
+                    }
+                    tx.Committed = true;
+                    PortablePaths.AtomicWriteAllText(txPath, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+                    // Garbage collection is best-effort AFTER durable commit. Failure to
+                    // remove the manifest must not trigger a destructive rollback.
+                    try { File.Delete(txPath); } catch (IOException) { }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        RecoverTransaction(paths, guard, tx, db);
+                        File.Delete(txPath);
+                        return Task.FromResult(ToolResult.Fail("patch_rolled_back", $"Patch aborted and pre-image checksums restored: {ex.Message}"));
+                    }
+                    catch (Exception recovery)
+                    {
+                        // Never erase this manifest. Explicit recovery requires inspecting
+                        // the conflicting file; startup refuses to work on ambiguous state.
+                        return Task.FromResult(ToolResult.Fail("patch_recovery_required",
+                            $"Patch failed ({ex.Message}); automatic recovery blocked ({recovery.Message}). Do NOT retry blindly. Manifest: {txPath}"));
+                    }
+                }
+                foreach (var item in staged)
+                    try { onFileMutated?.Invoke(item.FullPath); } catch { /* cache invalidation must not fail a committed transaction */ }
 
                 return Task.FromResult(ToolResult.Ok(
                     $"Applied patch across {fileResults.Count} file(s) (+{totalAdded}/-{totalRemoved} lines).",
-                    new
-                    {
-                        totalLinesAdded = totalAdded,
-                        totalLinesRemoved = totalRemoved,
-                        changedFiles = staged.Select(s => s.RelPath).ToArray(),
-                        edits = fileResults
-                    }));
+                    new { transactionId = tx.Id, totalLinesAdded = totalAdded,
+                          totalLinesRemoved = totalRemoved, changedFiles = staged.Select(s => s.RelPath).ToArray(), edits = fileResults }));
             });
 
         yield return new ToolDefinition(
@@ -544,7 +588,7 @@ public static partial class EditingTools
         yield return new ToolDefinition(
             Name: "rename_file",
             Category: "editing",
-            Description: "Renames or moves a file inside the trusted workspace.",
+            Description: "Moves a file within the workspace if the destination does not exist. Replacing an existing destination is blocked until reversible rename journaling is implemented.",
             IsReadOnly: false,
             IsIdempotent: false,
             SideEffects: "Moves file within trusted workspace.",
@@ -552,22 +596,24 @@ public static partial class EditingTools
             [
                 new("sourcePath", "string", "Existing relative file path.", Required: true),
                 new("destinationPath", "string", "New relative file path inside workspace.", Required: true),
-                new("overwrite", "boolean", "Overwrite destination if it exists.", Default: false)
+                new("overwrite", "boolean", "Reserved for a future reversible overwrite; overwriting an existing destination is not yet supported.", Default: false)
             ],
             Handler: (args, _, _) =>
             {
                 var ws = guard.RequireActiveWorkspace();
                 var src = guard.ResolvePath(args.RequireString("sourcePath"), forDelete: true);
                 var dst = guard.ResolvePath(args.RequireString("destinationPath"), forWrite: true);
-                var overwrite = args.OptionalBool("overwrite", false);
+                // Read the legacy flag so old callers receive a clear fail-closed result if the target exists.
+                _ = args.OptionalBool("overwrite", false);
 
                 if (!File.Exists(src))
                     throw new FileNotFoundException($"Source file not found: {args.RequireString("sourcePath")}");
-                if (File.Exists(dst) && !overwrite)
-                    return Task.FromResult(ToolResult.Fail("already_exists", $"Destination '{args.RequireString("destinationPath")}' already exists."));
+                if (File.Exists(dst))
+                    return Task.FromResult(ToolResult.Fail("unsafe_overwrite_blocked",
+                        $"Destination '{args.RequireString("destinationPath")}' exists. RAMCA cannot safely undo an overwritten rename yet; choose an unused destination instead."));
 
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                File.Move(src, dst, overwrite);
+                File.Move(src, dst);
                 onFileMutated?.Invoke(src);
                 onFileMutated?.Invoke(dst);
 
@@ -581,15 +627,15 @@ public static partial class EditingTools
         yield return new ToolDefinition(
             Name: "delete_file",
             Category: "editing",
-            Description: "Deletes a workspace file after preserving an undo backup (up to 256 MiB). Larger deletions require explicit allowIrreversible=true, and cannot be undone.",
+            Description: "Deletes a workspace file only after preserving and verifying a reversible backup (up to 256 MiB); larger deletions are refused.",
             IsReadOnly: false,
             IsIdempotent: false,
-            SideEffects: "Deletes target file; saves a reversible backup unless irreversible deletion was explicitly requested for an oversized file.",
+            SideEffects: "Deletes a workspace file only with a durable recovery manifest and verified undo backup.",
             Parameters:
             [
                 new("path", "string", "Relative file path to delete.", Required: true),
                 new("expectedSha256", "string", "Optional SHA-256 precondition check."),
-                new("allowIrreversible", "boolean", "Explicitly permit deletion without a backup when the file exceeds the 256 MiB undo limit.", Default: false)
+                new("allowIrreversible", "boolean", "Deprecated; irrevocable remote deletion is forbidden.", Default: false)
             ],
             Handler: (args, ctx, _) =>
             {
@@ -604,14 +650,14 @@ public static partial class EditingTools
                     return Task.FromResult(ToolResult.Fail("stale_file", $"File SHA-256 mismatch (expected {expected}, actual {beforeSha})."));
 
                 var fi = new FileInfo(full);
-                if (fi.Length > MaxReversibleDeleteBytes && !args.OptionalBool("allowIrreversible", false))
+                if (fi.Length > MaxReversibleDeleteBytes)
                 {
                     return Task.FromResult(ToolResult.Fail("backup_limit_exceeded",
-                        $"Refusing an irreversible deletion of {fi.Length} bytes. Files over {MaxReversibleDeleteBytes} bytes require explicit allowIrreversible=true."));
+                        $"Refusing deletion of {fi.Length} bytes: reversible backup limit is {MaxReversibleDeleteBytes} bytes. This tool cannot perform irreversible deletions."));
                 }
 
                 var editId = NewEditId();
-                string? backup = fi.Length <= MaxReversibleDeleteBytes ? SaveBackupBytes(paths, ctx.SessionId, editId, full) : null;
+                string backup = SaveBackupBytes(paths, ctx.SessionId, editId, full);
                 var rel = guard.GetRelativePathUnix(ws, full);
 
                 // Detect changed or incomplete backup contents BEFORE deleting the original.
@@ -629,15 +675,15 @@ public static partial class EditingTools
                     }
                 }
 
-                File.Delete(full);
-                db.RecordEdit(new EditJournalRecord(
-                    editId, ctx.SessionId, ws, rel, "delete_file",
-                    beforeSha, "deleted", true, backup, 0, 0, false, DateTimeOffset.UtcNow));
+                var transactionResult = CommitSingleFileEdit(paths, guard, db, ctx.SessionId, ws, rel, full,
+                    editId, "delete_file", beforeSha, "deleted", backup, true, 0, 0,
+                    () => File.Delete(full));
+                if (transactionResult is not null) return Task.FromResult(transactionResult);
 
                 onFileMutated?.Invoke(full);
                 return Task.FromResult(ToolResult.Ok(
-                    backup is null ? $"Deleted '{rel}' irreversibly (explicitly requested)." : $"Deleted '{rel}' (reversible via editId='{editId}').",
-                    new { editId, path = rel, beforeSha256 = beforeSha, reversible = backup is not null, changedFiles = new[] { rel } }));
+                    $"Deleted '{rel}' (reversible via editId='{editId}').",
+                    new { editId, path = rel, beforeSha256 = beforeSha, reversible = true, changedFiles = new[] { rel } }));
             });
 
         yield return new ToolDefinition(
@@ -672,8 +718,8 @@ public static partial class EditingTools
 
                 var edit = db.GetEdit(editId) ?? throw new KeyNotFoundException($"Edit '{editId}' not found.");
                 var full = guard.ResolvePath(edit.RelativePath, explicitWorkspace: edit.Workspace);
-                var oldLines = edit.BackupFilePath is not null && File.Exists(edit.BackupFilePath)
-                    ? LoadTextFile(edit.BackupFilePath).Lines
+                var oldLines = edit.BackupFilePath is not null && File.Exists(ResolveBackupPath(paths, edit))
+                    ? LoadTextFile(ResolveBackupPath(paths, edit)).Lines
                     : [];
                 var curLines = File.Exists(full) ? LoadTextFile(full).Lines : [];
                 var diff = BuildCompactUnifiedDiff(edit.RelativePath, oldLines, curLines);
@@ -697,74 +743,80 @@ public static partial class EditingTools
         yield return new ToolDefinition(
             Name: "revert_edit",
             Category: "editing",
-            Description: "Safely reverts a specific recorded editId ONLY if the file has not been modified since that edit (verified by SHA-256).",
+            Description: "Restores a recorded edit only when its current postimage matches SHA-256. The undo itself is crash-recoverable and receives its own edit ID.",
             IsReadOnly: false,
             IsIdempotent: false,
-            SideEffects: "Restores pre-edit file bytes (or deletes newly created file) inside the workspace.",
+            SideEffects: "Restores pre-edit file bytes (or removes a newly created file) and records a reversible undo transaction.",
             Parameters:
             [
-                new("editId", "string", "Edit identifier returned by create_file, replace_range, apply_patch, or delete_file.", Required: true)
+                new("editId", "string", "Recorded edit to undo, within the currently selected workspace.", Required: true)
             ],
-            Handler: (args, _, _) =>
+            Handler: (args, ctx, _) =>
             {
                 var editId = args.RequireString("editId");
                 var edit = db.GetEdit(editId) ?? throw new KeyNotFoundException($"Edit '{editId}' not found.");
                 if (edit.Reverted)
                     return Task.FromResult(ToolResult.Fail("already_reverted", $"Edit '{editId}' has already been reverted."));
 
-                var full = guard.ResolvePath(edit.RelativePath, forWrite: true, explicitWorkspace: edit.Workspace);
+                var ws = guard.RequireActiveWorkspace();
+                if (!string.Equals(WorkspaceGuard.NormalizeRoot(ws), WorkspaceGuard.NormalizeRoot(edit.Workspace),
+                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                    return Task.FromResult(ToolResult.Fail("wrong_workspace", "Select the edit's original workspace before reverting it."));
 
+                var full = guard.ResolvePath(edit.RelativePath, forWrite: true, explicitWorkspace: ws);
+                var existsNow = File.Exists(full);
                 if (edit.AfterSha256 == "deleted")
                 {
-                    if (File.Exists(full))
+                    if (existsNow)
                         return Task.FromResult(ToolResult.Fail("conflict",
-                            $"Cannot safely revert deletion of '{edit.RelativePath}' because a new file now exists at that path."));
+                            $"Cannot restore '{edit.RelativePath}': another file already exists at the destination."));
                 }
                 else
                 {
-                    if (!File.Exists(full))
+                    if (!existsNow)
+                        return Task.FromResult(ToolResult.Fail("conflict", $"File '{edit.RelativePath}' no longer exists."));
+                    var actualHash = ComputeFileSha256(full);
+                    if (!string.Equals(actualHash, edit.AfterSha256, StringComparison.OrdinalIgnoreCase))
                         return Task.FromResult(ToolResult.Fail("conflict",
-                            $"Cannot safely revert edit '{editId}' because '{edit.RelativePath}' no longer exists."));
-                    var currentSha = ComputeFileSha256(full);
-                    if (!string.Equals(currentSha, edit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                            $"Cannot undo '{editId}': current file differs from the recorded postimage ({actualHash})."));
+                }
+
+                string? originalSnapshot = null;
+                if (edit.ExistedBefore)
+                {
+                    originalSnapshot = ResolveBackupPath(paths, edit);
+                    if (!File.Exists(originalSnapshot))
+                        return Task.FromResult(ToolResult.Fail("backup_unavailable", $"Verified backup for '{editId}' is unavailable."));
+                    if (!string.Equals(ComputeFileSha256(originalSnapshot), edit.BeforeSha256, StringComparison.OrdinalIgnoreCase))
+                        return Task.FromResult(ToolResult.Fail("backup_corrupt", "Undo snapshot failed SHA-256 verification; no changes made."));
+                }
+
+                // Undo is another mutation. First save its own postimage and manifest;
+                // never delete/rewrite directly and then attempt to mark it reverted.
+                var undoId = NewEditId();
+                var currentHash = existsNow ? edit.AfterSha256 : "none";
+                var restoredHash = edit.ExistedBefore ? edit.BeforeSha256 : "deleted";
+                var undoBackup = existsNow ? SaveBackupBytes(paths, ctx.SessionId, undoId, full) : null;
+                var restoredSnapshot = originalSnapshot;
+                var transactionResult = CommitSingleFileEdit(paths, guard, db, ctx.SessionId, ws,
+                    edit.RelativePath, full, undoId, "revert_edit", currentHash, restoredHash,
+                    undoBackup, existsNow, 0, 0,
+                    () =>
                     {
-                        return Task.FromResult(ToolResult.Fail("conflict",
-                            $"Unsafe to revert edit '{editId}': '{edit.RelativePath}' has been modified since that edit (expected {edit.AfterSha256}, current {currentSha})."));
-                    }
-                }
-
-                if (!edit.ExistedBefore)
-                {
-                    File.Delete(full);
-                }
-                else
-                {
-                    if (string.IsNullOrEmpty(edit.BackupFilePath) || !File.Exists(edit.BackupFilePath))
-                        return Task.FromResult(ToolResult.Fail("backup_unavailable", $"Backup snapshot for edit '{editId}' is no longer available."));
-
-                    // Never overwrite a current file with an incomplete or modified backup snapshot.
-                    var backupSha = ComputeFileSha256(edit.BackupFilePath);
-                    if (!string.Equals(backupSha, edit.BeforeSha256, StringComparison.OrdinalIgnoreCase))
-                        return Task.FromResult(ToolResult.Fail("backup_corrupt", $"Backup snapshot for edit '{editId}' fails the recorded SHA-256 check; nothing has been restored."));
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-                    var tmp = full + $".revert.{Guid.NewGuid():N}.tmp";
-                    File.Copy(edit.BackupFilePath, tmp, overwrite: true);
-                    File.Move(tmp, full, overwrite: true);
-                }
+                        if (restoredSnapshot is null)
+                            File.Delete(full);
+                        else
+                            PortablePaths.AtomicRestoreBackupFile(restoredSnapshot, full);
+                    });
+                if (transactionResult is not null)
+                    return Task.FromResult(transactionResult);
 
                 db.MarkEditReverted(editId);
                 onFileMutated?.Invoke(full);
-
                 return Task.FromResult(ToolResult.Ok(
-                    $"Safely reverted edit '{editId}' on '{edit.RelativePath}'.",
-                    new
-                    {
-                        editId,
-                        path = edit.RelativePath,
-                        restoredSha256 = edit.ExistedBefore ? edit.BeforeSha256 : "deleted",
-                        changedFiles = new[] { edit.RelativePath }
-                    }));
+                    $"Restored '{edit.RelativePath}' from edit '{editId}'. Reversal is itself undoable.",
+                    new { editId, undoEditId = undoId, path = edit.RelativePath, restoredSha256 = restoredHash,
+                          changedFiles = new[] { edit.RelativePath } }));
             });
     }
 
@@ -781,8 +833,7 @@ public static partial class EditingTools
         // Reject obvious binary files (NUL byte outside UTF-16).
         if (!encName.StartsWith("utf-16", StringComparison.Ordinal))
         {
-            var checkLen = Math.Min(bytes.Length, 8192);
-            for (var i = bomLen; i < checkLen; i++)
+            for (var i = bomLen; i < bytes.Length; i++)
             {
                 if (bytes[i] == 0)
                     throw new InvalidOperationException("File appears to be binary (contains NUL bytes).");
@@ -812,12 +863,12 @@ public static partial class EditingTools
     private static (Encoding Enc, string Name, int BomLen) DetectEncoding(byte[] bytes)
     {
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-            return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: true), "utf-8-bom", 3);
+            return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: true, throwOnInvalidBytes: true), "utf-8-bom", 3);
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
-            return (new UnicodeEncoding(bigEndian: false, byteOrderMark: true), "utf-16-le", 2);
+            return (new UnicodeEncoding(bigEndian: false, byteOrderMark: true, throwOnInvalidBytes: true), "utf-16-le", 2);
         if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
-            return (new UnicodeEncoding(bigEndian: true, byteOrderMark: true), "utf-16-be", 2);
-        return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), "utf-8", 0);
+            return (new UnicodeEncoding(bigEndian: true, byteOrderMark: true, throwOnInvalidBytes: true), "utf-16-be", 2);
+        return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true), "utf-8", 0);
     }
 
     public static string ComputeFileSha256(string path)
@@ -830,7 +881,17 @@ public static partial class EditingTools
     {
         var dir = paths.GetSessionEditsDir(sessionId);
         var backup = Path.Combine(dir, $"{editId}.bak");
-        File.Copy(sourceFile, backup, overwrite: true);
+        using (var source = new FileStream(sourceFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var destination = new FileStream(backup, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.WriteThrough))
+        {
+            source.CopyTo(destination);
+            destination.Flush(flushToDisk: true);
+        }
+        if (!string.Equals(ComputeFileSha256(sourceFile), ComputeFileSha256(backup), StringComparison.OrdinalIgnoreCase))
+        {
+            File.Delete(backup);
+            throw new IOException("Backup snapshot failed SHA-256 verification; original file was not modified.");
+        }
         return backup;
     }
 
@@ -881,6 +942,20 @@ public static partial class EditingTools
 
             var oldPath = CleanDiffHeaderPath(rawLines[i][4..]);
             var newPath = CleanDiffHeaderPath(rawLines[i + 1][4..]);
+            // Git prefixes must be a matching asymmetric a/old + b/new pair.
+            // A plain '--- a/config.txt' / '+++ a/config.txt' refers to an
+            // actual a/ directory; silently removing the prefix edits the wrong file.
+            if (oldPath.StartsWith("a/", StringComparison.Ordinal) &&
+                newPath.StartsWith("b/", StringComparison.Ordinal) &&
+                string.Equals(oldPath[2..], newPath[2..], StringComparison.Ordinal))
+            {
+                oldPath = oldPath[2..];
+                newPath = newPath[2..];
+            }
+            else if (oldPath == "/dev/null" && newPath.StartsWith("b/", StringComparison.Ordinal))
+                newPath = newPath[2..];
+            else if (newPath == "/dev/null" && oldPath.StartsWith("a/", StringComparison.Ordinal))
+                oldPath = oldPath[2..];
             i += 2;
 
             var hunks = new List<DiffHunk>();
@@ -914,10 +989,7 @@ public static partial class EditingTools
                         break;
 
                     if (hl.StartsWith("\\ No newline", StringComparison.Ordinal))
-                    {
-                        i++;
-                        continue;
-                    }
+                        throw new ArgumentException("Unified patch with no-newline marker is not supported; use replace_range with an expected SHA-256 to preserve exact bytes.");
 
                     if (hl.Length == 0)
                     {
@@ -941,6 +1013,8 @@ public static partial class EditingTools
                     else break;
                 }
 
+                if (seenOld != oldCount || seenNew != newCount)
+                    throw new ArgumentException($"Invalid unified patch: hunk counts expected {oldCount}/{newCount}, got {seenOld}/{seenNew}.");
                 hunks.Add(new DiffHunk(oldStart, oldCount, newStart, newCount, hunkLines));
             }
 
@@ -956,8 +1030,7 @@ public static partial class EditingTools
         var tabIdx = raw.IndexOf('\t');
         var p = (tabIdx >= 0 ? raw[..tabIdx] : raw).Trim().Trim('"');
         if (p == "/dev/null") return p;
-        if (p.StartsWith("a/", StringComparison.Ordinal) || p.StartsWith("b/", StringComparison.Ordinal))
-            p = p[2..];
+        // Do not strip a/ or b/ without inspecting the matching header pair.
         return p;
     }
 
@@ -1030,12 +1103,17 @@ public static partial class EditingTools
         if (MatchesAt(source, hunk, preferred, minIdx))
             return preferred;
 
+        var candidate = -1;
         for (var delta = 1; delta <= 3; delta++)
         {
-            if (MatchesAt(source, hunk, preferred - delta, minIdx)) return preferred - delta;
-            if (MatchesAt(source, hunk, preferred + delta, minIdx)) return preferred + delta;
+            foreach (var pos in new[] { preferred - delta, preferred + delta })
+            {
+                if (!MatchesAt(source, hunk, pos, minIdx)) continue;
+                if (candidate >= 0) return -1; // ambiguous fuzzy match: don't guess
+                candidate = pos;
+            }
         }
-        return -1;
+        return candidate;
     }
 
     private static bool MatchesAt(IReadOnlyList<string> source, DiffHunk hunk, int startIdx, int minIdx)
@@ -1091,5 +1169,188 @@ public static partial class EditingTools
         if (sb.Length >= maxChars)
             sb.Append("... [diff preview truncated]\n");
         return sb.ToString().TrimEnd();
+    }
+
+    private static string ResolveBackupPath(PortablePaths paths, EditJournalRecord edit)
+    {
+        // Backups are always produced under session/edits; recovering a relocated
+        // portable app must not depend on the original absolute installation path.
+        var local = Path.Combine(paths.GetSessionEditsDir(edit.SessionId), edit.EditId + ".bak");
+        if (File.Exists(local)) return local;
+        return edit.BackupFilePath ?? local;
+    }
+
+    private sealed class PatchTransaction
+    {
+        public string Id { get; set; } = "";
+        public string Workspace { get; set; } = "";
+        public string SessionId { get; set; } = "";
+        public bool Committed { get; set; }
+        public List<PatchTransactionItem> Items { get; set; } = [];
+    }
+
+    private sealed class PatchTransactionItem
+    {
+        public string RelativePath { get; set; } = "";
+        public string EditId { get; set; } = "";
+        public string? BackupPath { get; set; }
+        public string BeforeHash { get; set; } = "";
+        public string AfterHash { get; set; } = "";
+    }
+
+    private static byte[] EncodeText(string text, Encoding encoding)
+    {
+        var preamble = encoding.GetPreamble();
+        var body = encoding.GetBytes(text);
+        if (preamble.Length == 0) return body;
+        var bytes = new byte[preamble.Length + body.Length];
+        preamble.CopyTo(bytes, 0);
+        body.CopyTo(bytes, preamble.Length);
+        return bytes;
+    }
+
+    /// <summary>
+    /// A regular edit is also a durable transaction. Its manifest is persisted before
+    /// the first mutation; after a crash, startup either verifies the committed result
+    /// or restores the exact preimage. If another editor changed it, startup blocks.
+    /// </summary>
+    private static ToolResult? CommitSingleFileEdit(
+        PortablePaths paths, WorkspaceGuard guard, StateDatabase db,
+        string sessionId, string workspace, string relative, string full,
+        string editId, string operation, string beforeSha, string afterSha,
+        string? backupPath, bool existedBefore, int added, int removed, Action mutation)
+    {
+        var tx = new PatchTransaction
+        {
+            Id = $"patch_{Guid.NewGuid():N}", Workspace = workspace, SessionId = sessionId,
+            Items = [new PatchTransactionItem
+            {
+                RelativePath = relative, EditId = editId, BackupPath = backupPath,
+                BeforeHash = beforeSha, AfterHash = afterSha
+            }]
+        };
+        var manifest = GetTransactionPath(paths, tx.Id);
+        PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+        try
+        {
+            var actual = File.Exists(full) ? ComputeFileSha256(full) : "none";
+            if (!string.Equals(actual, beforeSha, StringComparison.OrdinalIgnoreCase))
+                throw new IOException($"File '{relative}' changed after it was inspected; refusing a stale write.");
+            mutation();
+            actual = File.Exists(full) ? ComputeFileSha256(full) : "deleted";
+            if (!string.Equals(actual, afterSha, StringComparison.OrdinalIgnoreCase))
+                throw new IOException($"Post-write verification failed for '{relative}'.");
+            db.RecordEdit(new EditJournalRecord(editId, sessionId, workspace, relative,
+                operation, beforeSha, afterSha, existedBefore, backupPath, added, removed,
+                false, DateTimeOffset.UtcNow));
+            tx.Committed = true;
+            PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+            try { File.Delete(manifest); } catch (IOException) { }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                RecoverTransaction(paths, guard, tx, db);
+                File.Delete(manifest);
+                return ToolResult.Fail("edit_rolled_back", $"Edit aborted and original verified: {ex.Message}");
+            }
+            catch (Exception recovery)
+            {
+                // Persist the manifest: refuse future operations until data integrity
+                // can be determined, rather than guessing how to undo an interruption.
+                return ToolResult.Fail("edit_recovery_required",
+                    $"Edit failed ({ex.Message}) and recovery needs attention ({recovery.Message}). Manifest: {manifest}");
+            }
+        }
+    }
+
+    private static string GetTransactionPath(PortablePaths paths, string transactionId)
+    {
+        var dir = Path.Combine(paths.DataDir, "pending-patches");
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, transactionId + ".json");
+    }
+
+    /// <summary>
+    /// Recover only known pre/post-image hashes. A third-party edit is a conflict, never
+    /// permission to overwrite the user's newer work. Startup calls this under host lock.
+    /// </summary>
+    public static void RecoverPendingPatchTransactions(PortablePaths paths, WorkspaceGuard guard, StateDatabase db)
+    {
+        var dir = Path.Combine(paths.DataDir, "pending-patches");
+        if (!Directory.Exists(dir)) return;
+        foreach (var manifest in Directory.EnumerateFiles(dir, "patch_*.json"))
+        {
+            var tx = JsonSerializer.Deserialize<PatchTransaction>(File.ReadAllText(manifest), AppConfig.JsonOptions)
+                ?? throw new IOException($"Invalid recovery manifest: {manifest}");
+            // A committed marker means the bytes were checked and the journal was
+            // persisted. Never require the target to remain unchanged forever; later
+            // authorized edits legitimately change its hash. Only incomplete edits roll back.
+            if (!tx.Committed) RecoverTransaction(paths, guard, tx, db);
+            File.Delete(manifest);
+        }
+    }
+
+    private static string? ResolvePendingBackupPath(PortablePaths paths, PatchTransaction tx, PatchTransactionItem item)
+    {
+        // A portable RAMCA folder may move between a crash and the next launch.
+        // Session/edit IDs are durable references; an absolute backup path is not.
+        if (!string.IsNullOrWhiteSpace(tx.SessionId))
+        {
+            var local = Path.Combine(paths.GetSessionEditsDir(tx.SessionId), item.EditId + ".bak");
+            if (WorkspaceGuard.IsEqualOrInside(local, paths.SessionsDir)) return local;
+            return null;
+        }
+        // Only old manifests lacking SessionId may use their original stored path,
+        // and never if it points outside the portable session-storage directory.
+        if (item.BackupPath is not null && WorkspaceGuard.IsEqualOrInside(item.BackupPath, paths.SessionsDir))
+            return item.BackupPath;
+        return null;
+    }
+
+    private static void RecoverTransaction(PortablePaths paths, WorkspaceGuard guard, PatchTransaction tx, StateDatabase db)
+    {
+        using var workspaceLease = guard.UseInvocationWorkspace(tx.Workspace);
+        // Preflight EVERY target before restoring any; a conflict must never cause
+        // partial rollback of other files or destroy a newer external edit.
+        var targets = new List<(PatchTransactionItem Item, string Full)>();
+        foreach (var item in tx.Items)
+        {
+            var full = guard.ResolvePath(item.RelativePath, forWrite: true, explicitWorkspace: tx.Workspace);
+            var actual = File.Exists(full) ? ComputeFileSha256(full) : "deleted";
+            if (item.BeforeHash == "none" && actual == "deleted")
+            {
+                targets.Add((item, full));
+                continue;
+            }
+            if (!string.Equals(actual, item.BeforeHash, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(actual, item.AfterHash, StringComparison.OrdinalIgnoreCase))
+                throw new IOException($"Recovery conflict at '{item.RelativePath}' (actual SHA-256 {actual}).");
+            if (item.BeforeHash != "none")
+            {
+                var safeBackup = ResolvePendingBackupPath(paths, tx, item);
+                if (safeBackup is null || !File.Exists(safeBackup) ||
+                    !string.Equals(ComputeFileSha256(safeBackup), item.BeforeHash, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException($"Recovery snapshot unavailable or corrupted for '{item.RelativePath}'.");
+            }
+            targets.Add((item, full));
+        }
+        foreach (var (item, full) in targets)
+        {
+            var actual = File.Exists(full) ? ComputeFileSha256(full) : "deleted";
+            if (string.Equals(actual, item.BeforeHash, StringComparison.OrdinalIgnoreCase) ||
+                item.BeforeHash == "none" && actual == "deleted")
+                continue;
+            if (item.BeforeHash == "none")
+                File.Delete(full);
+            else
+                PortablePaths.AtomicRestoreBackupFile(
+                    ResolvePendingBackupPath(paths, tx, item) ?? throw new IOException("Recovery snapshot not found."), full);
+        }
+        foreach (var (item, _) in targets)
+            if (db.GetEdit(item.EditId) is not null)
+                db.MarkEditReverted(item.EditId);
     }
 }

@@ -15,6 +15,7 @@ public sealed class WorkspaceGuard : IDisposable
     private readonly AppConfig _config;
     private readonly object _activeLock = new();
     private string? _activeWorkspace;
+    private readonly AsyncLocal<string?> _invocationWorkspace = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _writeLocks = new(PathComparer);
 
     private static StringComparer PathComparer =>
@@ -41,7 +42,31 @@ public sealed class WorkspaceGuard : IDisposable
 
     public string? ActiveWorkspace
     {
-        get { lock (_activeLock) return _activeWorkspace; }
+        get
+        {
+            if (_invocationWorkspace.Value is { } scoped) return scoped;
+            lock (_activeLock) return _activeWorkspace;
+        }
+    }
+
+
+    /// <summary>Pin the workspace for this async call and its child tasks, even when
+    /// another user/client selects a new default workspace concurrently.</summary>
+    public IDisposable UseInvocationWorkspace(string workspace)
+    {
+        var normalized = NormalizeRoot(workspace);
+        ValidateTrustableDirectory(normalized);
+        if (!_config.TrustedWorkspaces.Any(w =>
+            string.Equals(NormalizeRoot(w.Path), normalized, PathComparison)))
+            throw new WorkspaceViolationException("Operation workspace is not on the trusted-workspace list.");
+        var prior = _invocationWorkspace.Value;
+        _invocationWorkspace.Value = normalized;
+        return new InvocationScope(_invocationWorkspace, prior);
+    }
+
+    private sealed class InvocationScope(AsyncLocal<string?> current, string? prior) : IDisposable
+    {
+        public void Dispose() => current.Value = prior;
     }
 
     public string RequireActiveWorkspace()
@@ -81,13 +106,22 @@ public sealed class WorkspaceGuard : IDisposable
     public void ValidateTrustableDirectory(string directoryPath)
     {
         var full = NormalizeRoot(directoryPath);
+        if (Directory.Exists(full) &&
+            (new DirectoryInfo(full).LinkTarget is not null ||
+             (new DirectoryInfo(full).Attributes & FileAttributes.ReparsePoint) != 0))
+            throw new WorkspaceViolationException("Workspace root cannot be a symbolic link/junction.");
         var root = Path.GetPathRoot(full)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         if (string.Equals(full, root, PathComparison))
             throw new WorkspaceViolationException("Refusing to trust an entire filesystem/drive root.");
 
-        // Never allow authorizing LocalIdeBridge's own secret state directory.
-        if (IsEqualOrInside(full, _paths.DataDir) || IsEqualOrInside(_paths.DataDir, full))
-            throw new WorkspaceViolationException("Refusing to trust a directory overlapping LocalIdeBridge internal state/secrets.");
+        // A workspace must never contain or be contained by the portable application root.
+        // The only exception is the explicit, isolated sandbox directory.
+        if (!IsEqualOrInside(full, _paths.SandboxDir) &&
+            (IsEqualOrInside(full, _paths.RootDir) || IsEqualOrInside(_paths.RootDir, full)))
+            throw new WorkspaceViolationException("Refusing a workspace overlapping RAMCA's portable installation or secrets.");
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrWhiteSpace(home) && string.Equals(full, NormalizeRoot(home), PathComparison))
+            throw new WorkspaceViolationException("Refusing to trust an entire user-profile directory.");
 
         string[] forbiddenPrefixes = OperatingSystem.IsWindows()
             ? [
@@ -117,6 +151,31 @@ public sealed class WorkspaceGuard : IDisposable
             throw new WorkspaceViolationException("Path must not be empty.");
         if (userPath.Contains('\0'))
             throw new WorkspaceViolationException("Path contains invalid null byte.");
+        // NTFS alternate streams, DOS device aliases and trailing dot/space normalization must
+        // not bypass protected paths. Absolute drive paths may contain ONE colon after the drive.
+        if (OperatingSystem.IsWindows())
+        {
+            var firstColon = userPath.IndexOf(':');
+            if (firstColon >= 0 && !(firstColon == 1 && char.IsAsciiLetter(userPath[0])) ||
+                (firstColon >= 0 && userPath.IndexOf(':', firstColon + 1) >= 0))
+                throw new WorkspaceViolationException("NTFS alternate data stream syntax is not allowed.");
+            foreach (var segment in userPath.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                var trimmed = segment.TrimEnd(' ', '.');
+                if (trimmed.Length == 0 || trimmed != segment)
+                    throw new WorkspaceViolationException("Ambiguous Windows path with trailing dots/spaces is forbidden.");
+                var device = trimmed.Split('.')[0].ToUpperInvariant();
+                if (device is "CON" or "PRN" or "AUX" or "NUL" ||
+                    (device.Length == 4 && (device.StartsWith("COM") || device.StartsWith("LPT")) && device[3] >= '1' && device[3] <= '9'))
+                    throw new WorkspaceViolationException("Reserved Windows device paths are forbidden.");
+                // NTFS 8.3 names can alias protected paths without spelling their
+                // real names (for example LOCALI~1.JSO -> .localidebridge.json).
+                // Reject short-name syntax until existing targets are resolved by
+                // a canonical handle, including their full long names.
+                if (System.Text.RegularExpressions.Regex.IsMatch(device, @"~[0-9]+$"))
+                    throw new WorkspaceViolationException("Windows 8.3 short-name aliases are forbidden in tool paths.");
+            }
+        }
 
         var workspaceRoot = explicitWorkspace is not null ? NormalizeRoot(explicitWorkspace) : RequireActiveWorkspace();
         var canonicalWorkspaceRoot = ResolveRealDirectory(workspaceRoot);
@@ -141,7 +200,11 @@ public sealed class WorkspaceGuard : IDisposable
 
         var relPath = GetRelativePathUnix(canonicalWorkspaceRoot, combined);
 
-        // Protect Git hook injection and credential config modification on write/delete.
+        // File tools cannot access Git internal metadata even through nested worktrees/submodules.
+        // Git is managed through its dedicated tools instead of arbitrary writes to hooks/config.
+        var segments = relPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Any(s => s.Equals(".git", PathComparison)))
+            throw new WorkspaceViolationException("Direct access to Git metadata is forbidden; use the Git tools.");
         if (forWrite || forDelete)
         {
             if (forWrite && !_config.Autonomy.AllowFileWrites)
@@ -192,8 +255,8 @@ public sealed class WorkspaceGuard : IDisposable
         try
         {
             var canonicalRoot = ResolveRealDirectory(workspaceRoot);
-            VerifyNoReparseEscape(canonicalRoot, entryPath);
-            return true;
+            var safe = ResolvePath(entryPath, explicitWorkspace: canonicalRoot);
+            return IsEqualOrInside(safe, canonicalRoot);
         }
         catch
         {
@@ -272,36 +335,9 @@ public sealed class WorkspaceGuard : IDisposable
             if (!isReparse)
                 continue;
 
-            FileSystemInfo? resolved;
-            try
-            {
-                resolved = fsi.ResolveLinkTarget(returnFinalTarget: true);
-            }
-            catch (IOException ex)
-            {
-                throw new WorkspaceViolationException($"Blocked unresolvable or cyclic symbolic link/junction '{current}': {ex.Message}");
-            }
-
-            if (resolved is null)
-                throw new WorkspaceViolationException($"Blocked opaque NTFS reparse point or junction at '{current}'.");
-
-            var targetFull = NormalizeRoot(resolved.FullName);
-            if (!IsEqualOrInside(targetFull, canonicalWorkspaceRoot))
-                throw new WorkspaceViolationException(
-                    $"Blocked symlink/junction escape: '{current}' points outside trusted workspace to '{targetFull}'.");
-
-            // Also verify direct link target when relative.
-            if (fsi.LinkTarget is not null)
-            {
-                var parent = Path.GetDirectoryName(current) ?? canonicalWorkspaceRoot;
-                var directTarget = NormalizeRoot(Path.IsPathRooted(fsi.LinkTarget)
-                    ? fsi.LinkTarget
-                    : Path.Combine(parent, fsi.LinkTarget));
-                if (!IsEqualOrInside(directTarget, canonicalWorkspaceRoot))
-                    throw new WorkspaceViolationException($"Blocked symlink escape at '{current}'.");
-            }
-
-            current = targetFull;
+            // Even an in-workspace link can alias `.git`, a denied path or create a cycle.
+            // Reject every reparse point until a canonical-handle-based alias policy exists.
+            throw new WorkspaceViolationException($"Symbolic links and junctions cannot be traversed by file tools: '{current}'.");
         }
     }
 

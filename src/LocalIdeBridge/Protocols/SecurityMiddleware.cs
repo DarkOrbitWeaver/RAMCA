@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using LocalIdeBridge.Core;
 
 namespace LocalIdeBridge.Protocols;
@@ -71,8 +72,12 @@ public sealed class SecurityMiddleware
             }
         }
 
-        // Enforce request payload cap early.
+        // Enforce the configured cap even on chunked uploads with no Content-Length.
+        // The length header alone is not a memory limit; Kestrel must stop reads.
         var maxBytes = _config.Security.MaxRequestBodyBytes;
+        var requestSize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (requestSize is { IsReadOnly: false })
+            requestSize.MaxRequestBodySize = maxBytes;
         if (context.Request.ContentLength.HasValue && context.Request.ContentLength.Value > maxBytes)
         {
             await WriteJsonError(context, StatusCodes.Status413PayloadTooLarge, "payload_too_large",
@@ -80,41 +85,32 @@ public sealed class SecurityMiddleware
             return;
         }
 
-        // Check failed-auth lockout window first.
-        if (GetCount(_failCounters, ipKey, nowMinute) >= _config.Security.FailedAuthPerMinute)
-        {
-            context.Response.Headers["Retry-After"] = "60";
-            await WriteJsonError(context, StatusCodes.Status429TooManyRequests, "auth_rate_limited",
-                "Too many failed authentication attempts. Wait 60 seconds and retry.");
-            return;
-        }
-
-        // Check general per-IP sliding minute rate limit.
-        if (IncrementCounter(_reqCounters, ipKey, nowMinute) > _config.Security.RequestsPerMinute)
-        {
-            context.Response.Headers["Retry-After"] = "60";
-            await WriteJsonError(context, StatusCodes.Status429TooManyRequests, "rate_limited",
-                "Request rate limit exceeded.");
-            return;
-        }
-
-        // Unauthenticated minimal liveness check only; exposes no workspace paths, tools, or secrets.
+        // Unauthenticated liveness is tiny and exposes no sensitive metadata.
         var path = context.Request.Path.Value ?? "/";
-        if (HttpMethods.IsGet(path == "/health" ? context.Request.Method : ""))
+        if (path == "/health" && HttpMethods.IsGet(context.Request.Method))
         {
             await _next(context);
             return;
         }
 
-        // Extract Bearer or X-LocalIdeBridge-Key credential (never from URL query string).
+        // Always verify a valid key BEFORE reading the failed-auth counter.
+        // A public scanner sharing the loopback tunnel IP must not lock out the owner.
         var token = ExtractToken(context.Request);
         if (!_credentials.Verify(token))
         {
             var failures = IncrementCounter(_failCounters, ipKey, nowMinute);
+            if (failures > _config.Security.FailedAuthPerMinute ||
+                IncrementCounter(_reqCounters, ipKey, nowMinute) > _config.Security.RequestsPerMinute)
+            {
+                context.Response.Headers["Retry-After"] = "60";
+                await WriteJsonError(context, StatusCodes.Status429TooManyRequests,
+                    "auth_rate_limited", "Too many rejected requests. Wait and retry.");
+                return;
+            }
             _logger.Warn("auth", $"Rejected unauthorized {context.Request.Method} {path} from {ipKey} (failures={failures}).");
             context.Response.Headers["WWW-Authenticate"] = "Bearer realm=\"LocalIdeBridge\"";
             await WriteJsonError(context, StatusCodes.Status401Unauthorized, "unauthorized",
-                "Valid access key required via 'Authorization: Bearer <key>' or 'X-LocalIdeBridge-Key: <key>'.");
+                "Valid access key required via Authorization: Bearer or X-LocalIdeBridge-Key.");
             return;
         }
 
@@ -174,6 +170,10 @@ public sealed class SecurityMiddleware
 
     private static int IncrementCounter(ConcurrentDictionary<string, WindowCounter> dict, string key, long minute)
     {
+        // Limit the key space even under distributed brute-force traffic. A full
+        // table must not allocate indefinitely just because scanners rotate IPs.
+        if (!dict.ContainsKey(key) && dict.Count >= 4096)
+            return int.MaxValue;
         var counter = dict.GetOrAdd(key, _ => new WindowCounter { WindowMinute = minute });
         lock (counter)
         {
