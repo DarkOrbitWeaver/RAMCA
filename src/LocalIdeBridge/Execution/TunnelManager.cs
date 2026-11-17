@@ -4,6 +4,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Text.RegularExpressions;
 using LocalIdeBridge.Core;
 
@@ -122,7 +123,13 @@ public sealed partial class TunnelManager : IDisposable
         if (!proc.Start())
             throw new InvalidOperationException($"Failed to launch tunnel executable '{exe}'.");
 
-        _supervisor.Register(proc);
+        try { _supervisor.Register(proc); }
+        catch
+        {
+            ChildProcessSupervisor.TryKillTree(proc);
+            proc.Dispose();
+            throw;
+        }
         try { proc.StandardInput.Close(); } catch { }
 
         lock (_lock)
@@ -138,11 +145,22 @@ public sealed partial class TunnelManager : IDisposable
             {
                 try
                 {
-                    string? line;
-                    while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) is not null)
+                    // Tunnel implementations can emit malformed/unbounded lines.
+                    // Drain all output, but never retain more than one 8 KiB line.
+                    var buffer = new char[4096];
+                    var line = new StringBuilder(8192);
+                    var oversized = false;
+                    void HandleLine()
                     {
-                        _logger.Info("tunnel", line);
-                        var m = HttpsUrlRegex().Match(line);
+                        if (oversized)
+                        {
+                            _logger.Warn("tunnel", "Tunnel output line exceeded 8 KiB; discarded.");
+                            return;
+                        }
+                        var message = line.ToString().TrimEnd('\r');
+                        if (message.Length == 0) return;
+                        _logger.Info("tunnel", message);
+                        var m = HttpsUrlRegex().Match(message);
                         if (m.Success &&
                             !m.Value.Contains("cloudflare.com/website-terms", StringComparison.OrdinalIgnoreCase) &&
                             !m.Value.Contains("developers.cloudflare.com", StringComparison.OrdinalIgnoreCase))
@@ -151,6 +169,25 @@ public sealed partial class TunnelManager : IDisposable
                             urlTcs.TrySetResult(m.Value.TrimEnd('/'));
                         }
                     }
+                    int count;
+                    while ((count = await reader.ReadAsync(buffer.AsMemory()).ConfigureAwait(false)) > 0)
+                    {
+                        for (var i = 0; i < count; i++)
+                        {
+                            if (buffer[i] == '\n')
+                            {
+                                HandleLine();
+                                line.Clear();
+                                oversized = false;
+                            }
+                            else if (!oversized)
+                            {
+                                if (line.Length >= 8192) oversized = true;
+                                else line.Append(buffer[i]);
+                            }
+                        }
+                    }
+                    if (line.Length > 0 || oversized) HandleLine();
                 }
                 catch { }
                 finally

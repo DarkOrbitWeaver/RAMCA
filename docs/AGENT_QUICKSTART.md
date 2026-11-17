@@ -37,3 +37,11 @@ Copy this document (or press **`I`** in LocalIdeBridge / run `LocalIdeBridge.exe
 - Paths escaping the trusted workspace (including junctions/symlinks) and edits to `.git/hooks` or `.localidebridge.json` are rejected.
 - `git_push` is blocked by default unless explicitly authorized by the local user.
 - The server stays online only while `LocalIdeBridge` is open; local async jobs pause/stop if the user exits the application, and crashed non-idempotent jobs are marked `interrupted_restart` rather than replayed blindly.
+
+
+## Reconnecting safely after an uncertain tool result
+
+For non-idempotent actions prefer the `execute_once` tool with a stable `operationId`.
+When connection drops, call `operation_status` or retry `execute_once` using the SAME operationId and arguments; RAMCA will not repeat a previously reserved side effect.
+If status is `interrupted_unknown`, inspect workspace and logs manually before creating a new action.
+See [Execution Continuity](EXECUTION_CONTINUITY.md).

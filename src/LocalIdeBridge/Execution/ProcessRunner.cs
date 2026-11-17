@@ -179,16 +179,6 @@ public sealed partial class ProcessRunner
             void Emit(string line)
             {
                 logWriter.WriteLine(prefix, line);
-                if (prefix == "out" && capturedStdout is not null)
-                {
-                    var remaining = stdoutCaptureLimit - capturedStdout.Length;
-                    if (line.Length + 1 > remaining) stdoutCaptureTruncated = true;
-                    if (remaining > 0)
-                    {
-                        capturedStdout.Append(line.AsSpan(0, Math.Min(line.Length, remaining)));
-                        if (remaining > line.Length) capturedStdout.Append('\n');
-                    }
-                }
                 if (!parseCompilerDiagnostics || diagnostics.Count >= 100) return;
                 var m = MsBuildDiagRegex().Match(line.Trim());
                 if (!m.Success) return;
@@ -208,6 +198,15 @@ public sealed partial class ProcessRunner
                 int count;
                 while ((count = await reader.ReadAsync(buffer.AsMemory(), linkedCts.Token).ConfigureAwait(false)) > 0)
                 {
+                    // Capture exact chars BEFORE formatting long log lines with
+                    // "[continued]" markers. Git diff must never contain log decorations.
+                    if (prefix == "out" && capturedStdout is not null)
+                    {
+                        var remaining = stdoutCaptureLimit - capturedStdout.Length;
+                        if (count > remaining) stdoutCaptureTruncated = true;
+                        if (remaining > 0)
+                            capturedStdout.Append(buffer.AsSpan(0, Math.Min(count, remaining)));
+                    }
                     for (var i = 0; i < count; i++)
                     {
                         if (buffer[i] == '\n')

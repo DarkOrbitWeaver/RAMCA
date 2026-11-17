@@ -310,36 +310,64 @@ public sealed class McpServer
     {
         using var reader = new StreamReader(input, Encoding.UTF8, leaveOpen: true);
         using var writer = new StreamWriter(output, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+        // Preserve line framing without ReadLineAsync (which can allocate an
+        // unlimited string if a client sends a newline-free payload).
+        var maxChars = Math.Clamp(_config.Security.MaxRequestBodyBytes, 64 * 1024, 8 * 1024 * 1024);
+        var frame = new StringBuilder(Math.Min(8192, maxChars));
+        var buffer = new char[8192];
+        var oversized = false;
 
-        while (!ct.IsCancellationRequested)
+        async Task ProcessFrameAsync()
         {
-            var line = await reader.ReadLineAsync(ct);
-            if (line is null) break;
-            if (string.IsNullOrWhiteSpace(line)) continue;
-
+            if (oversized)
+            {
+                await writer.WriteLineAsync(MakeError(null, -32600,
+                    $"MCP stdio message exceeded the {maxChars}-character limit.").ToJsonString());
+                return;
+            }
+            var line = frame.ToString().TrimEnd('\r');
+            if (string.IsNullOrWhiteSpace(line)) return;
             JsonObject? response;
             try
             {
                 var node = JsonNode.Parse(line);
                 if (node is not JsonObject obj)
-                {
                     response = MakeError(null, -32600, "Expected JSON-RPC object.");
-                }
                 else
-                {
                     (response, _, _) = await DispatchMessageAsync(obj, isStateless2026: false, ct);
-                }
             }
             catch (JsonException ex)
             {
                 response = MakeError(null, -32700, $"Parse error: {ex.Message}");
             }
-
-            if (response is not null)
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
             {
+                response = MakeError(null, -32600, "Malformed JSON-RPC parameters or message.");
+            }
+            if (response is not null)
                 await writer.WriteLineAsync(response.ToJsonString());
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(), ct);
+            if (read == 0) break;
+            for (var i = 0; i < read; i++)
+            {
+                if (buffer[i] == '\n')
+                {
+                    await ProcessFrameAsync();
+                    frame.Clear();
+                    oversized = false;
+                    continue;
+                }
+                if (oversized) continue;
+                if (frame.Length >= maxChars) oversized = true;
+                else frame.Append(buffer[i]);
             }
         }
+        if (frame.Length > 0 || oversized)
+            await ProcessFrameAsync();
     }
 
     private async Task<(JsonObject? Response, string? MintedSessionId, string ProtocolVersion)> DispatchMessageAsync(

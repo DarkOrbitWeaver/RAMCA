@@ -103,6 +103,7 @@ public sealed class WorkbenchHost : IAsyncDisposable
             Registry.RegisterRange(EditingTools.Create(Paths, Config, Guard, Database, CodeIntel.InvalidateFile));
             Registry.RegisterRange(BuildGitCommandTools.Create(Paths, Config, Guard, Database, Logs, Runner, ProcessSupervisor));
             Registry.RegisterRange(JobAndWorkflowTools.Create(Guard, Database, Jobs, Workflows));
+            Registry.RegisterRange(OperationLedgerTools.Create(Guard, Database, Registry));
 
             Instructions = new ConnectionInstructions(Config, Guard, Registry, Tunnel);
             Mcp = new McpServer(Config, Guard, Database, Registry, Instructions, Logger);

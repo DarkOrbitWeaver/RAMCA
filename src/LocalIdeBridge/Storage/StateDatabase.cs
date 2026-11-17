@@ -1,5 +1,6 @@
 using System.Text.Json;
 using LocalIdeBridge.Core;
+using LocalIdeBridge.Tools;
 using Microsoft.Data.Sqlite;
 
 namespace LocalIdeBridge.Storage;
@@ -61,6 +62,16 @@ public sealed record EditJournalRecord(
     int LinesRemoved,
     bool Reverted,
     DateTimeOffset CreatedAtUtc);
+
+public sealed record OperationLedgerRecord(
+    string OperationId,
+    string SessionId,
+    string Workspace,
+    string ToolName,
+    string ArgumentsSha256,
+    string Status,
+    string? ResultJson,
+    DateTimeOffset UpdatedAtUtc);
 
 public sealed record GitCheckpointRecord(
     string Id,
@@ -242,6 +253,19 @@ public sealed class StateDatabase : IDisposable
                 );
                 CREATE INDEX IF NOT EXISTS idx_workflows_session ON workflow_runs(session_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS operation_ledger (
+                    operation_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_operations_session ON operation_ledger(session_id, updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS log_index (
                     exec_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -312,6 +336,14 @@ public sealed class StateDatabase : IDisposable
                 """;
             wf.Parameters.AddWithValue("$now", now);
             affectedIds.AddRange(Enumerable.Repeat("wf", wf.ExecuteNonQuery()));
+        }
+
+        // Ambiguous execution completion is NEVER an invitation to repeat side effects.
+        using (var ops = conn.CreateCommand())
+        {
+            ops.CommandText = "UPDATE operation_ledger SET status = 'interrupted_unknown', updated_at = $now WHERE status = 'running';";
+            ops.Parameters.AddWithValue("$now", now);
+            ops.ExecuteNonQuery();
         }
 
         using (var sess = conn.CreateCommand())
@@ -516,6 +548,86 @@ public sealed class StateDatabase : IDisposable
                 r.IsDBNull(8) ? null : r.GetString(8), DateTimeOffset.Parse(r.GetString(9))));
         }
         return list;
+    }
+
+    /// <summary>Atomically reserve a client-supplied operation ID before a side effect.
+    /// Retries never re-enter the wrapped tool, even if prior execution crashed.
+    /// The first response contains Created=true; all others return original state.
+    /// </summary>
+    public (OperationLedgerRecord Record, bool Created) TryReserveOperation(
+        string id, string sessionId, string workspace, string toolName, string argumentsSha256)
+    {
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var insert = conn.CreateCommand();
+            insert.CommandText = """
+                INSERT OR IGNORE INTO operation_ledger
+                    (operation_id, session_id, workspace, tool_name, arguments_sha256, status, created_at, updated_at)
+                VALUES ($id, $sid, $ws, $tool, $hash, 'running', $now, $now);
+                """;
+            insert.Parameters.AddWithValue("$id", id);
+            insert.Parameters.AddWithValue("$sid", sessionId);
+            insert.Parameters.AddWithValue("$ws", workspace);
+            insert.Parameters.AddWithValue("$tool", toolName);
+            insert.Parameters.AddWithValue("$hash", argumentsSha256);
+            insert.Parameters.AddWithValue("$now", now);
+            var created = insert.ExecuteNonQuery() > 0;
+            using var select = conn.CreateCommand();
+            select.CommandText = """
+                SELECT operation_id, session_id, workspace, tool_name, arguments_sha256,
+                    status, result_json, updated_at FROM operation_ledger WHERE operation_id = $id;
+                """;
+            select.Parameters.AddWithValue("$id", id);
+            using var r = select.ExecuteReader();
+            if (!r.Read()) throw new IOException("Operation reservation vanished; refusing to execute.");
+            return (ReadOperation(r), created);
+        }
+    }
+
+    public OperationLedgerRecord? GetOperation(string operationId)
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT operation_id, session_id, workspace, tool_name, arguments_sha256,
+                status, result_json, updated_at FROM operation_ledger WHERE operation_id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$id", operationId);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadOperation(r) : null;
+    }
+
+    private static OperationLedgerRecord ReadOperation(SqliteDataReader r) => new(
+        r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4),
+        r.GetString(5), r.IsDBNull(6) ? null : r.GetString(6), DateTimeOffset.Parse(r.GetString(7)));
+
+    public void CompleteOperation(string operationId, ToolResult result)
+    {
+        // Only persist bounded summaries; a large output belongs to the disk-backed
+        // command log/job result store. Do not create unbounded state rows.
+        var payload = JsonSerializer.Serialize(result, AppConfig.JsonOptions);
+        if (payload.Length > 64_000)
+            payload = JsonSerializer.Serialize(new ToolResult(result.Success, result.Summary,
+                Data: new { fullResultStored = false, executionId = result.ExecutionId },
+                ErrorCode: result.ErrorCode, ErrorMessage: result.ErrorMessage,
+                ExecutionId: result.ExecutionId), AppConfig.JsonOptions);
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE operation_ledger SET status = $st, result_json = $json, updated_at = $now
+                WHERE operation_id = $id AND status = 'running';
+                """;
+            cmd.Parameters.AddWithValue("$id", operationId);
+            cmd.Parameters.AddWithValue("$st", result.Success ? "succeeded" : "failed");
+            cmd.Parameters.AddWithValue("$json", _credentials.Redact(payload));
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+            if (cmd.ExecuteNonQuery() != 1)
+                throw new IOException("Operation completion could not be persisted. Inspect existing outcome before retrying.");
+        }
     }
 
     public void CreateJob(string jobId, string sessionId, string workspace, string toolName, string argsJson, bool isIdempotent)

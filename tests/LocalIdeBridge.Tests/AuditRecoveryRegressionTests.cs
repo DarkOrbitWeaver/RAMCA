@@ -268,6 +268,64 @@ public sealed class AuditRecoveryRegressionTests
     }
 
     [Fact]
+    public async Task ExecuteOnce_DuplicateDoesNotRepeatFileMutation()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var invocation = new JsonObject
+        {
+            ["operationId"] = "exactly_once_created_file",
+            ["tool"] = "create_file",
+            ["arguments"] = new JsonObject { ["path"] = "once.txt", ["content"] = "first\n" }
+        };
+        var first = await sb.Host.Registry.InvokeAsync("execute_once", (JsonObject)invocation.DeepClone());
+        Assert.True(first.Success, first.ErrorMessage);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "once.txt"), "later-human-edit\n");
+        var repeated = await sb.Host.Registry.InvokeAsync("execute_once", (JsonObject)invocation.DeepClone());
+        Assert.True(repeated.Success, repeated.ErrorMessage);
+        Assert.Equal("later-human-edit\n", await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "once.txt")));
+        var recorded = sb.Host.Database.GetOperation("exactly_once_created_file");
+        Assert.NotNull(recorded);
+        Assert.Equal("succeeded", recorded!.Status);
+    }
+
+    [Fact]
+    public async Task ExecuteOnce_ReuseForDifferentPayloadFailsWithoutSideEffects()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var first = await sb.Host.Registry.InvokeAsync("execute_once", new JsonObject
+        {
+            ["operationId"] = "one_key_different_args", ["tool"] = "create_file",
+            ["arguments"] = new JsonObject { ["path"] = "first.txt", ["content"] = "one" }
+        });
+        Assert.True(first.Success, first.ErrorMessage);
+        var second = await sb.Host.Registry.InvokeAsync("execute_once", new JsonObject
+        {
+            ["operationId"] = "one_key_different_args", ["tool"] = "create_file",
+            ["arguments"] = new JsonObject { ["path"] = "second.txt", ["content"] = "two" }
+        });
+        Assert.False(second.Success);
+        Assert.Equal("operation_id_conflict", second.ErrorCode);
+        Assert.False(File.Exists(Path.Combine(sb.WorkspaceDir, "second.txt")));
+    }
+
+    [Fact]
+    public async Task ExecuteOnce_RunningOperationIsNeverReplayed()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var payload = new JsonObject { ["path"] = "must_not_exist.txt", ["content"] = "bad" };
+        var hash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(payload.ToJsonString())));
+        sb.Host.Database.TryReserveOperation("crash_ambiguous", sb.Host.Database.ActiveSessionId,
+            sb.WorkspaceDir, "create_file", hash);
+        var response = await sb.Host.Registry.InvokeAsync("execute_once", new JsonObject
+        {
+            ["operationId"] = "crash_ambiguous", ["tool"] = "create_file", ["arguments"] = payload
+        });
+        Assert.False(response.Success);
+        Assert.Equal("operation_in_progress", response.ErrorCode);
+        Assert.False(File.Exists(Path.Combine(sb.WorkspaceDir, "must_not_exist.txt")));
+    }
+
+    [Fact]
     public async Task IrreversibleDeleteFlag_DoesNotPermitUnbackedLargeDeletion()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);

@@ -30,6 +30,7 @@ The auditor's **5.6/10** was a rating of the original source, not the quality of
 11. Tests: all TRX files aggregated for a solution, absent or malformed test counters fail closed, incomplete status/diff stdout is reported explicitly rather than presenting a misleading clean Git state.
 12. Transport: SSE waiter cleanup, HTTP method type guard, protocol-version header validation, valid bearer requests independent of failed-auth lockout, credential live-rotation check, TLS fail-closed and ServerAuth EKU improvements; connection instructions updated for Gemini HTTP MCP.
 13. Added targeted regression tests to disposable workspaces for crash-recovery conflict rules, patch correctness, deletion safety, unpruned backups, Git metadata protection, large job-result fidelity, and TRX aggregation.
+14. Added a durable `operation_ledger` with explicit `execute_once` and `operation_status` tools. An interrupted operation becomes `interrupted_unknown` at startup and is not automatically replayed; documented client contract in [Execution Continuity](EXECUTION_CONTINUITY.md). This is **opt-in** and does not yet deduplicate ordinary raw MCP calls.
 
 ### Implementation != verification
 
@@ -59,11 +60,11 @@ Legend: **Implemented (unverified)** = source change intended to address, needs 
 | F-016 journal count prunes live undo | Implemented (unverified) | Disk quota, multi-user retention and verified recovery archive |
 | F-017 invalid truncated job JSON | Implemented (unverified) | Spill write-failure handling & atomic job-state transaction |
 | F-018 log starts before metadata | Implemented (unverified) | Crash-tail reconciliation |
-| F-019 unbounded process output | Partial | Process stdout/stderr bounded; stdio and tunnel readers still need bounds |
+| F-019 unbounded process output | Implemented (unverified) | Process, MCP stdio and tunnel streams bounded; test with malformed gigabyte streams |
 | F-020 CLI workspace override | Implemented (unverified) | Windows path/casing and symlink test |
 | F-021 TLS fallback/certificate | Partial | Full SAN cases, CA trust and remote real-client verification |
 | F-022 Gemini MCP config | Implemented (unverified) | Live Gemini CLI connection |
-| F-023 MCP cancel/validation/stdio | Partial | Invalid method guarded; cancellation, stdio HOL, idempotency still open |
+| F-023 MCP cancel/validation/stdio | Partial | Invalid method guarded; MCP stdio framed; opt-in execute-once added; automatic MCP cancellation/deduplication and stdio HOL still open |
 | F-024 workflow conditions/retry safety | Partial | Durable workflow state, pause/resume recovery and fan-out stress |
 | F-025 symlink traversal loops | Implemented (unverified) | Very deep Windows junction test |
 | F-026 Roslyn false positives | Open | Proper MSBuildWorkspace/project references/semantic validation |
@@ -77,7 +78,7 @@ Legend: **Implemented (unverified)** = source change intended to address, needs 
 | F-034 unacknowledged local steering | Open | Acknowledged inbox and client capability negotiation |
 | F-035 read/edit edge cases | Partial | Opaque encodings, long paths, empty/trailing-newline fixture coverage |
 | F-036 asynchronous jobs race/timeouts | Partial | Job registration race fixed; timeout vs user cancel distinction open |
-| F-037 tunnel process monitoring | Open | Failure/restart state with no orphaned tunnels |
+| F-037 tunnel process monitoring | Partial | Failed process supervision kills spawned tunnel; live restart/health checks and no-orphan Windows tests open |
 | F-038 MCP redundant work/protocol | Open | Profile payload overhead and version negotiation tests |
 
 ## Remaining release-blocking acceptance tests
