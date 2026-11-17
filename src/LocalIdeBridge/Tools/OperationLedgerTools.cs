@@ -61,9 +61,13 @@ public static class OperationLedgerTools
 
                 var workspace = guard.RequireActiveWorkspace();
                 var inputHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(CanonicalArguments(inner))));
+                // Existing durable reservations used insertion-order JSON hashing.
+                // Accept an EXACT legacy payload retry; do not silently reissue it.
+                var legacyHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(inner.ToJsonString())));
                 var (operation, created) = db.TryReserveOperation(opId, ctx.SessionId, workspace, name, inputHash);
                 if (!string.Equals(operation.ToolName, name, StringComparison.Ordinal) ||
-                    !string.Equals(operation.ArgumentsSha256, inputHash, StringComparison.Ordinal) ||
+                    (!string.Equals(operation.ArgumentsSha256, inputHash, StringComparison.Ordinal) &&
+                     !string.Equals(operation.ArgumentsSha256, legacyHash, StringComparison.Ordinal)) ||
                     !string.Equals(operation.Workspace, workspace, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
                     return ToolResult.Fail("operation_id_conflict", "This operationId already belongs to a different tool, workspace or argument set. Nothing was executed.");
 
