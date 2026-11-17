@@ -168,6 +168,7 @@ public sealed partial class ProcessRunner
 
         var timedOut = false;
         var cancelled = false;
+        var outputDrainIncomplete = false;
         int exitCode;
 
         async Task PumpStreamAsync(StreamReader reader, string prefix)
@@ -229,6 +230,7 @@ public sealed partial class ProcessRunner
             }
             catch (OperationCanceledException) { }
             catch (IOException) { }
+            catch (ObjectDisposedException) { }
         }
 
         var stdoutTask = PumpStreamAsync(proc.StandardOutput, "out");
@@ -237,8 +239,16 @@ public sealed partial class ProcessRunner
         try
         {
             await proc.WaitForExitAsync(linkedCts.Token).ConfigureAwait(false);
-            // Allow stream pumps a short grace window to drain buffered lines.
-            await Task.WhenAny(Task.WhenAll(stdoutTask, stderrTask), Task.Delay(1500, CancellationToken.None)).ConfigureAwait(false);
+            // A short output-drain timeout must never silently report complete logs.
+            var drain = Task.WhenAll(stdoutTask, stderrTask);
+            if (await Task.WhenAny(drain, Task.Delay(5000, CancellationToken.None)).ConfigureAwait(false) != drain)
+            {
+                outputDrainIncomplete = true;
+                logWriter.WriteLine("meta", "Output pipe did not close after process exit; execution log is incomplete.");
+                try { proc.StandardOutput.Dispose(); } catch { }
+                try { proc.StandardError.Dispose(); } catch { }
+                await Task.WhenAny(drain, Task.Delay(1000, CancellationToken.None)).ConfigureAwait(false);
+            }
             exitCode = proc.ExitCode;
         }
         catch (OperationCanceledException)
@@ -246,7 +256,14 @@ public sealed partial class ProcessRunner
             timedOut = timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested;
             cancelled = ct.IsCancellationRequested;
             ChildProcessSupervisor.TryKillTree(proc);
-            await Task.WhenAny(Task.WhenAll(stdoutTask, stderrTask), Task.Delay(1000, CancellationToken.None)).ConfigureAwait(false);
+            var drain = Task.WhenAll(stdoutTask, stderrTask);
+            if (await Task.WhenAny(drain, Task.Delay(1000, CancellationToken.None)).ConfigureAwait(false) != drain)
+            {
+                outputDrainIncomplete = true;
+                try { proc.StandardOutput.Dispose(); } catch { }
+                try { proc.StandardError.Dispose(); } catch { }
+                await Task.WhenAny(drain, Task.Delay(1000, CancellationToken.None)).ConfigureAwait(false);
+            }
             logWriter.WriteLine("meta", timedOut
                 ? $"Terminated after exceeding timeout of {effectiveTimeout}s."
                 : "Terminated due to cancellation request.");
@@ -274,10 +291,10 @@ public sealed partial class ProcessRunner
             logWriter.BuildBoundedExcerpt(),
             logWriter.TotalLines,
             logWriter.TotalBytes,
-            logWriter.WasTruncated,
+            logWriter.WasTruncated || outputDrainIncomplete,
             diagnostics,
             capturedStdout?.ToString(),
-            stdoutCaptureTruncated || (capturedStdout is not null && (!stdoutTask.IsCompletedSuccessfully || !stderrTask.IsCompletedSuccessfully)));
+            stdoutCaptureTruncated || outputDrainIncomplete || (capturedStdout is not null && (!stdoutTask.IsCompletedSuccessfully || !stderrTask.IsCompletedSuccessfully)));
 
         if (exitCode != 0)
             _logger.Warn("exec", $"{category} '{Path.GetFileName(resolvedExe)}' exited with {exitCode}", $"execId={execId}", sw.ElapsedMilliseconds);
@@ -351,6 +368,17 @@ public sealed partial class ProcessRunner
 
         var repoPolicy = _guard.LoadRepoPolicy(wsRoot);
         var baseName = Path.GetFileNameWithoutExtension(executable);
+        var pushDenied = !_config.Autonomy.GitPushPolicy.Equals("allow", StringComparison.OrdinalIgnoreCase) ||
+                         repoPolicy?.AllowGitPush == false;
+        // Catch direct Git invocations, including git -C/-c ... push, and the
+        // equivalent commands embedded in typical PowerShell/cmd scripts.
+        // This is command-policy enforcement, not an OS sandbox for arbitrary executables.
+        if (pushDenied &&
+            ((baseName.Equals("git", StringComparison.OrdinalIgnoreCase) &&
+              arguments.Any(a => a.Equals("push", StringComparison.OrdinalIgnoreCase))) ||
+             Regex.IsMatch(joinedCommand,
+                 @"(?i)\bgit(?:\.exe)?\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+)*push\b")))
+            throw new WorkspaceViolationException("Git push is denied by autonomy or repository policy.");
         if (baseName.Equals("powershell", StringComparison.OrdinalIgnoreCase) ||
             baseName.Equals("pwsh", StringComparison.OrdinalIgnoreCase) ||
             baseName.Equals("cmd", StringComparison.OrdinalIgnoreCase) ||
