@@ -1236,6 +1236,18 @@ public sealed class StateDatabase : IDisposable
                     SELECT 1 FROM edit_journal e
                     WHERE e.session_id = s.id AND e.reverted = 0
                 )
+                AND NOT EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.session_id = s.id AND j.status IN ('queued','running')
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM workflow_runs w
+                    WHERE w.session_id = s.id AND w.status = 'running'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM operation_ledger o
+                    WHERE o.session_id = s.id AND o.status = 'running'
+                )
                 ORDER BY s.updated_at DESC LIMIT -1 OFFSET $max;
                 """;
             cmd.Parameters.AddWithValue("$active", _activeSessionId);
@@ -1251,9 +1263,13 @@ public sealed class StateDatabase : IDisposable
                 DELETE FROM job_events WHERE job_id IN (SELECT id FROM jobs WHERE session_id = $sid);
                 DELETE FROM jobs WHERE session_id = $sid;
                 DELETE FROM tool_calls WHERE session_id = $sid;
+                DELETE FROM edit_reversal_links WHERE
+                    original_edit_id IN (SELECT edit_id FROM edit_journal WHERE session_id = $sid)
+                    OR inverse_edit_id IN (SELECT edit_id FROM edit_journal WHERE session_id = $sid);
                 DELETE FROM edit_journal WHERE session_id = $sid;
                 DELETE FROM git_checkpoints WHERE session_id = $sid;
                 DELETE FROM session_change_summaries WHERE session_id = $sid;
+                DELETE FROM operation_ledger WHERE session_id = $sid;
                 DELETE FROM workflow_runs WHERE session_id = $sid;
                 DELETE FROM log_index WHERE session_id = $sid;
                 DELETE FROM sessions WHERE id = $sid;
