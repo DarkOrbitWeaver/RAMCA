@@ -561,14 +561,16 @@ public static class BuildGitCommandTools
         yield return new ToolDefinition(
             Name: "git_commit",
             Category: "git",
-            Description: "Creates a local Git commit in the active workspace without pushing externally, and records the commit SHA in session checkpoints.",
+            Description: "Creates a local Git commit on main. Prefer explicit paths for a scoped commit that excludes unrelated staged changes; use allowPreviouslyStaged only after reviewing staged content.",
             IsReadOnly: false,
             IsIdempotent: false,
             SideEffects: "Creates a local Git commit and persists a session checkpoint.",
             Parameters:
             [
                 new("message", "string", "Commit message.", Required: true),
-                new("stageAll", "boolean", "Automatically stage all changes (git add -A) before committing.", Default: false),
+                new("stageAll", "boolean", "Stages all uncommitted workspace changes, excluding pre-staged owner work unless allowPreviouslyStaged=true. Use paths for scoped commits.", Default: false),
+                new("paths", "array", "Specific existing tracked file paths to commit using git commit --only, preserving unrelated staged files.", ItemsSchema: new JsonObject { ["type"] = "string" }),
+                new("allowPreviouslyStaged", "boolean", "Explicitly allow an unscoped index commit, including existing staged changes. Requires prior index review.", Default: false),
                 new("authorName", "string", "Optional fallback author name if repo has no git user.name configured."),
                 new("authorEmail", "string", "Optional fallback author email if repo has no git user.email configured.")
             ],
@@ -579,8 +581,37 @@ public static class BuildGitCommandTools
 
                 var ws = guard.RequireActiveWorkspace();
                 var message = args.RequireString("message");
+                var includeStaged = args.OptionalBool("allowPreviouslyStaged", false);
+                var stageAll = args.OptionalBool("stageAll", false);
+                var selectedPaths = args.OptionalStringList("paths");
+                if (selectedPaths.Count > 100) throw new ArgumentException("A scoped commit accepts up to 100 paths.");
+                if (selectedPaths.Count > 0 && stageAll)
+                    throw new ArgumentException("Use either paths for a scoped commit OR stageAll, not both.");
+                if (selectedPaths.Count == 0 && !stageAll && !includeStaged)
+                    return ToolResult.Fail("commit_scope_required",
+                        "Specify paths for a scoped commit, or explicitly set allowPreviouslyStaged=true after reviewing the Git index.");
 
-                if (args.OptionalBool("stageAll", false))
+                if (!config.Autonomy.AllowGitBranchChanges)
+                {
+                    var br = await runner.RunAsync("git", "git", ["symbolic-ref", "--quiet", "--short", "HEAD"],
+                        ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 512);
+                    if (br.ExitCode != 0 || !string.Equals(br.StdoutCapture?.Trim(), "main", StringComparison.Ordinal))
+                        return ToolResult.Fail("main_only", "Git commits are allowed on main only unless the owner explicitly enables branch changes.");
+                }
+
+                if (stageAll && !includeStaged)
+                {
+                    var existing = await runner.RunAsync("git", "git",
+                        ["diff", "--cached", "--name-only", "-z"], ws, timeoutSeconds: 15, ct: ct,
+                        stdoutCaptureLimit: 512_000);
+                    if (existing.ExitCode != 0 || existing.StdoutCaptureTruncated)
+                        return ToolResult.Fail("index_unavailable", "Unable to verify existing staged changes before stageAll.");
+                    if (!string.IsNullOrEmpty(existing.StdoutCapture))
+                        return ToolResult.Fail("pre_staged_changes",
+                            "The Git index already contains staged changes. Specify paths to avoid including them, or explicitly set allowPreviouslyStaged=true after reviewing them.");
+                }
+
+                if (stageAll)
                 {
                     var addRes = await runner.RunAsync("git", "git", ["add", "-A"], ws, timeoutSeconds: 30, ct: ct);
                     if (addRes.ExitCode != 0) return FormatCommandResult(addRes);
@@ -597,7 +628,24 @@ public static class BuildGitCommandTools
                     commitArgs.Add($"user.email={args.OptionalString("authorEmail", "user@local.invalid")}");
                 }
 
-                commitArgs.AddRange(["-c", "commit.gpgsign=false", "commit", "-m", message]);
+                commitArgs.AddRange(["-c", "commit.gpgsign=false", "commit"]);
+                if (selectedPaths.Count > 0)
+                {
+                    commitArgs.Add("--only"); // Ignore unrelated paths already staged in the index.
+                }
+                commitArgs.AddRange(["-m", message]);
+                if (selectedPaths.Count > 0)
+                {
+                    commitArgs.Add("--");
+                    foreach (var requested in selectedPaths)
+                    {
+                        var target = guard.ResolvePath(requested);
+                        var relative = guard.GetRelativePathUnix(ws, target);
+                        if (relative is "" or ".")
+                            throw new ArgumentException("Scoped Git commits require concrete file paths.");
+                        commitArgs.Add(relative);
+                    }
+                }
                 var res = await runner.RunAsync("git", "git", commitArgs, ws, timeoutSeconds: 30, ct: ct);
                 if (res.ExitCode != 0)
                     return FormatCommandResult(res);

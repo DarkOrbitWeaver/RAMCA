@@ -234,7 +234,8 @@ public sealed class EditingAndGitTests
         {
             ["message"] = "Initial commit",
             ["authorName"] = "Test User",
-            ["authorEmail"] = "test@example.com"
+            ["authorEmail"] = "test@example.com",
+            ["allowPreviouslyStaged"] = true
         });
         Assert.True(commit1.Success);
         var sha1 = JsonSerializer.SerializeToElement(commit1.Data).GetProperty("commitSha").GetString()!;
