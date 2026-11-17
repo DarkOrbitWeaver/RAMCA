@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -37,6 +38,8 @@ public sealed class McpServer
     private readonly BoundedRingBuffer<string> _sseNotifications = new(128);
     private readonly object _sseSubLock = new();
     private readonly List<TaskCompletionSource> _sseWaiters = [];
+    // Cancellation notifications identify an outstanding JSON-RPC request by transport/session and request id.
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingToolCalls = new(StringComparer.Ordinal);
 
     public McpServer(
         AppConfig config,
@@ -183,14 +186,14 @@ public sealed class McpServer
                     responses.Add(MakeError(null, -32600, "Batch item must be a JSON object."));
                     continue;
                 }
-                var (resp, newSid, negVer) = await DispatchMessageAsync(msgObj, isStateless2026, ct);
+                var (resp, newSid, negVer) = await DispatchMessageAsync(msgObj, isStateless2026, ct, reqSessionId ?? "http");
                 if (newSid is not null) { mintedSessionId = newSid; negotiatedProtocol = negVer; }
                 if (resp is not null) responses.Add(resp);
             }
         }
         else if (parsed is JsonObject single)
         {
-            var (resp, newSid, negVer) = await DispatchMessageAsync(single, isStateless2026, ct);
+            var (resp, newSid, negVer) = await DispatchMessageAsync(single, isStateless2026, ct, reqSessionId ?? "http");
             if (newSid is not null) { mintedSessionId = newSid; negotiatedProtocol = negVer; }
             if (resp is not null) responses.Add(resp);
         }
@@ -415,39 +418,75 @@ public sealed class McpServer
         var buffer = new char[8192];
         var oversized = false;
 
+        using var writeGate = new SemaphoreSlim(1, 1);
+        var activeCalls = new List<Task>();
+
+        async Task EmitAsync(JsonObject? response)
+        {
+            if (response is null) return;
+            await writeGate.WaitAsync(ct).ConfigureAwait(false);
+            try { await writer.WriteLineAsync(response.ToJsonString()).ConfigureAwait(false); }
+            finally { writeGate.Release(); }
+        }
+
+        async Task DispatchFrameAsync(JsonObject obj)
+        {
+            try
+            {
+                var modern = IsModernStdioRequest(obj);
+                var (response, _, _) = await DispatchMessageAsync(obj, modern, ct, "stdio").ConfigureAwait(false);
+                if (modern && response is not null) AddModernResultMetadata(response);
+                await EmitAsync(response).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException)
+            {
+                await EmitAsync(MakeError(null, -32600, "Malformed JSON-RPC parameters or message.")).ConfigureAwait(false);
+            }
+        }
+
         async Task ProcessFrameAsync()
         {
             if (oversized)
             {
-                await writer.WriteLineAsync(MakeError(null, -32600,
-                    $"MCP stdio message exceeded the {maxChars}-character limit.").ToJsonString());
+                await EmitAsync(MakeError(null, -32600,
+                    $"MCP stdio message exceeded the {maxChars}-character limit.")).ConfigureAwait(false);
                 return;
             }
             var line = frame.ToString().TrimEnd('\r');
             if (string.IsNullOrWhiteSpace(line)) return;
-            JsonObject? response;
+            JsonObject obj;
             try
             {
-                var node = JsonNode.Parse(line);
-                if (node is not JsonObject obj)
-                    response = MakeError(null, -32600, "Expected JSON-RPC object.");
-                else
+                if (JsonNode.Parse(line) is not JsonObject parsed)
                 {
-                    var modern = IsModernStdioRequest(obj);
-                    (response, _, _) = await DispatchMessageAsync(obj, modern, ct);
-                    if (modern && response is not null) AddModernResultMetadata(response);
+                    await EmitAsync(MakeError(null, -32600, "Expected JSON-RPC object.")).ConfigureAwait(false);
+                    return;
                 }
+                obj = parsed;
             }
             catch (JsonException ex)
             {
-                response = MakeError(null, -32700, $"Parse error: {ex.Message}");
+                await EmitAsync(MakeError(null, -32700, $"Parse error: {ex.Message}")).ConfigureAwait(false);
+                return;
             }
-            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+
+            // A synchronous stdio tool call would block the reader from receiving
+            // notifications/cancelled. Dispatch calls in bounded concurrent tasks.
+            if (obj["method"]?.GetValueKind() == JsonValueKind.String &&
+                obj["method"]!.GetValue<string>() == "tools/call")
             {
-                response = MakeError(null, -32600, "Malformed JSON-RPC parameters or message.");
+                activeCalls.RemoveAll(task => task.IsCompleted);
+                if (activeCalls.Count >= 16)
+                {
+                    await EmitAsync(MakeError(obj["id"], -32000, "Too many concurrent stdio tool calls.")).ConfigureAwait(false);
+                    return;
+                }
+                activeCalls.Add(Task.Run(async () => await DispatchFrameAsync(obj).ConfigureAwait(false), CancellationToken.None));
             }
-            if (response is not null)
-                await writer.WriteLineAsync(response.ToJsonString());
+            else
+            {
+                await DispatchFrameAsync(obj).ConfigureAwait(false);
+            }
         }
 
         while (!ct.IsCancellationRequested)
@@ -470,12 +509,15 @@ public sealed class McpServer
         }
         if (frame.Length > 0 || oversized)
             await ProcessFrameAsync();
+        if (activeCalls.Count > 0)
+            await Task.WhenAll(activeCalls).ConfigureAwait(false);
     }
 
     private async Task<(JsonObject? Response, string? MintedSessionId, string ProtocolVersion)> DispatchMessageAsync(
         JsonObject msg,
         bool isStateless2026,
-        CancellationToken ct)
+        CancellationToken ct,
+        string transportSession = "stdio")
     {
         var jsonrpc = msg["jsonrpc"]?.GetValueKind() == JsonValueKind.String ? msg["jsonrpc"]!.GetValue<string>() : null;
         var hasId = msg.TryGetPropertyValue("id", out var idNode);
@@ -493,9 +535,16 @@ public sealed class McpServer
 
         var paramsObj = msg["params"] as JsonObject ?? new JsonObject();
 
-        // JSON-RPC notifications do not include an 'id' property.
+        // JSON-RPC cancellation is a notification (no id) and may arrive
+        // over a separate HTTP request while a tool is running.
         if (!hasId)
         {
+            if (method == "notifications/cancelled" &&
+                paramsObj["requestId"] is { } cancelledRequestId &&
+                _pendingToolCalls.TryGetValue(RequestKey(transportSession, cancelledRequestId), out var running))
+            {
+                try { running.Cancel(); } catch (ObjectDisposedException) { }
+            }
             return (null, null, DefaultProtocolVersion);
         }
 
@@ -606,7 +655,19 @@ public sealed class McpServer
                 if (_registry.Find(toolName) is null)
                     return (MakeError(idNode, -32602, $"Unknown tool '{toolName}'."), null, DefaultProtocolVersion);
 
-                var res = await _registry.InvokeAsync(toolName, toolArgs, null, ct);
+                var requestKey = RequestKey(transportSession, idNode!);
+                using var invocationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                if (!_pendingToolCalls.TryAdd(requestKey, invocationCts))
+                    return (MakeError(idNode, -32600, "Duplicate in-flight JSON-RPC request id."), null, DefaultProtocolVersion);
+                ToolResult res;
+                try
+                {
+                    res = await _registry.InvokeAsync(toolName, toolArgs, null, invocationCts.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _pendingToolCalls.TryRemove(requestKey, out _);
+                }
                 var structuredNode = JsonSerializer.SerializeToNode(res, AppConfig.JsonOptions) as JsonObject ?? new JsonObject();
                 var textPayload = structuredNode.ToJsonString(AppConfig.JsonOptions);
 
@@ -781,6 +842,9 @@ public sealed class McpServer
         }
         foreach (var w in copy) w.TrySetResult();
     }
+
+    private static string RequestKey(string transportSession, JsonNode id) =>
+        transportSession + ":" + id.ToJsonString();
 
     private static string GenerateSessionId()
     {
