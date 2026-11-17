@@ -80,41 +80,32 @@ public sealed class SecurityMiddleware
             return;
         }
 
-        // Check failed-auth lockout window first.
-        if (GetCount(_failCounters, ipKey, nowMinute) >= _config.Security.FailedAuthPerMinute)
-        {
-            context.Response.Headers["Retry-After"] = "60";
-            await WriteJsonError(context, StatusCodes.Status429TooManyRequests, "auth_rate_limited",
-                "Too many failed authentication attempts. Wait 60 seconds and retry.");
-            return;
-        }
-
-        // Check general per-IP sliding minute rate limit.
-        if (IncrementCounter(_reqCounters, ipKey, nowMinute) > _config.Security.RequestsPerMinute)
-        {
-            context.Response.Headers["Retry-After"] = "60";
-            await WriteJsonError(context, StatusCodes.Status429TooManyRequests, "rate_limited",
-                "Request rate limit exceeded.");
-            return;
-        }
-
-        // Unauthenticated minimal liveness check only; exposes no workspace paths, tools, or secrets.
+        // Unauthenticated liveness is tiny and exposes no sensitive metadata.
         var path = context.Request.Path.Value ?? "/";
-        if (HttpMethods.IsGet(path == "/health" ? context.Request.Method : ""))
+        if (path == "/health" && HttpMethods.IsGet(context.Request.Method))
         {
             await _next(context);
             return;
         }
 
-        // Extract Bearer or X-LocalIdeBridge-Key credential (never from URL query string).
+        // Always verify a valid key BEFORE reading the failed-auth counter.
+        // A public scanner sharing the loopback tunnel IP must not lock out the owner.
         var token = ExtractToken(context.Request);
         if (!_credentials.Verify(token))
         {
             var failures = IncrementCounter(_failCounters, ipKey, nowMinute);
+            if (failures > _config.Security.FailedAuthPerMinute ||
+                IncrementCounter(_reqCounters, ipKey, nowMinute) > _config.Security.RequestsPerMinute)
+            {
+                context.Response.Headers["Retry-After"] = "60";
+                await WriteJsonError(context, StatusCodes.Status429TooManyRequests,
+                    "auth_rate_limited", "Too many rejected requests. Wait and retry.");
+                return;
+            }
             _logger.Warn("auth", $"Rejected unauthorized {context.Request.Method} {path} from {ipKey} (failures={failures}).");
             context.Response.Headers["WWW-Authenticate"] = "Bearer realm=\"LocalIdeBridge\"";
             await WriteJsonError(context, StatusCodes.Status401Unauthorized, "unauthorized",
-                "Valid access key required via 'Authorization: Bearer <key>' or 'X-LocalIdeBridge-Key: <key>'.");
+                "Valid access key required via Authorization: Bearer or X-LocalIdeBridge-Key.");
             return;
         }
 

@@ -86,18 +86,20 @@ public sealed class ToolRegistry
 
         var args = arguments ?? new JsonObject();
         var ctx = context ?? new ToolExecutionContext(_db.ActiveSessionId);
+        var workspace = ctx.WorkspaceRoot ?? _guard.ActiveWorkspace;
         ToolResult result;
 
         try
         {
+            using var workspaceScope = workspace is null ? null : _guard.UseInvocationWorkspace(workspace);
             var needsWriteLock = !tool.IsReadOnly &&
                                  !ctx.SkipWriteLock &&
-                                 tool.Category is "editing" or "git" or "build" or "execution" &&
-                                 _guard.ActiveWorkspace is not null;
+                                 tool.Category is "editing" or "git" or "build" or "execution" or "test" &&
+                                 workspace is not null;
 
             if (needsWriteLock)
             {
-                using var _ = await _guard.AcquireWriteLockAsync(_guard.ActiveWorkspace!, ct).ConfigureAwait(false);
+                using var _ = await _guard.AcquireWriteLockAsync(workspace!, ct).ConfigureAwait(false);
                 result = await tool.Handler(args, ctx, ct).ConfigureAwait(false);
             }
             else
@@ -141,7 +143,7 @@ public sealed class ToolRegistry
         if (!result.Success)
             Interlocked.Increment(ref _totalErrors);
 
-        var ws = _guard.ActiveWorkspace ?? "";
+        var ws = workspace ?? "";
         _db.RecordToolCall(tool.Name, tool.Category, ws, result.Success, sw.ElapsedMilliseconds, result.Summary, result.ErrorCode, ctx.SessionId);
 
         if (result.Success)

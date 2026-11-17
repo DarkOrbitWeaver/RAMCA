@@ -65,13 +65,18 @@ public sealed class JobManager : IDisposable
             cts.CancelAfter(TimeSpan.FromSeconds(clamped));
         }
 
-        var task = Task.Run(() => ExecuteJobAsync(jobId, sessionId, tool.Name, clonedArgs, cts), CancellationToken.None);
-        _active[jobId] = new RunningJob(jobId, cts, task);
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _active[jobId] = new RunningJob(jobId, cts, completion.Task);
+        _ = Task.Run(async () =>
+        {
+            try { await ExecuteJobAsync(jobId, sessionId, ws, tool.Name, clonedArgs, cts).ConfigureAwait(false); }
+            finally { completion.TrySetResult(); }
+        }, CancellationToken.None);
         _logger.Info("job", $"Started async job '{jobId}' for tool '{tool.Name}'.");
         return _db.GetJob(jobId)!;
     }
 
-    private async Task ExecuteJobAsync(string jobId, string sessionId, string toolName, JsonObject args, CancellationTokenSource cts)
+    private async Task ExecuteJobAsync(string jobId, string sessionId, string workspace, string toolName, JsonObject args, CancellationTokenSource cts)
     {
         var gateAcquired = false;
         try
@@ -84,7 +89,8 @@ public sealed class JobManager : IDisposable
             var ctx = new ToolExecutionContext(
                 SessionId: sessionId,
                 JobId: jobId,
-                ReportProgress: msg => _db.AppendJobEvent(jobId, "progress", msg));
+                ReportProgress: msg => _db.AppendJobEvent(jobId, "progress", msg),
+                WorkspaceRoot: workspace);
 
             var result = await _registry.InvokeAsync(toolName, args, ctx, cts.Token).ConfigureAwait(false);
             var json = JsonSerializer.Serialize(result, AppConfig.JsonOptions);
@@ -112,7 +118,11 @@ public sealed class JobManager : IDisposable
         }
         finally
         {
-            if (gateAcquired) _concurrencyGate.Release();
+            if (gateAcquired)
+            {
+                try { _concurrencyGate.Release(); }
+                catch (ObjectDisposedException) { /* shutdown racing worker unwind */ }
+            }
             _active.TryRemove(jobId, out _);
             cts.Dispose();
         }

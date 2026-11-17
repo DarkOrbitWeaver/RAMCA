@@ -48,7 +48,10 @@ public sealed class LogStore
         var meta = _db.GetLogMeta(safeExec)
             ?? throw new KeyNotFoundException($"Execution log '{safeExec}' not found.");
 
-        if (!File.Exists(meta.FilePath))
+        // The DB stores a legacy absolute path, but the portable folder may have
+        // moved. Derive the authoritative local path from session + execution IDs.
+        var localPath = Path.Combine(_paths.GetSessionLogsDir(meta.SessionId), safeExec + ".log");
+        if (!File.Exists(localPath))
             throw new FileNotFoundException($"Log file for execution '{safeExec}' is no longer on disk.");
 
         startLine = Math.Max(1, startLine);
@@ -61,7 +64,7 @@ public sealed class LogStore
         var endLine = startLine - 1;
         var hasMore = false;
 
-        using var fs = new FileStream(meta.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 8192);
+        using var fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 8192);
         using var sr = new StreamReader(fs, Encoding.UTF8);
         string? line;
         while ((line = sr.ReadLine()) is not null)
@@ -155,6 +158,7 @@ public sealed class StreamingLogWriter : IDisposable
 
         _fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.Read, 8192);
         _sw = new StreamWriter(_fs, new UTF8Encoding(false)) { AutoFlush = false };
+        _db.RegisterLog(_execId, _sessionId, _filePath, _category, 0, 0, false);
     }
 
     public void WriteLine(string streamPrefix, string line)

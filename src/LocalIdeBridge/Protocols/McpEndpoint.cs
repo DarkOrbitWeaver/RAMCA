@@ -116,7 +116,8 @@ public sealed class McpServer
 
         // Validate explicit Mcp-Session-Id on non-initialize calls (2025-xx Streamable HTTP compliance).
         var isInitialize = parsed is JsonObject singleObj &&
-                           string.Equals(singleObj["method"]?.GetValue<string>(), "initialize", StringComparison.Ordinal);
+                           singleObj["method"]?.GetValueKind() == JsonValueKind.String &&
+                           string.Equals(singleObj["method"]!.GetValue<string>(), "initialize", StringComparison.Ordinal);
 
         if (!isStateless2026 && !isInitialize && !string.IsNullOrWhiteSpace(reqSessionId))
         {
@@ -135,7 +136,9 @@ public sealed class McpServer
         }
 
         string? mintedSessionId = null;
-        string negotiatedProtocol = reqProtoHeader ?? DefaultProtocolVersion;
+        // Never reflect an arbitrary unvalidated protocol header into a response.
+        string negotiatedProtocol = reqProtoHeader is not null && SupportedVersions.Contains(reqProtoHeader)
+            ? reqProtoHeader : DefaultProtocolVersion;
         var responses = new List<JsonObject>();
 
         if (parsed is JsonArray batch)

@@ -144,7 +144,11 @@ public sealed class PortablePaths
         var dir = Path.GetDirectoryName(targetPath)
             ?? throw new InvalidOperationException($"Cannot determine parent directory for {targetPath}");
         Directory.CreateDirectory(dir);
-        var tmpPath = Path.Combine(dir, $".{Path.GetFileName(targetPath)}.{Process.GetCurrentProcess().Id}.{Guid.NewGuid():N}.tmp");
+        // Short staging filename avoids MAX_PATH component overflow for long source names.
+        var tmpPath = Path.Combine(dir, $".ramca-{Guid.NewGuid():N}.tmp");
+        UnixFileMode? unixMode = null;
+        if (!OperatingSystem.IsWindows() && File.Exists(targetPath))
+            unixMode = File.GetUnixFileMode(targetPath);
         var enc = encoding ?? new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
         try
         {
@@ -155,7 +159,12 @@ public sealed class PortablePaths
                 sw.Flush();
                 fs.Flush(flushToDisk: true);
             }
-            File.Move(tmpPath, targetPath, overwrite: true);
+            if (unixMode is not null)
+                File.SetUnixFileMode(tmpPath, unixMode.Value);
+            if (OperatingSystem.IsWindows() && File.Exists(targetPath))
+                File.Replace(tmpPath, targetPath, null);
+            else
+                File.Move(tmpPath, targetPath, overwrite: true);
         }
         finally
         {
@@ -163,6 +172,32 @@ public sealed class PortablePaths
             {
                 try { File.Delete(tmpPath); } catch { }
             }
+        }
+    }
+    public static void AtomicWriteAllBytes(string targetPath, byte[] bytes)
+    {
+        var dir = Path.GetDirectoryName(targetPath) ?? throw new InvalidOperationException("No target directory.");
+        Directory.CreateDirectory(dir);
+        var temporary = Path.Combine(dir, $".ramca-{Guid.NewGuid():N}.tmp");
+        UnixFileMode? unixMode = null;
+        if (!OperatingSystem.IsWindows() && File.Exists(targetPath))
+            unixMode = File.GetUnixFileMode(targetPath);
+        try
+        {
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            if (unixMode is not null) File.SetUnixFileMode(temporary, unixMode.Value);
+            if (OperatingSystem.IsWindows() && File.Exists(targetPath))
+                File.Replace(temporary, targetPath, null);
+            else
+                File.Move(temporary, targetPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
         }
     }
 }

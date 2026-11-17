@@ -128,7 +128,7 @@ public sealed class StateDatabase : IDisposable
         using var pragma = conn.CreateCommand();
         pragma.CommandText = """
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             PRAGMA cache_size = -2048;
             PRAGMA temp_store = FILE;
             PRAGMA foreign_keys = ON;
@@ -547,8 +547,23 @@ public sealed class StateDatabase : IDisposable
     {
         var now = DateTimeOffset.UtcNow.ToString("O");
         var safeResult = resultJson is null ? null : _credentials.Redact(resultJson);
-        if (safeResult is not null && safeResult.Length > 64_000)
-            safeResult = safeResult[..64_000];
+        if (safeResult is { Length: > 64_000 })
+        {
+            // Store complete JSON on disk and return a structured reference, never an
+            // invalid half-document which masquerades as a successful null result.
+            var resultDir = Path.Combine(_paths.DataDir, "job-results");
+            Directory.CreateDirectory(resultDir);
+            var resultFile = Path.Combine(resultDir, PortablePaths.SanitizeId(jobId) + ".json");
+            PortablePaths.AtomicWriteAllText(resultFile, safeResult);
+            safeResult = JsonSerializer.Serialize(new
+            {
+                spilled = true,
+                jobId,
+                resultChars = safeResult.Length,
+                sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(safeResult))),
+                retrieveWith = "job_result_slice"
+            });
+        }
         var safeErr = errorMessage is null ? null : _credentials.Redact(errorMessage);
 
         lock (_writeLock)
@@ -601,6 +616,35 @@ public sealed class StateDatabase : IDisposable
             cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
             cmd.ExecuteNonQuery();
         }
+    }
+
+    public (string Content, int Offset, int TotalChars, bool HasMore) ReadJobResultSlice(string jobId, int offset, int limit)
+    {
+        if (GetJob(jobId) is null) throw new KeyNotFoundException($"Job '{jobId}' not found.");
+        var path = Path.Combine(_paths.DataDir, "job-results", PortablePaths.SanitizeId(jobId) + ".json");
+        if (!File.Exists(path)) throw new FileNotFoundException("No spilled result exists for this job.");
+        offset = Math.Max(0, offset);
+        limit = Math.Clamp(limit, 1, 32_000);
+        // File is a complete result, possibly large; seek with StreamReader character reads.
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 8192);
+        using var reader = new StreamReader(fs, System.Text.Encoding.UTF8);
+        var skip = new char[4096];
+        var remaining = offset;
+        while (remaining > 0)
+        {
+            var count = reader.Read(skip, 0, Math.Min(skip.Length, remaining));
+            if (count == 0) return ("", offset, offset - remaining, false);
+            remaining -= count;
+        }
+        var chars = new char[limit + 1];
+        var read = 0;
+        while (read < chars.Length)
+        {
+            var count = reader.Read(chars, read, chars.Length - read);
+            if (count == 0) break;
+            read += count;
+        }
+        return (new string(chars, 0, Math.Min(limit, read)), offset, -1, read > limit);
     }
 
     public JobRecord? GetJob(string jobId)
@@ -699,7 +743,8 @@ public sealed class StateDatabase : IDisposable
             using var prune = conn.CreateCommand();
             prune.CommandText = """
                 SELECT edit_id, backup_file_path FROM edit_journal
-                ORDER BY created_at DESC LIMIT -1 OFFSET $max;
+                WHERE reverted = 1
+                ORDER BY rowid DESC LIMIT -1 OFFSET $max;
                 """;
             prune.Parameters.AddWithValue("$max", _retention.EditJournalMaxEntries);
             var old = new List<(string Id, string? Backup)>();
@@ -889,15 +934,15 @@ public sealed class StateDatabase : IDisposable
         }
     }
 
-    public (string FilePath, int TotalLines, long TotalBytes, bool Truncated, string Category)? GetLogMeta(string execId)
+    public (string SessionId, string FilePath, int TotalLines, long TotalBytes, bool Truncated, string Category)? GetLogMeta(string execId)
     {
         using var conn = OpenConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT file_path, total_lines, total_bytes, truncated, command_category FROM log_index WHERE exec_id = $id;";
+        cmd.CommandText = "SELECT session_id, file_path, total_lines, total_bytes, truncated, command_category FROM log_index WHERE exec_id = $id;";
         cmd.Parameters.AddWithValue("$id", execId);
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
-        return (r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt32(3) == 1, r.GetString(4));
+        return (r.GetString(0), r.GetString(1), r.GetInt32(2), r.GetInt64(3), r.GetInt32(4) == 1, r.GetString(5));
     }
 
     private void PruneOldSessionsLocked(SqliteConnection conn)
@@ -906,8 +951,12 @@ public sealed class StateDatabase : IDisposable
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT id FROM sessions WHERE id <> $active
-                ORDER BY updated_at DESC LIMIT -1 OFFSET $max;
+                SELECT s.id FROM sessions s WHERE s.id <> $active
+                AND NOT EXISTS (
+                    SELECT 1 FROM edit_journal e
+                    WHERE e.session_id = s.id AND e.reverted = 0
+                )
+                ORDER BY s.updated_at DESC LIMIT -1 OFFSET $max;
                 """;
             cmd.Parameters.AddWithValue("$active", _activeSessionId);
             cmd.Parameters.AddWithValue("$max", _retention.MaxSessionCount);

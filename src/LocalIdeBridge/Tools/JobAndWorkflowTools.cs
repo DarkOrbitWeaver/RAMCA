@@ -90,6 +90,29 @@ public static class JobAndWorkflowTools
             });
 
         yield return new ToolDefinition(
+            Name: "job_result_slice",
+            Category: "jobs",
+            Description: "Retrieves a bounded character page from a large JSON job result stored durably on disk.",
+            IsReadOnly: true,
+            IsIdempotent: true,
+            SideEffects: "None.",
+            Parameters:
+            [
+                new("jobId", "string", "Job identifier.", Required: true),
+                new("offset", "integer", "Character offset (zero-based).", Default: 0),
+                new("maxChars", "integer", "Maximum returned characters (<=32000).", Default: 16000)
+            ],
+            Handler: (args, _, _) =>
+            {
+                var jobId = args.RequireString("jobId");
+                var part = db.ReadJobResultSlice(jobId, args.OptionalInt("offset", 0), args.OptionalInt("maxChars", 16000));
+                return Task.FromResult(ToolResult.Ok("Returned a paginated job-result slice.", new
+                {
+                    jobId, offset = part.Offset, hasMore = part.HasMore, content = part.Content
+                }));
+            });
+
+        yield return new ToolDefinition(
             Name: "job_list",
             Category: "jobs",
             Description: "Returns a paginated list of asynchronous jobs (filterable by sessionId or status).",

@@ -237,11 +237,27 @@ public sealed partial class TunnelManager : IDisposable
         req.CertificateExtensions.Add(san.Build());
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
         req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, false));
+        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            new OidCollection { new Oid("1.3.6.1.5.5.7.3.1", "TLS Web Server Authentication") }, false));
 
         using var ephemeral = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddYears(1));
         var pfxBytes = ephemeral.Export(X509ContentType.Pfx);
         Directory.CreateDirectory(paths.DataDir);
-        File.WriteAllBytes(certPath, pfxBytes);
+        PortablePaths.AtomicWriteAllBytes(certPath, pfxBytes);
+        if (OperatingSystem.IsWindows())
+        {
+            // The passwordless PFX contains the private key; make the ACL user-only.
+            try
+            {
+                using var proc = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "icacls", ArgumentList = { certPath, "/inheritance:r", "/grant:r", $"{Environment.UserName}:(R,W)" },
+                    CreateNoWindow = true, UseShellExecute = false
+                });
+                proc?.WaitForExit(3000);
+            }
+            catch { }
+        }
         if (!OperatingSystem.IsWindows())
         {
             try { File.SetUnixFileMode(certPath, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { }

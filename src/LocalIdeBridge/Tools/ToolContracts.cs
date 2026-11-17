@@ -69,7 +69,8 @@ public sealed record ToolExecutionContext(
     string SessionId,
     string? JobId = null,
     Action<string>? ReportProgress = null,
-    bool SkipWriteLock = false);
+    bool SkipWriteLock = false,
+    string? WorkspaceRoot = null);
 
 public sealed record ToolResult(
     bool Success,
