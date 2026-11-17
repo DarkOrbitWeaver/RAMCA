@@ -177,7 +177,8 @@ public sealed partial class TunnelManager : IDisposable
                             if (buffer[i] == '\n')
                             {
                                 HandleLine();
-                                line.Clear();
+                                // Deliberately discarded.
+
                                 oversized = false;
                             }
                             else if (!oversized)
@@ -208,6 +209,90 @@ public sealed partial class TunnelManager : IDisposable
 
         var completed = await Task.WhenAny(urlTcs.Task, Task.Delay(TimeSpan.FromSeconds(12), ct)).ConfigureAwait(false);
         return completed == urlTcs.Task ? await urlTcs.Task.ConfigureAwait(false) : null;
+    }
+
+    /// <summary>
+    /// Optional private OpenAI tunnel. RAMCA owns the process and automatically stops it
+    /// when the host exits. The saved API key is supplied only through the child environment.
+    /// Remote callers must still pass RAMCA's own key, injected locally by tunnel-client.
+    /// </summary>
+    public Task<bool> StartChatGptIfConfiguredAsync(string localOriginUrl, CancellationToken ct = default)
+    {
+        if (!ChatGptTunnelSetup.IsConfigured(_paths)) return Task.FromResult(false);
+        if (_config.Connection.Mode != "localhost")
+            throw new InvalidOperationException("ChatGPT private tunnel requires connection.mode=localhost; do not enable a second public tunnel simultaneously.");
+        var binary = ChatGptTunnelSetup.FindBinary(_paths)
+            ?? throw new FileNotFoundException("ChatGPT tunnel-client missing from RAMCA/tools/tunnel-client/.");
+        var origin = new Uri(localOriginUrl);
+        if (origin.Scheme != Uri.UriSchemeHttp ||
+            origin.Host is not ("127.0.0.1" or "localhost" or "::1"))
+            throw new InvalidOperationException("Refusing non-local ChatGPT tunnel origin.");
+
+        lock (_lock)
+        {
+            if (_tunnelProcess is { HasExited: false }) return Task.FromResult(true);
+        }
+        var profile = ChatGptTunnelSetup.CreateProfile(_paths, localOriginUrl.TrimEnd('/') + "/mcp");
+        var key = File.ReadAllText(ChatGptTunnelSetup.KeyFile(_paths)).Trim();
+        if (!key.StartsWith("sk-", StringComparison.Ordinal))
+            throw new InvalidOperationException("Stored ChatGPT tunnel runtime key is invalid. Run connect-chatgpt again.");
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = binary,
+            WorkingDirectory = _paths.RootDir,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true
+        };
+        psi.ArgumentList.Add("run");
+        psi.ArgumentList.Add("--profile-file");
+        psi.ArgumentList.Add(profile);
+        psi.Environment["CONTROL_PLANE_API_KEY"] = key;
+        var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        if (!proc.Start()) throw new InvalidOperationException("Could not start OpenAI tunnel-client.");
+        try { _supervisor.Register(proc); }
+        catch
+        {
+            ChildProcessSupervisor.TryKillTree(proc);
+            proc.Dispose();
+            throw;
+        }
+        try { proc.StandardInput.Close(); } catch { }
+        lock (_lock)
+        {
+            _tunnelProcess = proc;
+            _announcedEndpoint = "OpenAI private tunnel (configured)";
+        }
+        proc.Exited += (_, _) =>
+        {
+            lock (_lock)
+            {
+                if (!ReferenceEquals(_tunnelProcess, proc)) return;
+            }
+            try { _logger.Warn("tunnel", "OpenAI tunnel-client exited. RAMCA's localhost tools remain available; press C to reconnect."); }
+            catch (ObjectDisposedException) { }
+        };
+        _ = DrainRedactedAsync(proc.StandardOutput, ct: CancellationToken.None);
+        _ = DrainRedactedAsync(proc.StandardError, ct: CancellationToken.None);
+        _logger.Info("tunnel", "OpenAI Secure MCP Tunnel process started. Select the existing tunnel in ChatGPT; connection readiness is not yet verified.");
+        return Task.FromResult(true);
+    }
+
+    private static async Task DrainRedactedAsync(StreamReader reader, CancellationToken ct)
+    {
+        // External client logs may include secrets. Drain the pipes without logging
+        // untrusted stdout/stderr or retaining unbounded buffers in memory.
+        var buffer = new char[1024];
+        try
+        {
+            while (await reader.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false) > 0) { }
+        }
+        catch (OperationCanceledException) { }
+        catch (IOException) { }
+        catch (ObjectDisposedException) { }
     }
 
     public void Stop()

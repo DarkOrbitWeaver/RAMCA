@@ -54,6 +54,9 @@ public static class Program
                 case "host" or "serve":
                     return await RunServerModeAsync(paths, filtered.Skip(1).ToList(), headless: true, cts.Token);
 
+                case "connect-chatgpt":
+                    return ChatGptTunnelSetup.Configure(paths, filtered.Skip(1).ToList());
+
                 case "key":
                     return HandleKeyCommand(paths, filtered.Skip(1).ToList());
 
@@ -411,6 +414,8 @@ public static class Program
 
             Connection & Credentials:
               LocalIdeBridge instructions [--copy] [--client codex|claude-code|claude-desktop|gemini-cli|http|cli]
+              LocalIdeBridge connect-chatgpt          One-time private ChatGPT tunnel setup (interactive)
+              LocalIdeBridge connect-chatgpt --disable Remove stored tunnel configuration
               LocalIdeBridge endpoint [--copy]        Display or copy the active MCP endpoint URL
               LocalIdeBridge key [status|copy|rotate] View masked key, copy secret key, or regenerate key
               LocalIdeBridge workspace [list|add|select|remove]

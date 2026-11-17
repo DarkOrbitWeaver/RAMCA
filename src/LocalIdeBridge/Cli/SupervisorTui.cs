@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using LocalIdeBridge.Core;
+using LocalIdeBridge.Execution;
 using LocalIdeBridge.Protocols;
 
 namespace LocalIdeBridge.Cli;
@@ -151,6 +152,35 @@ public sealed class SupervisorTui
                 _statusBanner = ok ? $"Copied endpoint: {ep}" : $"Endpoint: {ep}";
                 break;
             }
+            case ConsoleKey.C:
+            {
+                if (!ChatGptTunnelSetup.IsConfigured(_host.Paths))
+                {
+                    Console.Write("\x1b[?25h\x1b[2J\x1b[H");
+                    try
+                    {
+                        var code = ChatGptTunnelSetup.Configure(_host.Paths, []);
+                        if (code != 0)
+                        {
+                            _statusBanner = "Connection setup incomplete. Press C to retry.";
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _statusBanner = $"Connection setup failed: {ex.Message}";
+                        break;
+                    }
+                    finally { Console.Write("\x1b[?25l"); }
+                }
+                try
+                {
+                    var success = _host.Tunnel.StartChatGptIfConfiguredAsync(_host.BoundLocalUrl).GetAwaiter().GetResult();
+                    _statusBanner = success ? "Private ChatGPT tunnel process launched. Select existing tunnel in ChatGPT." : "Tunnel not configured.";
+                }
+                catch (Exception ex) { _statusBanner = $"Tunnel error: {ex.Message}"; }
+                break;
+            }
             case ConsoleKey.K:
             {
                 var secret = _host.Credentials.GetSecretForExplicitCopy();
@@ -174,6 +204,13 @@ public sealed class SupervisorTui
             case ConsoleKey.R:
             {
                 _host.Credentials.Rotate();
+                if (ChatGptTunnelSetup.IsConfigured(_host.Paths))
+                {
+                    // A tunnel profile reads the RAMCA key at startup. Reconnect after rotation.
+                    _host.Tunnel.Stop();
+                    try { _host.Tunnel.StartChatGptIfConfiguredAsync(_host.BoundLocalUrl).GetAwaiter().GetResult(); }
+                    catch (Exception ex) { _statusBanner = $"Key rotated, tunnel restart failed: {ex.Message}"; break; }
+                }
                 _statusBanner = $"Regenerated access key: {_host.Credentials.GetMasked()}. Prior key invalidated immediately.";
                 break;
             }
@@ -290,7 +327,7 @@ public sealed class SupervisorTui
         }
 
         Line(Dim(new string('─', w - 1)));
-        Line(Fit("[E] Copy Endpoint  [K] Copy Key  [I] Copy Instructions  [R] Rotate Key", w - 1));
+        Line(Fit("[C] Connect ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate", w - 1));
         Line(Fit("[W] Workspace  [S] New Session  [P] Pause/Resume  [N] Note  [Q] Quit", w - 1));
         sb.Append(Dim(Fit(_statusBanner, w - 1))).Append("\x1b[K");
 
