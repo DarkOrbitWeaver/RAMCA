@@ -814,11 +814,10 @@ public static partial class EditingTools
                             File.Delete(full);
                         else
                             PortablePaths.AtomicRestoreBackupFile(restoredSnapshot, full);
-                    });
+                    }, revertOriginalEditId: editId);
                 if (transactionResult is not null)
                     return Task.FromResult(transactionResult);
 
-                db.MarkEditReverted(editId);
                 onFileMutated?.Invoke(full);
                 return Task.FromResult(ToolResult.Ok(
                     $"Restored '{edit.RelativePath}' from edit '{editId}'. Reversal is itself undoable.",
@@ -1208,6 +1207,7 @@ public static partial class EditingTools
         public string? BackupPath { get; set; }
         public string BeforeHash { get; set; } = "";
         public string AfterHash { get; set; } = "";
+        public string? RevertsOriginalEditId { get; set; }
     }
 
     private static byte[] EncodeText(string text, Encoding encoding)
@@ -1230,7 +1230,8 @@ public static partial class EditingTools
         PortablePaths paths, WorkspaceGuard guard, StateDatabase db,
         string sessionId, string workspace, string relative, string full,
         string editId, string operation, string beforeSha, string afterSha,
-        string? backupPath, bool existedBefore, int added, int removed, Action mutation)
+        string? backupPath, bool existedBefore, int added, int removed, Action mutation,
+        string? revertOriginalEditId = null)
     {
         var tx = new PatchTransaction
         {
@@ -1238,7 +1239,8 @@ public static partial class EditingTools
             Items = [new PatchTransactionItem
             {
                 RelativePath = relative, EditId = editId, BackupPath = backupPath,
-                BeforeHash = beforeSha, AfterHash = afterSha
+                BeforeHash = beforeSha, AfterHash = afterSha,
+                RevertsOriginalEditId = revertOriginalEditId
             }]
         };
         var manifest = GetTransactionPath(paths, tx.Id);
@@ -1252,9 +1254,11 @@ public static partial class EditingTools
             actual = File.Exists(full) ? ComputeFileSha256(full) : "deleted";
             if (!string.Equals(actual, afterSha, StringComparison.OrdinalIgnoreCase))
                 throw new IOException($"Post-write verification failed for '{relative}'.");
-            db.RecordEdit(new EditJournalRecord(editId, sessionId, workspace, relative,
+            var journalEntry = new EditJournalRecord(editId, sessionId, workspace, relative,
                 operation, beforeSha, afterSha, existedBefore, backupPath, added, removed,
-                false, DateTimeOffset.UtcNow));
+                false, DateTimeOffset.UtcNow);
+            if (revertOriginalEditId is null) db.RecordEdit(journalEntry);
+            else db.RecordEditAndRevert(journalEntry, revertOriginalEditId);
             tx.Committed = true;
             PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
             try { File.Delete(manifest); } catch (IOException) { }
@@ -1461,7 +1465,11 @@ public static partial class EditingTools
                     full, item.BeforeHash, item.AfterHash);
         }
         foreach (var (item, _) in targets)
-            if (db.GetEdit(item.EditId) is not null)
+        {
+            if (item.RevertsOriginalEditId is not null)
+                db.ReconcileRolledBackInverse(item.EditId, item.RevertsOriginalEditId);
+            else if (db.GetEdit(item.EditId) is not null)
                 db.MarkEditReverted(item.EditId);
+        }
     }
 }
