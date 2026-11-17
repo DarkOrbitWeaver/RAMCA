@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text;
 using LocalIdeBridge.Core;
 using LocalIdeBridge.Storage;
 using LocalIdeBridge.Tools;
@@ -118,6 +119,11 @@ public sealed class WorkflowEngine
         }
 
         var stateLock = new object();
+        // Only explicitly referenced JSON pointers are retained. No workflow
+        // stores unbounded result payloads in memory or its persisted checkpoints.
+        var bindingPointers = CollectBindingPointers(definition);
+        var boundValues = new Dictionary<string, Dictionary<string, JsonNode?>>(StringComparer.OrdinalIgnoreCase);
+        var totalBoundBytes = 0;
 
         void PersistCheckpoint(string status)
         {
@@ -209,7 +215,9 @@ public sealed class WorkflowEngine
                         await readGate.WaitAsync(wfCts.Token).ConfigureAwait(false);
                         try
                         {
-                            await RunSingleStepAsync(step, stepStates[step.Id], sid, stateLock, onProgress, () => PersistCheckpoint("running"), wfCts.Token).ConfigureAwait(false);
+                            await RunSingleStepAsync(step, stepStates[step.Id], sid, stateLock, onProgress,
+                                () => PersistCheckpoint("running"), bindingPointers, boundValues, () => totalBoundBytes,
+                                size => totalBoundBytes += size, wfCts.Token).ConfigureAwait(false);
                         }
                         finally
                         {
@@ -228,7 +236,9 @@ public sealed class WorkflowEngine
                     await writeGate.WaitAsync(wfCts.Token).ConfigureAwait(false);
                     try
                     {
-                        await RunSingleStepAsync(wsStep, stepStates[wsStep.Id], sid, stateLock, onProgress, () => PersistCheckpoint("running"), wfCts.Token).ConfigureAwait(false);
+                        await RunSingleStepAsync(wsStep, stepStates[wsStep.Id], sid, stateLock, onProgress,
+                            () => PersistCheckpoint("running"), bindingPointers, boundValues, () => totalBoundBytes,
+                            size => totalBoundBytes += size, wfCts.Token).ConfigureAwait(false);
                     }
                     finally
                     {
@@ -297,6 +307,10 @@ public sealed class WorkflowEngine
         object stateLock,
         Action<string>? onProgress,
         Action saveCheckpoint,
+        IReadOnlyDictionary<string, HashSet<string>> neededPointers,
+        Dictionary<string, Dictionary<string, JsonNode?>> boundValues,
+        Func<int> currentBoundBytes,
+        Action<int> addBoundBytes,
         CancellationToken wfCt)
     {
         var tool = _registry.Find(spec.Tool)!;
@@ -318,7 +332,18 @@ public sealed class WorkflowEngine
             if (spec.TimeoutSeconds is > 0)
                 stepCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(spec.TimeoutSeconds.Value, 1, _config.Resources.MaxCommandTimeoutSeconds)));
 
-            var argsClone = spec.Arguments is null ? new JsonObject() : (JsonObject)spec.Arguments.DeepClone();
+            JsonObject argsClone;
+            try
+            {
+                lock (stateLock)
+                    argsClone = spec.Arguments is null ? new JsonObject() :
+                        (JsonObject)ReplaceBindings(spec.Arguments, boundValues)!;
+            }
+            catch (ArgumentException ex)
+            {
+                lastResult = ToolResult.Fail("workflow_binding_failed", ex.Message);
+                break; // Invalid/missing upstream bindings must not trigger a mutation.
+            }
             try
             {
                 lastResult = await _registry.InvokeAsync(spec.Tool, argsClone,
@@ -326,6 +351,42 @@ public sealed class WorkflowEngine
                 if (!lastResult.Success && lastResult.ErrorCode == "cancelled" &&
                     stepCts.IsCancellationRequested && !wfCt.IsCancellationRequested)
                     lastResult = ToolResult.Fail("timeout", $"Step '{spec.Id}' exceeded timeout of {spec.TimeoutSeconds}s.");
+
+                if (lastResult.Success && neededPointers.TryGetValue(spec.Id, out var pointers))
+                {
+                    try
+                    {
+                        var root = JsonSerializer.SerializeToNode(lastResult, AppConfig.JsonOptions)
+                            ?? throw new ArgumentException("Upstream result cannot be serialized for binding.");
+                        var outputs = new Dictionary<string, JsonNode?>(StringComparer.Ordinal);
+                        var bytes = 0;
+                        foreach (var pointer in pointers)
+                        {
+                            var bound = ResolvePointer(root, pointer);
+                            var copy = bound?.DeepClone();
+                            var byteSize = Encoding.UTF8.GetByteCount(copy?.ToJsonString() ?? "null");
+                            if (byteSize > 8192 || bytes + byteSize > 32768)
+                                throw new ArgumentException($"Result of '{spec.Id}' exceeds workflow binding output limit.");
+                            bytes += byteSize;
+                            outputs[pointer] = copy;
+                        }
+                        lock (stateLock)
+                        {
+                            if (currentBoundBytes() + bytes > 65536)
+                                throw new ArgumentException("Workflow result bindings exceed 64 KiB aggregate limit.");
+                            boundValues[spec.Id] = outputs;
+                            addBoundBytes(bytes);
+                        }
+                    }
+                    catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or JsonException)
+                    {
+                        // The tool may have written files. Record the ambiguity and
+                        // prevent downstream execution; never retry the write.
+                        lastResult = ToolResult.Fail("workflow_binding_failed",
+                            $"Step '{spec.Id}' executed successfully, but its requested result could not be bound: {ex.Message}. Inspect execution before retrying.",
+                            new { toolExecuted = true, lastResult.ExecutionId }, lastResult.ExecutionId);
+                    }
+                }
             }
             catch (OperationCanceledException) when (!wfCt.IsCancellationRequested)
             {
@@ -473,6 +534,11 @@ public sealed class WorkflowEngine
                 throw new ArgumentException($"Step '{s.Id}' condition must reference one of its declared dependencies.");
         }
 
+        // Bindings must only refer to direct declared dependencies and may
+        // never name a sibling or future step. Reject invalid plans before
+        // any operation can run.
+        _ = CollectBindingPointers(def);
+
         // Cycle detection via 3-color DFS.
         var map = def.Steps.ToDictionary(s => s.Id, StringComparer.OrdinalIgnoreCase);
         var color = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -494,6 +560,97 @@ public sealed class WorkflowEngine
             if (color.GetValueOrDefault(s.Id, 0) == 0)
                 Visit(s.Id);
         }
+    }
+
+    private static (string Step, string Pointer) ParseBinding(JsonObject obj)
+    {
+        if (obj.Count != 1 || obj["$from"] is not JsonObject from ||
+            from.Count != 2 || from["step"]?.GetValueKind() != JsonValueKind.String ||
+            from["pointer"]?.GetValueKind() != JsonValueKind.String)
+            throw new ArgumentException("A binding must be exactly {\"$from\":{\"step\":\"id\",\"pointer\":\"/data/field\"}}.");
+        var step = from["step"]!.GetValue<string>();
+        var pointer = from["pointer"]!.GetValue<string>();
+        if (step.Length is 0 or > 128 || pointer.Length is 0 or > 256 ||
+            pointer[0] != '/' || pointer.Contains('\u0000'))
+            throw new ArgumentException("Binding step or JSON pointer is malformed.");
+        return (step, pointer);
+    }
+
+    private static Dictionary<string, HashSet<string>> CollectBindingPointers(WorkflowDefinition def)
+    {
+        var needed = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var count = 0;
+        foreach (var step in def.Steps)
+        {
+            void Visit(JsonNode? node, int depth)
+            {
+                if (depth > 20) throw new ArgumentException("Workflow binding nesting exceeds 20 levels.");
+                if (node is JsonObject obj)
+                {
+                    if (obj.ContainsKey("$from"))
+                    {
+                        var (refStep, pointer) = ParseBinding(obj);
+                        if (!step.DependsOn.Contains(refStep, StringComparer.OrdinalIgnoreCase))
+                            throw new ArgumentException($"Step '{step.Id}' must declare dependency '{refStep}' before using its output.");
+                        if (++count > 256) throw new ArgumentException("Workflow has over 256 references.");
+                        if (!needed.TryGetValue(refStep, out var pointers))
+                        {
+                            pointers = new HashSet<string>(StringComparer.Ordinal);
+                            needed[refStep] = pointers;
+                        }
+                        pointers.Add(pointer);
+                    }
+                    else foreach (var pair in obj) Visit(pair.Value, depth + 1);
+                }
+                else if (node is JsonArray arr)
+                    foreach (var item in arr) Visit(item, depth + 1);
+            }
+            Visit(step.Arguments, 0);
+        }
+        return needed;
+    }
+
+    private static JsonNode? ReplaceBindings(JsonNode? node,
+        IReadOnlyDictionary<string, Dictionary<string, JsonNode?>> values)
+    {
+        if (node is JsonObject obj)
+        {
+            if (obj.ContainsKey("$from"))
+            {
+                var (step, pointer) = ParseBinding(obj);
+                if (!values.TryGetValue(step, out var exports) ||
+                    !exports.TryGetValue(pointer, out var value))
+                    throw new ArgumentException($"Result '{pointer}' of dependency '{step}' is not available.");
+                return value?.DeepClone();
+            }
+            var output = new JsonObject();
+            foreach (var pair in obj)
+                output[pair.Key] = ReplaceBindings(pair.Value, values);
+            return output;
+        }
+        if (node is JsonArray arr)
+            return new JsonArray(arr.Select(n => ReplaceBindings(n, values)).ToArray());
+        return node?.DeepClone();
+    }
+
+    private static JsonNode? ResolvePointer(JsonNode root, string pointer)
+    {
+        JsonNode? current = root;
+        foreach (var segment in pointer[1..].Split('/'))
+        {
+            var key = segment.Replace("~1", "/", StringComparison.Ordinal)
+                .Replace("~0", "~", StringComparison.Ordinal);
+            if (current is JsonObject obj)
+            {
+                if (!obj.TryGetPropertyValue(key, out current))
+                    throw new ArgumentException($"Requested result pointer '{pointer}' does not exist.");
+            }
+            else if (current is JsonArray arr &&
+                int.TryParse(key, out var index) && index >= 0 && index < arr.Count)
+                current = arr[index];
+            else throw new ArgumentException($"Requested result pointer '{pointer}' is not available.");
+        }
+        return current;
     }
 
     private static WorkflowRunResult BuildResult(
