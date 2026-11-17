@@ -1,4 +1,8 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text.Json.Nodes;
+using LocalIdeBridge.Storage;
+using LocalIdeBridge.Tools;
 using System.Runtime.InteropServices;
 using System.Text;
 using LocalIdeBridge.Core;
@@ -18,7 +22,18 @@ public sealed class SupervisorTui
     private readonly WorkbenchHost _host;
     private readonly SemaphoreSlim _wakeSignal = new(1, 1);
     private ViewTab _activeTab = ViewTab.Overview;
+    // Selection moves through small, on-demand SQLite pages. We never retain an
+    // ever-growing list of historical operations or logs in the TUI.
     private int _scrollOffset;
+    private int _detailPage;
+    private int _lastListSlots = 6;
+    private bool _focusDetails;
+    private string? _cachedDiffKey;
+    private IReadOnlyList<UiLine> _cachedDiffLines = [];
+    private string? _cachedLogKey;
+    private IReadOnlyList<UiLine> _cachedLogLines = [];
+    private enum UiTone { Normal, Muted, Good, Warning, Error, Accent }
+    private readonly record struct UiLine(string Text, UiTone Tone = UiTone.Normal);
     private string _statusBanner = "Ready. Press [I] to copy AI instructions, [E] endpoint, [K] key, or [Q] to quit.";
     private string? _cachedGitBranch;
     private DateTimeOffset _lastGitCheckUtc = DateTimeOffset.MinValue;
@@ -82,6 +97,9 @@ public sealed class SupervisorTui
                 {
                     if (woken)
                     {
+                        // Invalidate only the currently selected preview; never preload history.
+                        _cachedDiffKey = null;
+                        _cachedLogKey = null;
                         // Coalesce rapid bursts of tool events into a single frame.
                         await Task.Delay(Math.Min(_host.Config.Tui.RefreshIntervalMs, 250), ct).ConfigureAwait(false);
                     }
@@ -135,15 +153,23 @@ public sealed class SupervisorTui
 
         switch (key.Key)
         {
-            case ConsoleKey.D1: _activeTab = ViewTab.Overview; _scrollOffset = 0; break;
-            case ConsoleKey.D2: _activeTab = ViewTab.Edits; _scrollOffset = 0; break;
-            case ConsoleKey.D3: _activeTab = ViewTab.Jobs; _scrollOffset = 0; break;
-            case ConsoleKey.D4: _activeTab = ViewTab.GitAndSessions; _scrollOffset = 0; break;
-            case ConsoleKey.D5: _activeTab = ViewTab.Errors; _scrollOffset = 0; break;
-            case ConsoleKey.UpArrow: _scrollOffset = Math.Max(0, _scrollOffset - 1); break;
-            case ConsoleKey.DownArrow: _scrollOffset = Math.Min(200, _scrollOffset + 1); break;
-            case ConsoleKey.PageUp: _scrollOffset = Math.Max(0, _scrollOffset - 10); break;
-            case ConsoleKey.PageDown: _scrollOffset = Math.Min(200, _scrollOffset + 10); break;
+            case ConsoleKey.D1: SelectTab(ViewTab.Overview); break;
+            case ConsoleKey.D2: SelectTab(ViewTab.Edits); break;
+            case ConsoleKey.D3: SelectTab(ViewTab.Jobs); break;
+            case ConsoleKey.D4: SelectTab(ViewTab.GitAndSessions); break;
+            case ConsoleKey.D5: SelectTab(ViewTab.Errors); break;
+            case ConsoleKey.UpArrow: MoveSelection(-1); break;
+            case ConsoleKey.DownArrow: MoveSelection(1); break;
+            case ConsoleKey.PageUp: MoveSelection(-Math.Max(1, _lastListSlots - 1)); break;
+            case ConsoleKey.PageDown: MoveSelection(Math.Max(1, _lastListSlots - 1)); break;
+            case ConsoleKey.Enter:
+                _focusDetails = !_focusDetails;
+                _detailPage = 0;
+                break;
+            case ConsoleKey.Escape:
+                _focusDetails = false;
+                _detailPage = 0;
+                break;
 
             case ConsoleKey.E:
             {
@@ -278,149 +304,503 @@ public sealed class SupervisorTui
         _statusBanner = string.IsNullOrWhiteSpace(note) ? "Cleared steering note." : "Updated session steering note.";
     }
 
+    private void SelectTab(ViewTab tab)
+    {
+        _activeTab = tab;
+        _scrollOffset = 0;
+        _detailPage = 0;
+        _focusDetails = false;
+        _cachedDiffKey = null;
+        _cachedLogKey = null;
+    }
+
+    private bool HasItemAt(int index)
+    {
+        if (index < 0) return false;
+        return _activeTab switch
+        {
+            ViewTab.Overview => _host.Database.ListToolCalls(_host.Database.ActiveSessionId, 1, index).Count > 0,
+            ViewTab.Edits => index < _host.Database.ListRecentEdits(_host.Database.ActiveSessionId, 100).Count,
+            ViewTab.Jobs => _host.Database.ListJobs(limit: 1, offset: index).Count > 0,
+            ViewTab.GitAndSessions => _host.Database.ListSessions(1, index).Count > 0,
+            ViewTab.Errors => _host.Database.ListToolCalls(null, 1, index, errorsOnly: true).Count > 0,
+            _ => false
+        };
+    }
+
+    private void MoveSelection(int amount)
+    {
+        if (_focusDetails)
+        {
+            // Detail pages move through a bounded diff preview or saved command log.
+            _detailPage = Math.Clamp(_detailPage - Math.Sign(amount), 0, 100_000);
+            return;
+        }
+
+        var desired = (int)Math.Clamp((long)_scrollOffset + amount, 0, 100_000);
+        if (desired < _scrollOffset)
+            _scrollOffset = desired;
+        else if (desired > _scrollOffset)
+        {
+            // PageDown may overshoot the last item. Find the last existing row
+            // without loading an unbounded collection.
+            for (var n = desired; n > _scrollOffset; n--)
+            {
+                if (!HasItemAt(n)) continue;
+                _scrollOffset = n;
+                break;
+            }
+        }
+        _detailPage = 0;
+        _cachedDiffKey = null;
+        _cachedLogKey = null;
+    }
+
     private void RenderFrame()
     {
-        var w = Math.Max(50, SafeWidth());
+        var w = Math.Max(20, SafeWidth());
         var h = Math.Max(16, SafeHeight());
         _lastWidth = w;
         _lastHeight = h;
-
-        var sb = new StringBuilder(4096);
-        sb.Append("\x1b[H"); // Cursor home (overwrite per line with \x1b[K for zero flicker).
+        var sb = new StringBuilder(8192);
+        sb.Append("\x1b[H");
 
         var highContrast = string.Equals(_host.Config.Tui.Theme, "high_contrast", StringComparison.OrdinalIgnoreCase);
-        string Bold(string s) => _useColor ? $"\x1b[1m{s}\x1b[0m" : s;
-        string Dim(string s) => _useColor && !highContrast ? $"\x1b[2m{s}\x1b[0m" : s;
-        string Green(string s) => _useColor ? $"\x1b[32m{s}\x1b[0m" : s;
-        string Yellow(string s) => _useColor ? $"\x1b[33m{s}\x1b[0m" : s;
-        string Red(string s) => _useColor ? $"\x1b[31m{s}\x1b[0m" : s;
-        string Cyan(string s) => _useColor ? $"\x1b[36m{s}\x1b[0m" : s;
-
-        void Line(string raw, int visibleLen = -1)
+        string Style(string s, UiTone tone) => !_useColor ? s : tone switch
         {
-            sb.Append(raw).Append("\x1b[K\n");
+            UiTone.Good => $"\x1b[32m{s}\x1b[0m",
+            UiTone.Warning => $"\x1b[33m{s}\x1b[0m",
+            UiTone.Error => $"\x1b[31m{s}\x1b[0m",
+            UiTone.Accent => $"\x1b[36m{s}\x1b[0m",
+            UiTone.Muted when !highContrast => $"\x1b[2m{s}\x1b[0m",
+            _ => s
+        };
+        void Line(string raw)
+        {
+            // Clip ANSI-aware text to the physical terminal width. Output never
+            // wraps and leaves ghosts from a longer previous frame.
+            sb.Append(ClipAnsi(raw, w - 1)).Append("\x1b[0m\x1b[K\n");
         }
 
         using var self = Process.GetCurrentProcess();
-        var rssMb = self.WorkingSet64 / (1024.0 * 1024.0);
-        var statusLabel = _host.Registry.IsPaused ? Yellow("Paused") : Green("Online");
-        var ep = _host.Instructions.GetMcpEndpoint();
-        var ws = _host.Guard.ActiveWorkspace ?? "(none)";
-        var branch = _cachedGitBranch ?? "-";
+        var ram = self.WorkingSet64 / (1024.0 * 1024.0);
+        var status = _host.Registry.IsPaused ? Style("Paused", UiTone.Warning) : Style("Online", UiTone.Good);
+        var workspace = _host.Guard.ActiveWorkspace ?? "(none)";
+        var currentSession = _host.Database.ActiveSessionId;
+        Line($"LocalIdeBridge  {status}  {Style($"| Tools {_host.Registry.All.Count} | Calls {_host.Registry.TotalInvocations} | Jobs {_host.Jobs.ActiveJobCount} | RAM {ram:F1} MB", UiTone.Muted)}");
+        Line($"Endpoint  : {Style(_host.Instructions.GetMcpEndpoint(), UiTone.Accent)}");
+        Line($"Key       : {_host.Credentials.GetMasked()}  Session: {currentSession}");
+        Line($"Workspace : {workspace}  Branch: {_cachedGitBranch ?? "-"}");
+        Line(Style(new string('─', Math.Max(1, w - 1)), UiTone.Muted));
+        string Tab(ViewTab tab, string label) =>
+            _activeTab == tab ? $"\x1b[1m[{label}]\x1b[0m" : Style($" {label} ", UiTone.Muted);
+        Line($"{Tab(ViewTab.Overview, "1:Activity")} {Tab(ViewTab.Edits, "2:Changes")} {Tab(ViewTab.Jobs, "3:Commands")} {Tab(ViewTab.GitAndSessions, "4:Git")} {Tab(ViewTab.Errors, "5:Errors")}");
 
-        Line($"{Bold("LocalIdeBridge")}  Status: {statusLabel}  {Dim($"| Tools: {_host.Registry.All.Count} | Calls: {_host.Registry.TotalInvocations} | Jobs: {_host.Jobs.ActiveJobCount} | RAM: {rssMb:F1} MB")}");
-        Line($"Endpoint  : {Cyan(Fit(ep, w - 13))}");
-        Line($"Key       : {_host.Credentials.GetMasked()}   Session: {Fit(_host.Database.ActiveSessionId, Math.Max(12, w - 42))}");
-        Line($"Workspace : {Fit(ws, Math.Max(16, w - 30))}  Branch: {Fit(branch, 18)}");
-        Line(Dim(new string('─', w - 1)));
-
-        // Navigation tabs.
-        string Tab(ViewTab t, string label) => _activeTab == t ? Bold($"[{label}]") : Dim($" {label} ");
-        Line($"{Tab(ViewTab.Overview, "1:Recent")} {Tab(ViewTab.Edits, "2:Edits/Diffs")} {Tab(ViewTab.Jobs, "3:Jobs/Builds")} {Tab(ViewTab.GitAndSessions, "4:Git/Sessions")} {Tab(ViewTab.Errors, "5:Errors")}");
-
-        // Virtualized body viewport: fetch ONLY enough rows for current terminal height.
-        var bodyRows = Math.Max(4, h - 10);
-        var rows = BuildVirtualizedRows(bodyRows, w - 2, Green, Yellow, Red, Dim);
+        var bodyRows = Math.Max(1, h - 11);
+        var rows = BuildVisibleRows(bodyRows, w - 2);
         for (var i = 0; i < bodyRows; i++)
         {
-            Line(i < rows.Count ? rows[i] : "");
+            var row = i < rows.Count ? rows[i] : new UiLine("");
+            Line(Style(row.Text, row.Tone));
         }
 
-        Line(Dim(new string('─', w - 1)));
-        Line(Fit("[C] Connect ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate", w - 1));
-        Line(Fit("[W] Workspace  [S] New Session  [P] Pause/Resume  [N] Note  [Q] Quit", w - 1));
-        sb.Append(Dim(Fit(_statusBanner, w - 1))).Append("\x1b[K");
-
+        Line(Style(new string('─', Math.Max(1, w - 1)), UiTone.Muted));
+        Line(Style("[Up/Down] Select  [PgUp/PgDn] Page  [Enter] Details  [Esc] Back", UiTone.Muted));
+        Line("[C] ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate");
+        Line("[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
+        sb.Append(Style(Fit(_statusBanner, w - 1), UiTone.Muted)).Append("\x1b[0m\x1b[K");
         Console.Write(sb.ToString());
     }
 
-    private List<string> BuildVirtualizedRows(
-        int count,
-        int maxCols,
-        Func<string, string> green,
-        Func<string, string> yellow,
-        Func<string, string> red,
-        Func<string, string> dim)
+    private List<UiLine> BuildVisibleRows(int count, int width)
     {
-        var lines = new List<string>(count);
-
-        switch (_activeTab)
+        var lines = new List<UiLine>(count);
+        try
         {
-            case ViewTab.Overview:
+            switch (_activeTab)
             {
-                var calls = _host.Database.ListToolCalls(_host.Database.ActiveSessionId, count, _scrollOffset);
-                if (calls.Count == 0)
-                {
-                    lines.Add(dim("  Waiting for authorized AI agent tool calls..."));
-                    lines.Add(dim("  Copy connection instructions [I] and key [K] into a compatible MCP/HTTP/CLI agent."));
-                }
-                foreach (var c in calls)
-                {
-                    var badge = c.Success ? green("OK ") : red("ERR");
-                    var text = Fit($"{c.CreatedAtUtc.ToLocalTime():HH:mm:ss}  {c.ToolName,-20} {c.DurationMs,5}ms  {c.Summary}", Math.Max(20, maxCols - 5));
-                    lines.Add($"{badge} {text}");
-                }
-                break;
+                case ViewTab.Overview: AddActivityRows(lines, count, width); break;
+                case ViewTab.Edits: AddEditRows(lines, count, width); break;
+                case ViewTab.Jobs: AddCommandRows(lines, count, width); break;
+                case ViewTab.GitAndSessions: AddGitRows(lines, count, width); break;
+                case ViewTab.Errors: AddErrorRows(lines, count, width); break;
             }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            lines.Add(new UiLine("  View unavailable: " + Fit(ex.Message, width - 22), UiTone.Error));
+        }
+        return lines.Count <= count ? lines : lines.Take(count).ToList();
+    }
 
-            case ViewTab.Edits:
+    private void AddActivityRows(List<UiLine> lines, int count, int width)
+    {
+        var slots = _focusDetails ? 1 : Math.Clamp((count - 5) / 2, 1, 8);
+        _lastListSlots = slots;
+        var first = _focusDetails ? _scrollOffset : Math.Max(0, _scrollOffset - slots + 1);
+        var calls = _host.Database.ListToolCalls(_host.Database.ActiveSessionId, slots, first);
+        if (calls.Count == 0)
+        {
+            lines.Add(new UiLine("  No recorded operations for this session.", UiTone.Muted));
+            return;
+        }
+
+        ToolCallRecord? selected = null;
+        foreach (var (call, i) in calls.Select((v, i) => (v, i)))
+        {
+            var active = first + i == _scrollOffset;
+            if (active) selected = call;
+            if (_focusDetails && !active) continue;
+            var tag = call.Success ? "OK" : "ERR";
+            var friendly = FriendlyToolName(call.ToolName);
+            lines.Add(new UiLine(
+                Fit($"{(active ? '›' : ' ')} {tag,-3} {call.CreatedAtUtc.ToLocalTime():HH:mm:ss}  {friendly}  {FormatDuration(call.DurationMs)}", width),
+                active ? UiTone.Accent : call.Success ? UiTone.Good : UiTone.Error));
+            if (!_focusDetails)
+                lines.Add(new UiLine(Fit($"     {call.Summary}", width), UiTone.Muted));
+        }
+
+        if (selected is null) return;
+        lines.Add(new UiLine("  ── Selected operation ──", UiTone.Accent));
+        lines.Add(new UiLine(Fit($"  {selected.ToolName}  ·  {selected.Category}  ·  {FormatDuration(selected.DurationMs)}", width)));
+        lines.Add(new UiLine(Fit($"  {selected.Summary}", width), selected.Success ? UiTone.Normal : UiTone.Error));
+        if (!string.IsNullOrEmpty(selected.ErrorCode))
+            lines.Add(new UiLine("  Error: " + selected.ErrorCode, UiTone.Error));
+        lines.Add(new UiLine(Fit("  Workspace: " + selected.Workspace, width), UiTone.Muted));
+        if (selected.Category == "editing")
+            lines.Add(new UiLine("  Open [2] Changes to see verified line diffs.", UiTone.Muted));
+        else if (selected.ToolName is "run_command" or "dotnet_build" or "dotnet_test" or "msbuild_run")
+            lines.Add(new UiLine("  [3] Commands shows linked background-job output.", UiTone.Muted));
+        if (!_focusDetails)
+            lines.Add(new UiLine("  Enter: expand  ·  Older operations: PgDown", UiTone.Muted));
+    }
+
+    private void AddEditRows(List<UiLine> lines, int count, int width)
+    {
+        // The existing edit journal API offers the 100 most recent edits. We
+        // never invent older pages or scan unbounded history.
+        var entries = _host.Database.ListRecentEdits(_host.Database.ActiveSessionId, 100);
+        if (entries.Count == 0)
+        {
+            lines.Add(new UiLine("  No file edits recorded in this session.", UiTone.Muted));
+            return;
+        }
+
+        _scrollOffset = Math.Min(_scrollOffset, entries.Count - 1);
+        var selected = entries[_scrollOffset];
+        var slots = _focusDetails ? 0 : Math.Clamp(count / 3, 2, 8);
+        _lastListSlots = Math.Max(1, slots);
+        if (!_focusDetails)
+        {
+            var from = Math.Max(0, _scrollOffset - slots + 1);
+            for (var i = from; i < Math.Min(entries.Count, from + slots); i++)
             {
-                var edits = _host.Database.ListRecentEdits(_host.Database.ActiveSessionId, count);
-                if (edits.Count == 0) lines.Add(dim("  No file edits in current session yet."));
-                foreach (var e in edits.Take(count))
-                {
-                    var rev = e.Reverted ? yellow("[reverted] ") : "";
-                    lines.Add(Fit($"  {e.CreatedAtUtc.ToLocalTime():HH:mm:ss}  +{e.LinesAdded,-4} -{e.LinesRemoved,-4} {e.Operation,-14} {rev}{e.RelativePath}", maxCols));
-                }
-                break;
-            }
-
-            case ViewTab.Jobs:
-            {
-                var jobs = _host.Database.ListJobs(limit: count, offset: _scrollOffset);
-                if (jobs.Count == 0) lines.Add(dim("  No asynchronous jobs recorded yet."));
-                foreach (var j in jobs)
-                {
-                    var st = j.Status switch
-                    {
-                        "succeeded" => green("DONE"),
-                        "running" or "queued" => yellow("RUN "),
-                        _ => red("FAIL")
-                    };
-                    lines.Add($"{st} {Fit($"{j.Id}  {j.ToolName,-16}  {j.Status,-18}  {j.ErrorMessage ?? ""}", Math.Max(20, maxCols - 6))}");
-                }
-                break;
-            }
-
-            case ViewTab.GitAndSessions:
-            {
-                var cps = _host.Database.ListGitCheckpoints(limit: Math.Max(2, count / 2));
-                lines.Add("  Recent Git Commits / Checkpoints:");
-                if (cps.Count == 0) lines.Add(dim("    (none recorded yet)"));
-                foreach (var cp in cps.Take(Math.Max(1, count / 2 - 1)))
-                    lines.Add(Fit($"    {cp.CommitSha[..Math.Min(8, cp.CommitSha.Length)]} ({cp.Branch}) {cp.Label}", maxCols));
-
-                var remaining = count - lines.Count - 1;
-                if (remaining > 0)
-                {
-                    lines.Add("  Recent Sessions:");
-                    foreach (var s in _host.Database.ListSessions(remaining, _scrollOffset))
-                        lines.Add(Fit($"    {s.Id}  [{s.Status,-6}]  calls={s.ToolCallCount} err={s.ErrorCount}  {Path.GetFileName(s.Workspace)}", maxCols));
-                }
-                break;
-            }
-
-            case ViewTab.Errors:
-            {
-                var errs = _host.Database.ListToolCalls(null, count, _scrollOffset, errorsOnly: true);
-                if (errs.Count == 0) lines.Add(dim("  No tool errors recorded."));
-                foreach (var e in errs)
-                    lines.Add($"{red("ERR")} {Fit($"{e.CreatedAtUtc.ToLocalTime():HH:mm:ss} {e.ToolName} [{e.ErrorCode}]: {e.Summary}", Math.Max(20, maxCols - 5))}");
-                break;
+                var e = entries[i];
+                lines.Add(new UiLine(
+                    Fit($"{(i == _scrollOffset ? '›' : ' ')} {e.CreatedAtUtc.ToLocalTime():HH:mm:ss}  +{e.LinesAdded} -{e.LinesRemoved}  {CompactPath(e.RelativePath, Math.Max(8, width - 27))}", width),
+                    i == _scrollOffset ? UiTone.Accent : e.Reverted ? UiTone.Warning : UiTone.Normal));
             }
         }
 
-        return lines;
+        lines.Add(new UiLine("  ── " + (selected.Reverted ? "Reverted edit" : "Recorded edit") + " ──", UiTone.Accent));
+        lines.Add(new UiLine(Fit($"  {selected.Operation}  +{selected.LinesAdded} -{selected.LinesRemoved}  {selected.CreatedAtUtc.ToLocalTime():HH:mm:ss}", width)));
+        lines.Add(new UiLine(Fit("  " + selected.RelativePath, width), UiTone.Muted));
+        var preview = GetVerifiedDiff(selected);
+        var visible = Math.Max(0, count - lines.Count - 1);
+        var start = _focusDetails ? Math.Min(preview.Count, _detailPage * Math.Max(1, visible)) : 0;
+        foreach (var line in preview.Skip(start).Take(visible))
+            lines.Add(new UiLine("  " + Fit(line.Text, width - 2), line.Tone));
+        if (lines.Count < count)
+            lines.Add(new UiLine(
+                _focusDetails ? $"  Diff lines {start + 1}–{Math.Min(preview.Count, start + visible)} of {preview.Count} · PgUp/PgDn: navigate"
+                              : "  Enter: larger diff · PgDown: older edits",
+                UiTone.Muted));
+    }
+
+    private IReadOnlyList<UiLine> GetVerifiedDiff(EditJournalRecord edit)
+    {
+        if (_cachedDiffKey == edit.EditId) return _cachedDiffLines;
+        var result = new List<UiLine>();
+        try
+        {
+            using var scope = _host.Guard.UseInvocationWorkspace(edit.Workspace);
+            var full = _host.Guard.ResolvePath(edit.RelativePath, explicitWorkspace: edit.Workspace);
+            var backup = Path.Combine(_host.Paths.SessionsDir, PortablePaths.SanitizeId(edit.SessionId),
+                "edits", PortablePaths.SanitizeId(edit.EditId) + ".bak");
+            const long maxPreviewBytes = 256 * 1024;
+            string? currentHash = File.Exists(full) ? EditingTools.ComputeFileSha256(full) : null;
+            if (edit.AfterSha256 == "deleted")
+            {
+                if (currentHash is not null)
+                    throw new InvalidOperationException("File has been recreated since this edit; historical diff unavailable.");
+            }
+            else if (!string.Equals(currentHash, edit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("File changed after this edit; showing its original diff would be misleading.");
+
+            if (edit.ExistedBefore && !File.Exists(backup))
+                throw new FileNotFoundException("Verified edit backup is no longer available.");
+            if ((File.Exists(full) && new FileInfo(full).Length > maxPreviewBytes) ||
+                (edit.ExistedBefore && new FileInfo(backup).Length > maxPreviewBytes))
+                throw new InvalidOperationException("Preview limited to 256 KiB per file; counts remain available.");
+
+            string[] before = [];
+            if (edit.ExistedBefore)
+            {
+                if (!string.Equals(EditingTools.ComputeFileSha256(backup), edit.BeforeSha256,
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Original backup hash differs; preview suppressed.");
+                before = EditingTools.LoadTextFile(backup).Lines;
+            }
+            var after = edit.AfterSha256 == "deleted" ? [] : EditingTools.LoadTextFile(full).Lines;
+            var diff = EditingTools.BuildCompactUnifiedDiff(edit.RelativePath, before, after, maxChars: 20_000);
+            foreach (var raw in diff.Split('\n'))
+            {
+                if (raw.StartsWith("--- ") || raw.StartsWith("+++ ")) continue;
+                var tone = raw.StartsWith('+') ? UiTone.Good :
+                    raw.StartsWith('-') ? UiTone.Error :
+                    raw.StartsWith("@@") ? UiTone.Accent : UiTone.Muted;
+                result.Add(new UiLine(raw.TrimEnd('\r'), tone));
+            }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or WorkspaceViolationException or UnauthorizedAccessException or ArgumentException)
+        {
+            result.Add(new UiLine(ex.Message, UiTone.Warning));
+            result.Add(new UiLine("Only trustworthy, matching pre/post-image diffs are displayed.", UiTone.Muted));
+        }
+        _cachedDiffKey = edit.EditId;
+        _cachedDiffLines = result;
+        return result;
+    }
+
+    private void AddCommandRows(List<UiLine> lines, int count, int width)
+    {
+        var slots = _focusDetails ? 1 : Math.Clamp(count / 3, 2, 8);
+        _lastListSlots = slots;
+        var from = _focusDetails ? _scrollOffset : Math.Max(0, _scrollOffset - slots + 1);
+        var jobs = _host.Database.ListJobs(limit: slots, offset: from);
+        if (jobs.Count == 0)
+        {
+            lines.Add(new UiLine("  No background jobs recorded yet.", UiTone.Muted));
+            lines.Add(new UiLine("  Direct commands are summarized in [1] Activity.", UiTone.Muted));
+            return;
+        }
+
+        JobRecord? selected = null;
+        foreach (var (job, i) in jobs.Select((v, i) => (v, i)))
+        {
+            var active = from + i == _scrollOffset;
+            if (active) selected = job;
+            if (_focusDetails && !active) continue;
+            var tone = StatusTone(job.Status);
+            var duration = job.StartedAtUtc is not null
+                ? FormatDuration((long)Math.Max(0, ((job.CompletedAtUtc ?? DateTimeOffset.UtcNow) - job.StartedAtUtc.Value).TotalMilliseconds))
+                : "queued";
+            lines.Add(new UiLine(
+                Fit($"{(active ? '›' : ' ')} {job.Status,-10} {FriendlyToolName(job.ToolName)}  {duration}", width),
+                active ? UiTone.Accent : tone));
+        }
+        if (selected is null) return;
+
+        lines.Add(new UiLine("  ── Command / job details ──", UiTone.Accent));
+        lines.Add(new UiLine(Fit($"  {selected.ToolName}  [{selected.Status}]  {selected.Id}", width), StatusTone(selected.Status)));
+        lines.Add(new UiLine(Fit($"  Workspace: {selected.Workspace}", width), UiTone.Muted));
+        if (!string.IsNullOrWhiteSpace(selected.ErrorMessage))
+            lines.Add(new UiLine(Fit("  " + selected.ErrorMessage, width), UiTone.Error));
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(selected.ResultJson) &&
+                JsonNode.Parse(selected.ResultJson) is JsonObject result)
+            {
+                var data = result["data"] as JsonObject;
+                var exe = data?["executable"]?.ToString();
+                var exit = data?["exitCode"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(exe))
+                    lines.Add(new UiLine(Fit($"  Executable: {exe}" + (exit is null ? "" : $" · exit {exit}"), width)));
+                if (data?["total"] is not null)
+                    lines.Add(new UiLine(Fit($"  Tests: {data["passed"]} passed · {data["failed"]} failed · {data["skipped"]} skipped", width),
+                        data["failed"]?.ToString() == "0" ? UiTone.Good : UiTone.Warning));
+            }
+        }
+        catch (JsonException) { /* Older or partial result: show durable metadata. */ }
+
+        var remaining = Math.Max(0, count - lines.Count - 1);
+        if (remaining <= 0) return;
+        var output = GetJobLogPreview(selected, remaining);
+        foreach (var line in output.Take(remaining))
+            lines.Add(new UiLine("  " + Fit(line.Text, width - 2), line.Tone));
+        if (lines.Count < count)
+            lines.Add(new UiLine(_focusDetails ? "  PgUp: older output · PgDown: newer · Esc: list"
+                        : "  Enter: larger output · PgDown: older jobs", UiTone.Muted));
+    }
+
+    private IReadOnlyList<UiLine> GetJobLogPreview(JobRecord job, int maxRows)
+    {
+        if (string.IsNullOrWhiteSpace(job.LogExecId))
+        {
+            var rows = new List<UiLine>();
+            if (!string.IsNullOrWhiteSpace(job.ErrorMessage))
+                rows.Add(new UiLine(job.ErrorMessage!, UiTone.Error));
+            if (rows.Count == 0)
+                rows.Add(new UiLine(job.Status is "running" or "queued"
+                    ? "Job active; output appears when its execution log is linked."
+                    : "No execution log was linked to this job.", UiTone.Muted));
+            return rows;
+        }
+        try
+        {
+            var meta = _host.Database.GetLogMeta(job.LogExecId);
+            if (meta is null) return [new UiLine("Execution log metadata unavailable.", UiTone.Warning)];
+            var pageSize = Math.Max(1, maxRows);
+            var start = Math.Max(1, meta.Value.TotalLines - (_detailPage + 1) * pageSize + 1);
+            var key = $"{job.LogExecId}:{meta.Value.TotalLines}:{pageSize}:{start}";
+            if (_cachedLogKey == key) return _cachedLogLines;
+            var slice = _host.Logs.ReadRange(job.LogExecId, start, pageSize);
+            var rows = new List<UiLine>();
+            if (meta.Value.Truncated) rows.Add(new UiLine("Output capped by RAMCA's configured log limit.", UiTone.Warning));
+            if (start > 1) rows.Add(new UiLine($"Showing saved log lines {start}–{Math.Min(meta.Value.TotalLines, start + pageSize - 1)} / {meta.Value.TotalLines}.", UiTone.Muted));
+            foreach (var entry in slice.Content.Split('\n', StringSplitOptions.RemoveEmptyEntries).Take(pageSize))
+            {
+                var tone = entry.Contains("[err]", StringComparison.OrdinalIgnoreCase) ||
+                    entry.Contains(": error ", StringComparison.OrdinalIgnoreCase) ? UiTone.Error :
+                    entry.Contains("warning", StringComparison.OrdinalIgnoreCase) ? UiTone.Warning :
+                    entry.Contains("[meta]", StringComparison.OrdinalIgnoreCase) ? UiTone.Muted : UiTone.Normal;
+                rows.Add(new UiLine(entry.TrimEnd('\r'), tone));
+            }
+            _cachedLogKey = key;
+            _cachedLogLines = rows;
+            return rows;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or KeyNotFoundException)
+        {
+            return [new UiLine("Execution log unavailable: " + ex.Message, UiTone.Warning)];
+        }
+    }
+
+    private void AddGitRows(List<UiLine> lines, int count, int width)
+    {
+        _lastListSlots = Math.Max(1, count - 5);
+        lines.Add(new UiLine($"  Active workspace: {CompactPath(_host.Guard.ActiveWorkspace ?? "-", width - 20)}", UiTone.Accent));
+        lines.Add(new UiLine($"  Branch: {_cachedGitBranch ?? "unknown"}", UiTone.Muted));
+        var checkpoints = _host.Database.ListGitCheckpoints(limit: Math.Min(3, Math.Max(1, count / 4)));
+        lines.Add(new UiLine("  Saved Git checkpoints:", UiTone.Accent));
+        if (checkpoints.Count == 0) lines.Add(new UiLine("    None saved in this session.", UiTone.Muted));
+        foreach (var point in checkpoints)
+            lines.Add(new UiLine(Fit($"    {point.CommitSha[..Math.Min(8, point.CommitSha.Length)]}  {point.Label}", width)));
+
+        lines.Add(new UiLine("  Sessions (bounded history):", UiTone.Accent));
+        var sessions = _host.Database.ListSessions(limit: Math.Max(1, count - lines.Count), offset: _scrollOffset);
+        if (sessions.Count == 0) lines.Add(new UiLine("    No sessions at this position.", UiTone.Muted));
+        foreach (var (session, index) in sessions.Select((v, i) => (v, i)))
+            lines.Add(new UiLine(Fit(
+                $"    {(_scrollOffset + index == _scrollOffset ? '›' : ' ')} {session.Status,-7} {session.Id}  calls {session.ToolCallCount}  err {session.ErrorCount}", width)));
+    }
+
+    private void AddErrorRows(List<UiLine> lines, int count, int width)
+    {
+        var slots = _focusDetails ? 1 : Math.Clamp((count - 4) / 2, 1, 8);
+        _lastListSlots = slots;
+        var first = _focusDetails ? _scrollOffset : Math.Max(0, _scrollOffset - slots + 1);
+        var errors = _host.Database.ListToolCalls(null, slots, first, errorsOnly: true);
+        if (errors.Count == 0)
+        {
+            lines.Add(new UiLine("  No errors recorded.", UiTone.Good));
+            return;
+        }
+        foreach (var (error, i) in errors.Select((v, i) => (v, i)))
+        {
+            var active = first + i == _scrollOffset;
+            lines.Add(new UiLine(Fit($"{(active ? '›' : ' ')} {error.CreatedAtUtc.ToLocalTime():HH:mm:ss}  {error.ToolName}  {FormatDuration(error.DurationMs)}", width),
+                active ? UiTone.Accent : UiTone.Error));
+            if (!_focusDetails) lines.Add(new UiLine(Fit("     " + error.Summary, width), UiTone.Muted));
+            if (active)
+            {
+                // Preserve the diagnostic fields, never synthesize a root cause.
+                if (_focusDetails)
+                {
+                    lines.Add(new UiLine("  ── Recorded failure ──", UiTone.Error));
+                    lines.Add(new UiLine(Fit($"  Code: {error.ErrorCode ?? "(none)"}  ·  {error.Category}", width)));
+                    lines.Add(new UiLine(Fit("  " + error.Summary, width), UiTone.Error));
+                    lines.Add(new UiLine(Fit("  Workspace: " + error.Workspace, width), UiTone.Muted));
+                }
+            }
+        }
+    }
+
+    private static UiTone StatusTone(string status) => status switch
+    {
+        "succeeded" => UiTone.Good,
+        "running" or "queued" => UiTone.Warning,
+        "cancelled" or "interrupted_restart" => UiTone.Muted,
+        _ => UiTone.Error
+    };
+
+    private static string FriendlyToolName(string tool) => tool switch
+    {
+        "replace_range" => "Edit lines",
+        "apply_patch" => "Apply patch",
+        "create_file" => "Create file",
+        "delete_file" => "Delete file",
+        "rename_file" => "Rename file",
+        "revert_edit" => "Undo edit",
+        "run_command" => "Run command",
+        "dotnet_build" => ".NET build",
+        "dotnet_test" => ".NET tests",
+        "msbuild_run" => "MSBuild",
+        "job_start" => "Start job",
+        "job_status" => "Job status",
+        "git_commit" => "Git commit",
+        "git_push" => "Git push",
+        _ => tool.Replace('_', ' ')
+    };
+
+    private static string FormatDuration(long ms)
+    {
+        ms = Math.Max(0, ms);
+        if (ms < 1_000) return $"{ms / 1_000.0:0.###}s";
+        if (ms < 60_000) return $"{ms / 1_000.0:0.#}s";
+        var seconds = ms / 1_000;
+        if (seconds < 3_600) return $"{seconds / 60}m {seconds % 60}s";
+        return $"{seconds / 3_600}h {(seconds % 3_600) / 60}m {seconds % 60}s";
+    }
+
+    private static string CompactPath(string path, int max)
+    {
+        max = Math.Max(5, max);
+        var clean = path.Replace('\\', '/');
+        return clean.Length <= max ? clean : "…/" + clean[^Math.Max(1, max - 2)..];
+    }
+
+    private static string ClipAnsi(string source, int maxColumns)
+    {
+        // Preserve only SGR color escapes. Strip arbitrary cursor/control bytes
+        // from file contents and tool logs so an operation cannot rewrite the TUI.
+        var output = new StringBuilder(Math.Min(source.Length, Math.Max(0, maxColumns) + 48));
+        var visible = 0;
+        for (var i = 0; i < source.Length && visible < maxColumns; i++)
+        {
+            var ch = source[i];
+            if (ch == '\x1b')
+            {
+                if (i + 1 < source.Length && source[i + 1] == '[')
+                {
+                    var end = i + 2;
+                    while (end < source.Length && end - i < 24 &&
+                           (char.IsAsciiDigit(source[end]) || source[end] == ';')) end++;
+                    if (end < source.Length && source[end] == 'm')
+                    {
+                        output.Append(source, i, end - i + 1);
+                        i = end;
+                    }
+                }
+                continue;
+            }
+            if (ch is '\r' or '\n' or '\t') { output.Append(' '); visible++; continue; }
+            if (char.IsControl(ch)) continue;
+            output.Append(ch);
+            visible++;
+        }
+        return output.ToString();
     }
 
     private void RefreshGitBranchIfStale(bool force)
