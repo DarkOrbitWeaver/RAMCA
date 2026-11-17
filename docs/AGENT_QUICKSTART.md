@@ -29,7 +29,7 @@ Copy this document (or press **`I`** in LocalIdeBridge / run `LocalIdeBridge.exe
    - Call `job_start` (`{ "tool": "dotnet_test", "arguments": {} }`), poll `job_status` / `job_events` (`afterEventId`), cancel via `job_cancel`.
    - Chain multi-step tasks with `workflow_run` (supports `dependsOn`, `runIf`, `retries`, `timeoutSeconds`, and `checkpointAfter`).
 6. **Commit locally:**
-   - Review `git_diff` and `git_status`, create branches with `git_branch` (or isolated `git_worktree`), and commit with `git_commit`.
+   - Review `git_diff` and `git_status`, stay on `main`, and commit with `git_commit`. Do not create branches, worktrees, or pull requests unless the owner explicitly authorizes an exception and changes the local policy.
 
 ## Boundaries & Limitations
 

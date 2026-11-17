@@ -366,8 +366,8 @@ public static partial class EditingTools
                 var staged = new List<(string RelPath, string FullPath, string Op, LoadedTextFile? Before, string? NewContent, Encoding Enc, int Added, int Removed)>();
                 var seen = new HashSet<string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
                 var shaMap = args["expectedSha256Map"] as JsonObject;
-                if (shaMap is not null && filePatches.Count == 1 && expectedSha is not null)
-                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "Specify one SHA-256 precondition scheme, not both."));
+                if (expectedSha is not null && (filePatches.Count != 1 || shaMap is not null))
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "A scalar expectedSha256 is permitted only for a single-file patch without expectedSha256Map."));
 
                 foreach (var fp in filePatches)
                 {
@@ -1051,10 +1051,15 @@ public static partial class EditingTools
         for (var hIdx = 0; hIdx < hunks.Count; hIdx++)
         {
             var h = hunks[hIdx];
-            var targetIdx = h.OldStart == 0 ? 0 : h.OldStart - 1;
+            // Unified diff empty OLD ranges designate the line *before*
+            // insertion: -N,0 inserts after the existing Nth line.
+            var targetIdx = h.OldCount == 0 ? h.OldStart : h.OldStart == 0 ? 0 : h.OldStart - 1;
 
-            // Support small line-offset fuzz (+/- 3 lines) when exact line shifted slightly but context matches uniquely.
-            var matchedIdx = FindMatchingPosition(source, h, targetIdx, cursor);
+            // Pure additions have no source context to justify fuzzy relocation.
+            // Never silently shift them to a different line.
+            var matchedIdx = h.OldCount == 0
+                ? (targetIdx >= cursor && targetIdx <= source.Count ? targetIdx : -1)
+                : FindMatchingPosition(source, h, targetIdx, cursor);
             if (matchedIdx < 0)
             {
                 error = $"Patch precondition failed in '{displayPath}' at hunk #{hIdx + 1} (around line {h.OldStart}): context or removed lines do not match current file.";

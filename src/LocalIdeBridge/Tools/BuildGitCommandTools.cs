@@ -395,7 +395,7 @@ public static class BuildGitCommandTools
         yield return new ToolDefinition(
             Name: "git_branch",
             Category: "git",
-            Description: "Lists, creates, or switches local Git branches (or initializes a new Git repository in the workspace when action='init').",
+            Description: "Lists branches or initializes main; creating/switching branches requires local owner authorization (autonomy.allowGitBranchChanges).",
             IsReadOnly: false,
             IsIdempotent: false,
             SideEffects: "Initializes repo or creates/switches local Git branch inside workspace.",
@@ -414,6 +414,12 @@ public static class BuildGitCommandTools
 
                 if (name is not null && name.StartsWith('-'))
                     throw new ArgumentException("Branch name must not start with '-'.");
+
+                if (action is "create" or "switch" or "create_and_switch" && !config.Autonomy.AllowGitBranchChanges)
+                    throw new WorkspaceViolationException("Branch creation/switching is disabled by the owner's main-only policy; change autonomy.allowGitBranchChanges locally for an explicit exception.");
+                if (action == "init" && !string.IsNullOrWhiteSpace(name) && !name.Equals("main", StringComparison.OrdinalIgnoreCase) &&
+                    !config.Autonomy.AllowGitBranchChanges)
+                    throw new WorkspaceViolationException("New Git repositories must initialize on main under the owner's default policy.");
 
                 List<string> gitArgs = action switch
                 {

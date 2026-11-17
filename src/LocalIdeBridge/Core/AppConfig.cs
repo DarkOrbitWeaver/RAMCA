@@ -153,7 +153,9 @@ public sealed class AutonomySettings
     public bool AllowShellScripts { get; set; } = true;
     public bool AllowDependencyInstall { get; set; } = true;
     public bool AllowGitCommits { get; set; } = true;
-    public bool AllowGitWorktrees { get; set; } = true;
+    public bool AllowGitWorktrees { get; set; } = false;
+    // Owner preference: main-only by default; explicit local opt-in for exceptions.
+    public bool AllowGitBranchChanges { get; set; } = false;
     /// <summary>deny | allow</summary>
     public string GitPushPolicy { get; set; } = "deny";
     public bool RedirectChildTempToPortable { get; set; }

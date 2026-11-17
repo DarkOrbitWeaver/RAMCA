@@ -19,7 +19,8 @@
     "allowShellScripts": true,
     "allowDependencyInstall": true,
     "allowGitCommits": true,
-    "allowGitWorktrees": true,
+    "allowGitWorktrees": false,
+    "allowGitBranchChanges": false,
     "gitPushPolicy": "deny",
     "redirectChildTempToPortable": false,
     "allowedExecutables": [

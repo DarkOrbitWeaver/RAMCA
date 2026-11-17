@@ -216,7 +216,12 @@ public sealed class EditingAndGitTests
     [Fact]
     public async Task GitOperations_InitBranchStageCommitDiffCheckpointWorktree_AndBlocksPushByDefault()
     {
-        await using var sb = await TestSandbox.CreateAsync();
+        await using var sb = await TestSandbox.CreateAsync(cfg =>
+        {
+            // Explicit opt-in for this legacy branch/worktree functionality test.
+            cfg.Autonomy.AllowGitBranchChanges = true;
+            cfg.Autonomy.AllowGitWorktrees = true;
+        });
 
         var init = await sb.Host.Registry.InvokeAsync("git_branch", new JsonObject { ["action"] = "init", ["name"] = "main" });
         Assert.True(init.Success);

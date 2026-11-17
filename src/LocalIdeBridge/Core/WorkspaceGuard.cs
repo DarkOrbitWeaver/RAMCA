@@ -161,6 +161,7 @@ public sealed class WorkspaceGuard : IDisposable
                 throw new WorkspaceViolationException("NTFS alternate data stream syntax is not allowed.");
             foreach (var segment in userPath.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
             {
+                if (segment == ".") continue; // Ordinary . and ./ paths are legal inside the workspace.
                 var trimmed = segment.TrimEnd(' ', '.');
                 if (trimmed.Length == 0 || trimmed != segment)
                     throw new WorkspaceViolationException("Ambiguous Windows path with trailing dots/spaces is forbidden.");

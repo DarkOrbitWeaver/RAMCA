@@ -92,10 +92,16 @@ public static class WorkspaceTools
                 {
                     try
                     {
-                        var br = await runner.RunAsync("git", "git", ["rev-parse", "--abbrev-ref", "HEAD"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 5000);
-                        if (br.ExitCode != 0 || br.StdoutCaptureTruncated || br.StdoutCapture is null)
-                            return ToolResult.Fail("git_status_unavailable", "Could not determine Git branch reliably.");
-                        gitBranch = br.StdoutCapture.Trim();
+                        var br = await runner.RunAsync("git", "git", ["symbolic-ref", "--quiet", "--short", "HEAD"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 5000);
+                        if (br.ExitCode != 0 || br.StdoutCaptureTruncated || string.IsNullOrWhiteSpace(br.StdoutCapture))
+                        {
+                            // Detached HEAD has no symbolic ref; unborn HEAD *does*.
+                            var detached = await runner.RunAsync("git", "git", ["rev-parse", "--short", "HEAD"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 5000);
+                            if (detached.ExitCode != 0 || detached.StdoutCaptureTruncated || string.IsNullOrWhiteSpace(detached.StdoutCapture))
+                                return ToolResult.Fail("git_status_unavailable", "Could not determine Git branch or detached HEAD reliably.");
+                            gitBranch = "HEAD@" + detached.StdoutCapture.Trim();
+                        }
+                        else gitBranch = br.StdoutCapture.Trim();
 
                         var st = await runner.RunAsync("git", "git", ["status", "--porcelain=v1"], ws, timeoutSeconds: 10, ct: ct, stdoutCaptureLimit: 2_000_000);
                         if (st.ExitCode != 0 || st.StdoutCaptureTruncated || st.StdoutCapture is null)

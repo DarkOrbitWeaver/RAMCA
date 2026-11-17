@@ -101,6 +101,8 @@ public sealed class ToolRegistry
             if (needsWriteLock)
             {
                 using var _ = await _guard.AcquireWriteLockAsync(workspace!, ct).ConfigureAwait(false);
+                if (_isPaused && tool.Name is not ("job_cancel" or "workflow_cancel" or "revert_edit"))
+                    return ToolResult.Fail("host_paused", "The supervisor paused execution while this operation waited for the write lock.");
                 result = await tool.Handler(args, ctx, ct).ConfigureAwait(false);
             }
             else
@@ -145,7 +147,20 @@ public sealed class ToolRegistry
             Interlocked.Increment(ref _totalErrors);
 
         var ws = workspace ?? "";
-        _db.RecordToolCall(tool.Name, tool.Category, ws, result.Success, sw.ElapsedMilliseconds, result.Summary, result.ErrorCode, ctx.SessionId);
+        try
+        {
+            _db.RecordToolCall(tool.Name, tool.Category, ws, result.Success, sw.ElapsedMilliseconds, result.Summary, result.ErrorCode, ctx.SessionId);
+        }
+        catch (Exception ex)
+        {
+            // The handler has already run. Do not hide that result behind an
+            // exception and invite blind replay of a potentially committed edit.
+            var message = _credentials.Redact(ex.Message);
+            try { _logger.Error("audit", $"Tool '{tool.Name}' executed, but its call record failed: {message}"); } catch { }
+            return ToolResult.Fail("audit_outcome_unrecorded",
+                $"Tool '{tool.Name}' already executed, but its audit record could not be saved. Do NOT retry automatically. Original success={result.Success}. {message}",
+                new { executedResult = result }, result.ExecutionId);
+        }
 
         if (result.Success)
             _logger.Info(tool.Category, $"{tool.Name}: {result.Summary}", null, sw.ElapsedMilliseconds);
