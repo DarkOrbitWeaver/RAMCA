@@ -35,6 +35,16 @@ public sealed class SupervisorTui
     private IReadOnlyList<UiLine> _cachedLogLines = [];
     private enum UiTone { Normal, Muted, Good, Warning, Error, Accent }
     private readonly record struct UiLine(string Text, UiTone Tone = UiTone.Normal);
+    // Only a small, redacted subset of live results is retained. Historical tool
+    // calls do not store full output/arguments; never invent their details.
+    private sealed record CapturedOperation(
+        long CallId, DateTimeOffset TimestampUtc, string ToolName, bool Success,
+        string Summary, string? Excerpt, string? Diff, string? Path,
+        string? Executable, string? ExitCode, string? Tests);
+    private readonly object _resultsLock = new();
+    private readonly Queue<CapturedOperation> _recentResults = new();
+    private const int MaxCapturedOperations = 48;
+
     private string _statusBanner = "Ready. Press [I] to copy AI instructions, [E] endpoint, [K] key, or [Q] to quit.";
     private string? _cachedGitBranch;
     private DateTimeOffset _lastGitCheckUtc = DateTimeOffset.MinValue;
@@ -70,7 +80,13 @@ public sealed class SupervisorTui
         }
 
         void OnActivity(Core.ActivityEvent _) => SignalRedraw();
+        void OnToolCompleted(string name, ToolResult result, long elapsed)
+        {
+            CaptureToolResult(name, result, elapsed);
+            SignalRedraw();
+        }
         _host.Logger.OnEvent += OnActivity;
+        _host.Registry.OnToolCompleted += OnToolCompleted;
 
         // Enter alternate screen buffer and hide cursor for clean, flicker-free rendering.
         Console.Write("\x1b[?1049h\x1b[?25l");
@@ -113,6 +129,7 @@ public sealed class SupervisorTui
         finally
         {
             _host.Logger.OnEvent -= OnActivity;
+            _host.Registry.OnToolCompleted -= OnToolCompleted;
             Console.Write("\x1b[0m\x1b[?25h\x1b[?1049l");
         }
     }
@@ -305,6 +322,128 @@ public sealed class SupervisorTui
         _statusBanner = string.IsNullOrWhiteSpace(note) ? "Cleared steering note." : "Updated session steering note.";
     }
 
+    private static bool HasInterestingResult(string name) =>
+        name is "run_command" or "dotnet_build" or "dotnet_test" or "msbuild_run" or
+            "compiler_diagnostics" or "replace_range" or "apply_patch" or
+            "create_file" or "delete_file" or "revert_edit" or "rename_file" or
+            "git_commit" or "git_diff" or "git_push";
+
+    private static string? ReadResultField(object? data, string property)
+    {
+        if (data is null) return null;
+        try
+        {
+            var value = data.GetType().GetProperty(property)?.GetValue(data);
+            return value?.ToString();
+        }
+        catch { return null; }
+    }
+
+    private void CaptureToolResult(string name, ToolResult result, long durationMs)
+    {
+        if (!HasInterestingResult(name)) return;
+        try
+        {
+            // RecordToolCall runs before OnToolCompleted. Match an unambiguous
+            // durable row by tool, summary and elapsed time. Never attribute a
+            // result to a guessed call when concurrent operations look alike.
+            var now = DateTimeOffset.UtcNow;
+            var summary = _host.Credentials.Redact(result.Summary);
+            var matches = _host.Database.ListToolCalls(null, 30)
+                .Where(c => c.ToolName.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                    c.Summary == summary && Math.Abs(c.DurationMs - durationMs) <= 2 &&
+                    (now - c.CreatedAtUtc).Duration() <= TimeSpan.FromSeconds(5))
+                .ToArray();
+            if (matches.Length != 1) return;
+
+            string? Safe(string? value, int max = 5000)
+            {
+                if (value is null) return null;
+                value = _host.Credentials.Redact(value);
+                return value.Length <= max ? value : value[..max] + " ...[preview capped]";
+            }
+            var data = result.Data;
+            string? tests = null;
+            var passed = ReadResultField(data, "passed");
+            if (passed is not null)
+                tests = $"{passed} passed, {ReadResultField(data, "failed") ?? "?"} failed, {ReadResultField(data, "skipped") ?? "?"} skipped";
+            var capture = new CapturedOperation(matches[0].Id, matches[0].CreatedAtUtc,
+                name, result.Success, summary,
+                Safe(ReadResultField(data, "outputExcerpt")),
+                Safe(ReadResultField(data, "diff")),
+                Safe(ReadResultField(data, "path"), 800),
+                Safe(ReadResultField(data, "executable"), 300),
+                Safe(ReadResultField(data, "exitCode"), 30),
+                Safe(tests, 150));
+            lock (_resultsLock)
+            {
+                if (_recentResults.Count == MaxCapturedOperations) _recentResults.Dequeue();
+                _recentResults.Enqueue(capture);
+            }
+        }
+        catch { /* Presentation capture must never interfere with a real tool. */ }
+    }
+
+    private CapturedOperation? CapturedFor(long id)
+    {
+        lock (_resultsLock)
+            return _recentResults.FirstOrDefault(e => e.CallId == id);
+    }
+
+    private List<CapturedOperation> RecentDirectCommands()
+    {
+        lock (_resultsLock)
+            return _recentResults.Where(e => e.ToolName is
+                "run_command" or "dotnet_build" or "dotnet_test" or "msbuild_run" or
+                "compiler_diagnostics" or "git_commit" or "git_diff" or "git_push")
+                .ToList();
+    }
+
+    private void AddCapturedOutput(List<UiLine> lines, CapturedOperation captured, int remaining, int width)
+    {
+        if (remaining <= 0) return;
+        if (!string.IsNullOrWhiteSpace(captured.Path))
+            lines.Add(new UiLine(Fit("  File: " + captured.Path, width), UiTone.Muted));
+        if (!string.IsNullOrWhiteSpace(captured.Executable))
+            lines.Add(new UiLine(Fit($"  {captured.Executable} · exit {captured.ExitCode ?? "?"}", width), UiTone.Muted));
+        if (!string.IsNullOrWhiteSpace(captured.Tests))
+            lines.Add(new UiLine(Fit("  Tests: " + captured.Tests, width), UiTone.Good));
+
+        var preview = captured.Diff ?? captured.Excerpt;
+        if (string.IsNullOrWhiteSpace(preview)) return;
+        var entries = preview.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        // A short card shows the useful tail; expanded details allow the longer
+        // bounded excerpt without loading an entire historical log.
+        var budget = Math.Max(0, remaining - (lines.Count > 0 ? 1 : 0));
+        var offset = _focusDetails ? Math.Min(entries.Length, _detailPage * Math.Max(1, budget)) :
+            Math.Max(0, entries.Length - budget);
+        foreach (var entry in entries.Skip(offset).Take(budget))
+        {
+            var trimmed = entry.TrimEnd('\r');
+            var tone = trimmed.StartsWith('+') && !trimmed.StartsWith("+++") ? UiTone.Good :
+                trimmed.StartsWith('-') && !trimmed.StartsWith("---") ||
+                trimmed.Contains("[err]", StringComparison.OrdinalIgnoreCase) ? UiTone.Error :
+                trimmed.StartsWith("@@") ? UiTone.Accent :
+                trimmed.Contains("warning", StringComparison.OrdinalIgnoreCase) ? UiTone.Warning : UiTone.Muted;
+            lines.Add(new UiLine("  " + Fit(trimmed, width - 2), tone));
+        }
+    }
+
+    private sealed record CommandItem(DateTimeOffset When, JobRecord? Job, CapturedOperation? Direct);
+
+    private List<CommandItem> RecentCommands()
+    {
+        // Fixed-size, blended page: durable jobs plus live direct tool results.
+        // The latter are intentionally not claimed to persist across restarts.
+        var jobs = _host.Database.ListJobs(limit: 60);
+        var direct = RecentDirectCommands();
+        return jobs.Select(j => new CommandItem(j.CreatedAtUtc, j, null))
+            .Concat(direct.Select(d => new CommandItem(d.TimestampUtc, null, d)))
+            .OrderByDescending(item => item.When)
+            .Take(100)
+            .ToList();
+    }
+
     private void SelectTab(ViewTab tab)
     {
         _activeTab = tab;
@@ -322,7 +461,7 @@ public sealed class SupervisorTui
         {
             ViewTab.Overview => _host.Database.ListToolCalls(_host.Database.ActiveSessionId, 1, index).Count > 0,
             ViewTab.Edits => index < _host.Database.ListRecentEdits(_host.Database.ActiveSessionId, 100).Count,
-            ViewTab.Jobs => _host.Database.ListJobs(limit: 1, offset: index).Count > 0,
+            ViewTab.Jobs => index < RecentCommands().Count,
             ViewTab.GitAndSessions => _host.Database.ListSessions(1, index).Count > 0,
             ViewTab.Errors => _host.Database.ListToolCalls(null, 1, index, errorsOnly: true).Count > 0,
             _ => false
@@ -468,11 +607,14 @@ public sealed class SupervisorTui
         if (!string.IsNullOrEmpty(selected.ErrorCode))
             lines.Add(new UiLine("  Error: " + selected.ErrorCode, UiTone.Error));
         lines.Add(new UiLine(Fit("  Workspace: " + selected.Workspace, width), UiTone.Muted));
-        if (selected.Category == "editing")
-            lines.Add(new UiLine("  Open [2] Changes to see verified line diffs.", UiTone.Muted));
+        var capture = CapturedFor(selected.Id);
+        if (capture is not null)
+            AddCapturedOutput(lines, capture, Math.Max(0, count - lines.Count - 1), width);
+        else if (selected.Category == "editing")
+            lines.Add(new UiLine("  [2] Changes: recorded edits and verified file diffs.", UiTone.Muted));
         else if (selected.ToolName is "run_command" or "dotnet_build" or "dotnet_test" or "msbuild_run")
-            lines.Add(new UiLine("  [3] Commands shows linked background-job output.", UiTone.Muted));
-        if (!_focusDetails)
+            lines.Add(new UiLine("  Output from older direct calls was not persisted in call records.", UiTone.Muted));
+        if (!_focusDetails && lines.Count < count)
             lines.Add(new UiLine("  Enter: expand  ·  Older operations: PgDown", UiTone.Muted));
     }
 
@@ -529,6 +671,11 @@ public sealed class SupervisorTui
             var backup = Path.Combine(_host.Paths.SessionsDir, PortablePaths.SanitizeId(edit.SessionId),
                 "edits", PortablePaths.SanitizeId(edit.EditId) + ".bak");
             const long maxPreviewBytes = 256 * 1024;
+            // Reject large previews before hashing or decoding them on every
+            // TUI redraw. The edit metadata is still displayed.
+            if ((File.Exists(full) && new FileInfo(full).Length > maxPreviewBytes) ||
+                (edit.ExistedBefore && File.Exists(backup) && new FileInfo(backup).Length > maxPreviewBytes))
+                throw new InvalidOperationException("Preview limited to 256 KiB per file; counts remain available.");
             string? currentHash = File.Exists(full) ? EditingTools.ComputeFileSha256(full) : null;
             if (edit.AfterSha256 == "deleted")
             {
@@ -540,10 +687,6 @@ public sealed class SupervisorTui
 
             if (edit.ExistedBefore && !File.Exists(backup))
                 throw new FileNotFoundException("Verified edit backup is no longer available.");
-            if ((File.Exists(full) && new FileInfo(full).Length > maxPreviewBytes) ||
-                (edit.ExistedBefore && new FileInfo(backup).Length > maxPreviewBytes))
-                throw new InvalidOperationException("Preview limited to 256 KiB per file; counts remain available.");
-
             string[] before = [];
             if (edit.ExistedBefore)
             {
@@ -575,43 +718,56 @@ public sealed class SupervisorTui
 
     private void AddCommandRows(List<UiLine> lines, int count, int width)
     {
-        var slots = _focusDetails ? 1 : Math.Clamp(count / 3, 2, 8);
-        _lastListSlots = slots;
-        var from = _focusDetails ? _scrollOffset : Math.Max(0, _scrollOffset - slots + 1);
-        var jobs = _host.Database.ListJobs(limit: slots, offset: from);
-        if (jobs.Count == 0)
+        var commands = RecentCommands();
+        if (commands.Count == 0)
         {
-            lines.Add(new UiLine("  No background jobs recorded yet.", UiTone.Muted));
-            lines.Add(new UiLine("  Direct commands are summarized in [1] Activity.", UiTone.Muted));
+            lines.Add(new UiLine("  No command or job results yet.", UiTone.Muted));
+            return;
+        }
+        _scrollOffset = Math.Min(_scrollOffset, commands.Count - 1);
+        var slots = _focusDetails ? 0 : Math.Clamp(count / 3, 2, 8);
+        _lastListSlots = Math.Max(1, slots);
+        if (!_focusDetails)
+        {
+            var from = Math.Max(0, _scrollOffset - slots + 1);
+            for (var i = from; i < Math.Min(commands.Count, from + slots); i++)
+            {
+                var entry = commands[i];
+                var status = entry.Job?.Status ?? (entry.Direct!.Success ? "succeeded" : "failed");
+                var tool = entry.Job?.ToolName ?? entry.Direct!.ToolName;
+                var duration = entry.Job?.StartedAtUtc is { } started
+                    ? FormatDuration((long)Math.Max(0,
+                        ((entry.Job.CompletedAtUtc ?? DateTimeOffset.UtcNow) - started).TotalMilliseconds))
+                    : entry.Job is not null ? "queued" : "direct";
+                lines.Add(new UiLine(
+                    Fit($"{(i == _scrollOffset ? '›' : ' ')} {status,-10} {FriendlyToolName(tool)}  {duration}", width),
+                    i == _scrollOffset ? UiTone.Accent : StatusTone(status)));
+            }
+        }
+
+        var selected = commands[_scrollOffset];
+        lines.Add(new UiLine(selected.Job is null ? "  ── Live command result ──" : "  ── Background job details ──", UiTone.Accent));
+        if (selected.Direct is { } direct)
+        {
+            lines.Add(new UiLine(Fit($"  {direct.ToolName}: {direct.Summary}", width),
+                direct.Success ? UiTone.Good : UiTone.Error));
+            AddCapturedOutput(lines, direct, Math.Max(0, count - lines.Count - 1), width);
+            if (lines.Count < count)
+                lines.Add(new UiLine(_focusDetails ? "  PgUp/PgDn: preview pages · Esc: list"
+                    : "  Enter: expanded live output · PgDown: older commands", UiTone.Muted));
             return;
         }
 
-        JobRecord? selected = null;
-        foreach (var (job, i) in jobs.Select((v, i) => (v, i)))
-        {
-            var active = from + i == _scrollOffset;
-            if (active) selected = job;
-            if (_focusDetails && !active) continue;
-            var tone = StatusTone(job.Status);
-            var duration = job.StartedAtUtc is not null
-                ? FormatDuration((long)Math.Max(0, ((job.CompletedAtUtc ?? DateTimeOffset.UtcNow) - job.StartedAtUtc.Value).TotalMilliseconds))
-                : "queued";
-            lines.Add(new UiLine(
-                Fit($"{(active ? '›' : ' ')} {job.Status,-10} {FriendlyToolName(job.ToolName)}  {duration}", width),
-                active ? UiTone.Accent : tone));
-        }
-        if (selected is null) return;
-
-        lines.Add(new UiLine("  ── Command / job details ──", UiTone.Accent));
-        lines.Add(new UiLine(Fit($"  {selected.ToolName}  [{selected.Status}]  {selected.Id}", width), StatusTone(selected.Status)));
-        lines.Add(new UiLine(Fit($"  Workspace: {selected.Workspace}", width), UiTone.Muted));
-        if (!string.IsNullOrWhiteSpace(selected.ErrorMessage))
-            lines.Add(new UiLine(Fit("  " + selected.ErrorMessage, width), UiTone.Error));
+        var job = selected.Job!;
+        lines.Add(new UiLine(Fit($"  {job.ToolName}  [{job.Status}]  {job.Id}", width), StatusTone(job.Status)));
+        lines.Add(new UiLine(Fit($"  Workspace: {job.Workspace}", width), UiTone.Muted));
+        if (!string.IsNullOrWhiteSpace(job.ErrorMessage))
+            lines.Add(new UiLine(Fit("  " + job.ErrorMessage, width), UiTone.Error));
 
         try
         {
-            if (!string.IsNullOrWhiteSpace(selected.ResultJson) &&
-                JsonNode.Parse(selected.ResultJson) is JsonObject result)
+            if (!string.IsNullOrWhiteSpace(job.ResultJson) &&
+                JsonNode.Parse(job.ResultJson) is JsonObject result)
             {
                 var data = result["data"] as JsonObject;
                 var exe = data?["executable"]?.ToString();
@@ -627,12 +783,12 @@ public sealed class SupervisorTui
 
         var remaining = Math.Max(0, count - lines.Count - 1);
         if (remaining <= 0) return;
-        var output = GetJobLogPreview(selected, remaining);
+        var output = GetJobLogPreview(job, remaining);
         foreach (var line in output.Take(remaining))
             lines.Add(new UiLine("  " + Fit(line.Text, width - 2), line.Tone));
         if (lines.Count < count)
             lines.Add(new UiLine(_focusDetails ? "  PgUp: older output · PgDown: newer · Esc: list"
-                        : "  Enter: larger output · PgDown: older jobs", UiTone.Muted));
+                        : "  Enter: larger output · PgDown: older commands", UiTone.Muted));
     }
 
     private IReadOnlyList<UiLine> GetJobLogPreview(JobRecord job, int maxRows)
