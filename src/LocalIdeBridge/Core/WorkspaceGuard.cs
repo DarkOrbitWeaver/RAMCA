@@ -168,6 +168,12 @@ public sealed class WorkspaceGuard : IDisposable
                 if (device is "CON" or "PRN" or "AUX" or "NUL" ||
                     (device.Length == 4 && (device.StartsWith("COM") || device.StartsWith("LPT")) && device[3] >= '1' && device[3] <= '9'))
                     throw new WorkspaceViolationException("Reserved Windows device paths are forbidden.");
+                // NTFS 8.3 names can alias protected paths without spelling their
+                // real names (for example LOCALI~1.JSO -> .localidebridge.json).
+                // Reject short-name syntax until existing targets are resolved by
+                // a canonical handle, including their full long names.
+                if (System.Text.RegularExpressions.Regex.IsMatch(device, @"~[0-9]+$"))
+                    throw new WorkspaceViolationException("Windows 8.3 short-name aliases are forbidden in tool paths.");
             }
         }
 

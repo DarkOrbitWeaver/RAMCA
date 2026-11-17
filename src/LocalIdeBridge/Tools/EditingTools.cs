@@ -422,7 +422,7 @@ public static partial class EditingTools
                 // Persist a recovery manifest and *all* durable backups BEFORE the first write.
                 // On crash the next startup rolls back only matching pre/post-image hashes; it
                 // will fail closed on an external edit rather than overwrite unexpected bytes.
-                var tx = new PatchTransaction { Id = $"patch_{Guid.NewGuid():N}", Workspace = ws };
+                var tx = new PatchTransaction { Id = $"patch_{Guid.NewGuid():N}", Workspace = ws, SessionId = ctx.SessionId };
                 var fileResults = new List<object>();
                 var recordedEdits = new List<string>();
                 var totalAdded = 0;
@@ -743,74 +743,80 @@ public static partial class EditingTools
         yield return new ToolDefinition(
             Name: "revert_edit",
             Category: "editing",
-            Description: "Safely reverts a specific recorded editId ONLY if the file has not been modified since that edit (verified by SHA-256).",
+            Description: "Restores a recorded edit only when its current postimage matches SHA-256. The undo itself is crash-recoverable and receives its own edit ID.",
             IsReadOnly: false,
             IsIdempotent: false,
-            SideEffects: "Restores pre-edit file bytes (or deletes newly created file) inside the workspace.",
+            SideEffects: "Restores pre-edit file bytes (or removes a newly created file) and records a reversible undo transaction.",
             Parameters:
             [
-                new("editId", "string", "Edit identifier returned by create_file, replace_range, apply_patch, or delete_file.", Required: true)
+                new("editId", "string", "Recorded edit to undo, within the currently selected workspace.", Required: true)
             ],
-            Handler: (args, _, _) =>
+            Handler: (args, ctx, _) =>
             {
                 var editId = args.RequireString("editId");
                 var edit = db.GetEdit(editId) ?? throw new KeyNotFoundException($"Edit '{editId}' not found.");
                 if (edit.Reverted)
                     return Task.FromResult(ToolResult.Fail("already_reverted", $"Edit '{editId}' has already been reverted."));
 
-                var full = guard.ResolvePath(edit.RelativePath, forWrite: true, explicitWorkspace: edit.Workspace);
+                var ws = guard.RequireActiveWorkspace();
+                if (!string.Equals(WorkspaceGuard.NormalizeRoot(ws), WorkspaceGuard.NormalizeRoot(edit.Workspace),
+                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                    return Task.FromResult(ToolResult.Fail("wrong_workspace", "Select the edit's original workspace before reverting it."));
 
+                var full = guard.ResolvePath(edit.RelativePath, forWrite: true, explicitWorkspace: ws);
+                var existsNow = File.Exists(full);
                 if (edit.AfterSha256 == "deleted")
                 {
-                    if (File.Exists(full))
+                    if (existsNow)
                         return Task.FromResult(ToolResult.Fail("conflict",
-                            $"Cannot safely revert deletion of '{edit.RelativePath}' because a new file now exists at that path."));
+                            $"Cannot restore '{edit.RelativePath}': another file already exists at the destination."));
                 }
                 else
                 {
-                    if (!File.Exists(full))
+                    if (!existsNow)
+                        return Task.FromResult(ToolResult.Fail("conflict", $"File '{edit.RelativePath}' no longer exists."));
+                    var actualHash = ComputeFileSha256(full);
+                    if (!string.Equals(actualHash, edit.AfterSha256, StringComparison.OrdinalIgnoreCase))
                         return Task.FromResult(ToolResult.Fail("conflict",
-                            $"Cannot safely revert edit '{editId}' because '{edit.RelativePath}' no longer exists."));
-                    var currentSha = ComputeFileSha256(full);
-                    if (!string.Equals(currentSha, edit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                            $"Cannot undo '{editId}': current file differs from the recorded postimage ({actualHash})."));
+                }
+
+                string? originalSnapshot = null;
+                if (edit.ExistedBefore)
+                {
+                    originalSnapshot = ResolveBackupPath(paths, edit);
+                    if (!File.Exists(originalSnapshot))
+                        return Task.FromResult(ToolResult.Fail("backup_unavailable", $"Verified backup for '{editId}' is unavailable."));
+                    if (!string.Equals(ComputeFileSha256(originalSnapshot), edit.BeforeSha256, StringComparison.OrdinalIgnoreCase))
+                        return Task.FromResult(ToolResult.Fail("backup_corrupt", "Undo snapshot failed SHA-256 verification; no changes made."));
+                }
+
+                // Undo is another mutation. First save its own postimage and manifest;
+                // never delete/rewrite directly and then attempt to mark it reverted.
+                var undoId = NewEditId();
+                var currentHash = existsNow ? edit.AfterSha256 : "none";
+                var restoredHash = edit.ExistedBefore ? edit.BeforeSha256 : "deleted";
+                var undoBackup = existsNow ? SaveBackupBytes(paths, ctx.SessionId, undoId, full) : null;
+                var restoredSnapshot = originalSnapshot;
+                var transactionResult = CommitSingleFileEdit(paths, guard, db, ctx.SessionId, ws,
+                    edit.RelativePath, full, undoId, "revert_edit", currentHash, restoredHash,
+                    undoBackup, existsNow, 0, 0,
+                    () =>
                     {
-                        return Task.FromResult(ToolResult.Fail("conflict",
-                            $"Unsafe to revert edit '{editId}': '{edit.RelativePath}' has been modified since that edit (expected {edit.AfterSha256}, current {currentSha})."));
-                    }
-                }
-
-                if (!edit.ExistedBefore)
-                {
-                    File.Delete(full);
-                }
-                else
-                {
-                    if (string.IsNullOrEmpty(edit.BackupFilePath) || !File.Exists(ResolveBackupPath(paths, edit)))
-                        return Task.FromResult(ToolResult.Fail("backup_unavailable", $"Backup snapshot for edit '{editId}' is no longer available."));
-
-                    // Never overwrite a current file with an incomplete or modified backup snapshot.
-                    var backupSha = ComputeFileSha256(ResolveBackupPath(paths, edit));
-                    if (!string.Equals(backupSha, edit.BeforeSha256, StringComparison.OrdinalIgnoreCase))
-                        return Task.FromResult(ToolResult.Fail("backup_corrupt", $"Backup snapshot for edit '{editId}' fails the recorded SHA-256 check; nothing has been restored."));
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-                    var tmp = full + $".revert.{Guid.NewGuid():N}.tmp";
-                    File.Copy(ResolveBackupPath(paths, edit), tmp, overwrite: true);
-                    File.Move(tmp, full, overwrite: true);
-                }
+                        if (restoredSnapshot is null)
+                            File.Delete(full);
+                        else
+                            PortablePaths.AtomicRestoreBackupFile(restoredSnapshot, full);
+                    });
+                if (transactionResult is not null)
+                    return Task.FromResult(transactionResult);
 
                 db.MarkEditReverted(editId);
                 onFileMutated?.Invoke(full);
-
                 return Task.FromResult(ToolResult.Ok(
-                    $"Safely reverted edit '{editId}' on '{edit.RelativePath}'.",
-                    new
-                    {
-                        editId,
-                        path = edit.RelativePath,
-                        restoredSha256 = edit.ExistedBefore ? edit.BeforeSha256 : "deleted",
-                        changedFiles = new[] { edit.RelativePath }
-                    }));
+                    $"Restored '{edit.RelativePath}' from edit '{editId}'. Reversal is itself undoable.",
+                    new { editId, undoEditId = undoId, path = edit.RelativePath, restoredSha256 = restoredHash,
+                          changedFiles = new[] { edit.RelativePath } }));
             });
     }
 
@@ -1178,6 +1184,7 @@ public static partial class EditingTools
     {
         public string Id { get; set; } = "";
         public string Workspace { get; set; } = "";
+        public string SessionId { get; set; } = "";
         public bool Committed { get; set; }
         public List<PatchTransactionItem> Items { get; set; } = [];
     }
@@ -1215,7 +1222,7 @@ public static partial class EditingTools
     {
         var tx = new PatchTransaction
         {
-            Id = $"patch_{Guid.NewGuid():N}", Workspace = workspace,
+            Id = $"patch_{Guid.NewGuid():N}", Workspace = workspace, SessionId = sessionId,
             Items = [new PatchTransactionItem
             {
                 RelativePath = relative, EditId = editId, BackupPath = backupPath,
@@ -1286,6 +1293,23 @@ public static partial class EditingTools
         }
     }
 
+    private static string? ResolvePendingBackupPath(PortablePaths paths, PatchTransaction tx, PatchTransactionItem item)
+    {
+        // A portable RAMCA folder may move between a crash and the next launch.
+        // Session/edit IDs are durable references; an absolute backup path is not.
+        if (!string.IsNullOrWhiteSpace(tx.SessionId))
+        {
+            var local = Path.Combine(paths.GetSessionEditsDir(tx.SessionId), item.EditId + ".bak");
+            if (WorkspaceGuard.IsEqualOrInside(local, paths.SessionsDir)) return local;
+            return null;
+        }
+        // Only old manifests lacking SessionId may use their original stored path,
+        // and never if it points outside the portable session-storage directory.
+        if (item.BackupPath is not null && WorkspaceGuard.IsEqualOrInside(item.BackupPath, paths.SessionsDir))
+            return item.BackupPath;
+        return null;
+    }
+
     private static void RecoverTransaction(PortablePaths paths, WorkspaceGuard guard, PatchTransaction tx, StateDatabase db)
     {
         using var workspaceLease = guard.UseInvocationWorkspace(tx.Workspace);
@@ -1306,9 +1330,9 @@ public static partial class EditingTools
                 throw new IOException($"Recovery conflict at '{item.RelativePath}' (actual SHA-256 {actual}).");
             if (item.BeforeHash != "none")
             {
-                if (item.BackupPath is null || !WorkspaceGuard.IsEqualOrInside(item.BackupPath, paths.SessionsDir) ||
-                    !File.Exists(item.BackupPath) ||
-                    !string.Equals(ComputeFileSha256(item.BackupPath), item.BeforeHash, StringComparison.OrdinalIgnoreCase))
+                var safeBackup = ResolvePendingBackupPath(paths, tx, item);
+                if (safeBackup is null || !File.Exists(safeBackup) ||
+                    !string.Equals(ComputeFileSha256(safeBackup), item.BeforeHash, StringComparison.OrdinalIgnoreCase))
                     throw new IOException($"Recovery snapshot unavailable or corrupted for '{item.RelativePath}'.");
             }
             targets.Add((item, full));
@@ -1322,7 +1346,8 @@ public static partial class EditingTools
             if (item.BeforeHash == "none")
                 File.Delete(full);
             else
-                PortablePaths.AtomicWriteAllBytes(full, File.ReadAllBytes(item.BackupPath!));
+                PortablePaths.AtomicRestoreBackupFile(
+                    ResolvePendingBackupPath(paths, tx, item) ?? throw new IOException("Recovery snapshot not found."), full);
         }
         foreach (var (item, _) in targets)
             if (db.GetEdit(item.EditId) is not null)

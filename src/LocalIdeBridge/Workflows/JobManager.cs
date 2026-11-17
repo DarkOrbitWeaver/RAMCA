@@ -58,25 +58,28 @@ public sealed class JobManager : IDisposable
 
         _db.CreateJob(jobId, sessionId, ws, tool.Name, clonedArgs.ToJsonString(), tool.IsIdempotent);
 
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_hostCts.Token);
+        // An explicit timeout is not the same as the user cancelling a job.
+        // Keep their cancellation causes separate in the persisted job status.
+        var timeoutCts = new CancellationTokenSource();
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_hostCts.Token, timeoutCts.Token);
         if (timeoutSeconds is > 0)
         {
             var clamped = Math.Clamp(timeoutSeconds.Value, 1, _config.Resources.MaxCommandTimeoutSeconds);
-            cts.CancelAfter(TimeSpan.FromSeconds(clamped));
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(clamped));
         }
 
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _active[jobId] = new RunningJob(jobId, cts, completion.Task);
         _ = Task.Run(async () =>
         {
-            try { await ExecuteJobAsync(jobId, sessionId, ws, tool.Name, clonedArgs, cts).ConfigureAwait(false); }
-            finally { completion.TrySetResult(); }
+            try { await ExecuteJobAsync(jobId, sessionId, ws, tool.Name, clonedArgs, cts, timeoutCts).ConfigureAwait(false); }
+            finally { timeoutCts.Dispose(); completion.TrySetResult(); }
         }, CancellationToken.None);
         _logger.Info("job", $"Started async job '{jobId}' for tool '{tool.Name}'.");
         return _db.GetJob(jobId)!;
     }
 
-    private async Task ExecuteJobAsync(string jobId, string sessionId, string workspace, string toolName, JsonObject args, CancellationTokenSource cts)
+    private async Task ExecuteJobAsync(string jobId, string sessionId, string workspace, string toolName, JsonObject args, CancellationTokenSource cts, CancellationTokenSource timeoutCts)
     {
         var gateAcquired = false;
         try
@@ -99,6 +102,10 @@ public sealed class JobManager : IDisposable
             {
                 _db.UpdateJobStatus(jobId, "succeeded", resultJson: json, logExecId: result.ExecutionId, eventMessage: result.Summary);
             }
+            else if (timeoutCts.IsCancellationRequested)
+            {
+                _db.UpdateJobStatus(jobId, "timed_out", resultJson: json, errorMessage: result.ErrorMessage, logExecId: result.ExecutionId, eventMessage: "Job timed out; not safe to assume a command had no side effects.");
+            }
             else if (result.ErrorCode == "cancelled" || cts.IsCancellationRequested)
             {
                 _db.UpdateJobStatus(jobId, "cancelled", resultJson: json, errorMessage: result.ErrorMessage, logExecId: result.ExecutionId, eventMessage: "Job cancelled.");
@@ -110,7 +117,10 @@ public sealed class JobManager : IDisposable
         }
         catch (OperationCanceledException)
         {
-            _db.UpdateJobStatus(jobId, "cancelled", errorMessage: "Job was cancelled or timed out.", eventMessage: "Job cancelled.");
+            var timedOut = timeoutCts.IsCancellationRequested;
+            _db.UpdateJobStatus(jobId, timedOut ? "timed_out" : "cancelled",
+                errorMessage: timedOut ? "Job timed out; outcome may require reconciliation." : "Job was cancelled.",
+                eventMessage: timedOut ? "Job deadline reached." : "Job cancelled.");
         }
         catch (Exception ex)
         {

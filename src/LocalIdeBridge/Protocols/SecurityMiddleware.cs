@@ -165,6 +165,10 @@ public sealed class SecurityMiddleware
 
     private static int IncrementCounter(ConcurrentDictionary<string, WindowCounter> dict, string key, long minute)
     {
+        // Limit the key space even under distributed brute-force traffic. A full
+        // table must not allocate indefinitely just because scanners rotate IPs.
+        if (!dict.ContainsKey(key) && dict.Count >= 4096)
+            return int.MaxValue;
         var counter = dict.GetOrAdd(key, _ => new WindowCounter { WindowMinute = minute });
         lock (counter)
         {

@@ -1,23 +1,37 @@
-name: Windows build and tests
+name: Build and regression tests (.NET 10)
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    runs-on: windows-latest
-    permissions:
-      contents: read
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Restore
-        run: dotnet restore LocalIdeBridge.sln
-      - name: Build
-        run: dotnet build LocalIdeBridge.sln -c Release --no-restore
-      - name: Test
-        run: dotnet test LocalIdeBridge.sln -c Release --no-build --logger trx
+      - name: Restore dependencies
+        run: dotnet restore LocalIdeBridge.sln --nologo
+      - name: Build Release
+        run: dotnet build LocalIdeBridge.sln -c Release --no-restore --nologo -warnaserror
+      - name: Run tests
+        run: dotnet test LocalIdeBridge.sln -c Release --no-build --logger 'trx;LogFilePrefix=ramca' --results-directory ./test-results --nologo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ramca-tests-${{ matrix.os }}
+          path: test-results/**/*.trx
+          if-no-files-found: ignore
+          retention-days: 7

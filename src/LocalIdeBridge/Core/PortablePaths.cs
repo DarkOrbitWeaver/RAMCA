@@ -174,6 +174,41 @@ public sealed class PortablePaths
             }
         }
     }
+    /// <summary>
+    /// Restore a verified snapshot without materializing a 256 MiB backup in RAM.
+    /// Caller checks the snapshot SHA-256; the target is replaced only after the
+    /// temporary copy has been fully flushed to storage on the same volume.
+    /// </summary>
+    public static void AtomicRestoreBackupFile(string backupPath, string targetPath)
+    {
+        var directory = Path.GetDirectoryName(targetPath) ?? throw new IOException("Missing target directory.");
+        Directory.CreateDirectory(directory);
+        var temporary = Path.Combine(directory, $".ramca-{Guid.NewGuid():N}.tmp");
+        UnixFileMode? unixMode = null;
+        if (!OperatingSystem.IsWindows() && File.Exists(targetPath))
+            unixMode = File.GetUnixFileMode(targetPath);
+        try
+        {
+            using (var source = new FileStream(backupPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var destination = new FileStream(temporary, FileMode.CreateNew,
+                       FileAccess.Write, FileShare.None, 81920, FileOptions.WriteThrough))
+            {
+                source.CopyTo(destination, 81920);
+                destination.Flush(flushToDisk: true);
+            }
+            if (unixMode is not null) File.SetUnixFileMode(temporary, unixMode.Value);
+            if (OperatingSystem.IsWindows() && File.Exists(targetPath))
+                File.Replace(temporary, targetPath, null);
+            else
+                File.Move(temporary, targetPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporary))
+                try { File.Delete(temporary); } catch (IOException) { }
+        }
+    }
+
     public static void AtomicWriteAllBytes(string targetPath, byte[] bytes)
     {
         var dir = Path.GetDirectoryName(targetPath) ?? throw new InvalidOperationException("No target directory.");

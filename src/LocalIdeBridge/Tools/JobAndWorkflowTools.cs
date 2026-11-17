@@ -122,7 +122,7 @@ public static class JobAndWorkflowTools
             Parameters:
             [
                 new("sessionId", "string", "Optional session ID filter (omit to list across sessions)."),
-                new("status", "string", "Optional status filter: queued | running | succeeded | failed | cancelled | interrupted_restart."),
+                new("status", "string", "Optional status filter: queued | running | succeeded | failed | timed_out | cancelled | interrupted_restart."),
                 new("limit", "integer", "Page size (1-100).", Default: 25),
                 new("offset", "integer", "Pagination offset.", Default: 0)
             ],

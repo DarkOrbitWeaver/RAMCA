@@ -12,8 +12,8 @@ namespace LocalIdeBridge.Protocols;
 
 /// <summary>
 /// Standards-compliant Model Context Protocol (MCP) server implementing both:
-/// 1. Streamable HTTP transport at /mcp (POST JSON + SSE streaming, GET SSE with Last-Event-ID,
-///    DELETE session termination; compatible with 2025-03-26, 2025-06-18, 2025-11-25, and stateless 2026-07-28).
+/// 1. Streamable HTTP at /mcp. Legacy versions support initialize and optional GET SSE;
+///    MCP 2026-07-28 supports stateless POST, server/discover, and per-request metadata.
 /// 2. Local stdio transport (newline-delimited JSON-RPC 2.0) for desktop/CLI MCP hosts.
 /// All tool execution routes directly through the single shared ToolRegistry.
 /// </summary>
@@ -90,6 +90,18 @@ public sealed class McpServer
         var reqSessionId = ctx.Request.Headers["Mcp-Session-Id"].FirstOrDefault();
         var reqProtoHeader = ctx.Request.Headers["MCP-Protocol-Version"].FirstOrDefault();
         var isStateless2026 = string.Equals(reqProtoHeader, "2026-07-28", StringComparison.Ordinal);
+        if (!string.IsNullOrEmpty(reqProtoHeader) && !SupportedVersions.Contains(reqProtoHeader))
+        {
+            await WriteJsonRpcErrorHttp(ctx, StatusCodes.Status400BadRequest, null, -32022,
+                $"Unsupported MCP protocol version '{reqProtoHeader}'. Supported: {string.Join(", ", SupportedVersions.Order())}.");
+            return;
+        }
+        if (!ctx.Request.HasJsonContentType())
+        {
+            await WriteJsonRpcErrorHttp(ctx, StatusCodes.Status415UnsupportedMediaType, null, -32600,
+                "MCP POST requests require Content-Type: application/json.");
+            return;
+        }
 
         string body;
         using (var sr = new StreamReader(ctx.Request.Body, Encoding.UTF8))
@@ -112,6 +124,22 @@ public sealed class McpServer
         {
             await WriteJsonRpcErrorHttp(ctx, StatusCodes.Status400BadRequest, null, -32700, $"Parse error: {ex.Message}");
             return;
+        }
+
+        if (isStateless2026)
+        {
+            if (parsed is not JsonObject modernRequest)
+            {
+                await WriteJsonRpcErrorHttp(ctx, StatusCodes.Status400BadRequest, null, -32600,
+                    "Modern MCP uses one JSON-RPC request per POST, not a batch.");
+                return;
+            }
+            var validationError = ValidateModernRequest(ctx.Request, modernRequest);
+            if (validationError is not null)
+            {
+                await WriteJsonRpcErrorHttp(ctx, StatusCodes.Status400BadRequest, modernRequest["id"], -32020, validationError);
+                return;
+            }
         }
 
         // Validate explicit Mcp-Session-Id on non-initialize calls (2025-xx Streamable HTTP compliance).
@@ -174,6 +202,12 @@ public sealed class McpServer
 
         if (mintedSessionId is not null && !isStateless2026)
             ctx.Response.Headers["Mcp-Session-Id"] = mintedSessionId;
+        if (isStateless2026)
+        {
+            negotiatedProtocol = "2026-07-28";
+            foreach (var response in responses)
+                AddModernResultMetadata(response);
+        }
         ctx.Response.Headers["MCP-Protocol-Version"] = negotiatedProtocol;
 
         // Notifications/responses only -> 202 Accepted with no body per MCP Streamable HTTP spec.
@@ -204,7 +238,9 @@ public sealed class McpServer
             return;
         }
 
-        ctx.Response.StatusCode = StatusCodes.Status200OK;
+        ctx.Response.StatusCode = isStateless2026 && responses.Count == 1 &&
+            responses[0]["error"] is JsonObject rpcError && rpcError["code"]?.GetValue<int>() == -32601
+            ? StatusCodes.Status404NotFound : StatusCodes.Status200OK;
         ctx.Response.ContentType = "application/json; charset=utf-8";
         if (parsed is JsonArray)
         {
@@ -288,6 +324,64 @@ public sealed class McpServer
         catch (OperationCanceledException) { }
     }
 
+    // The modern 2026-07-28 transport has no initialize handshake: each POST
+    // independently asserts the protocol, capabilities and method routing.
+    private static bool IsModernStdioRequest(JsonObject request)
+        => request["params"] is JsonObject p && p["_meta"] is JsonObject meta &&
+           meta["io.modelcontextprotocol/protocolVersion"]?.GetValueKind() == JsonValueKind.String &&
+           meta["io.modelcontextprotocol/protocolVersion"]?.GetValue<string>() == "2026-07-28";
+
+    private static string? ValidateModernRequest(HttpRequest request, JsonObject json)
+    {
+        if (json["method"]?.GetValueKind() != JsonValueKind.String)
+            return "Modern MCP requires a JSON-RPC method.";
+        var method = json["method"]!.GetValue<string>();
+        if (!string.Equals(request.Headers["Mcp-Method"].ToString(), method, StringComparison.Ordinal))
+            return "Mcp-Method header does not match the JSON-RPC method.";
+        if (json["params"] is not JsonObject parameters || parameters["_meta"] is not JsonObject meta ||
+            meta["io.modelcontextprotocol/protocolVersion"]?.GetValueKind() != JsonValueKind.String ||
+            meta["io.modelcontextprotocol/protocolVersion"]!.GetValue<string>() != "2026-07-28" ||
+            meta["io.modelcontextprotocol/clientCapabilities"] is not JsonObject)
+            return "Modern MCP requires _meta protocolVersion and clientCapabilities on each request.";
+        if (method is "tools/call" or "resources/read" or "prompts/get")
+        {
+            var field = method == "tools/call" ? "name" : method == "resources/read" ? "uri" : "name";
+            if (parameters[field]?.GetValueKind() != JsonValueKind.String)
+                return $"Modern MCP requires params.{field}.";
+            var requiredName = parameters[field]!.GetValue<string>();
+            var providedName = request.Headers["Mcp-Name"].ToString();
+            if (providedName.StartsWith("=?base64?", StringComparison.Ordinal) && providedName.EndsWith("?=", StringComparison.Ordinal))
+            {
+                try
+                {
+                    var encoded = providedName[9..^2];
+                    providedName = new UTF8Encoding(false, true).GetString(Convert.FromBase64String(encoded));
+                }
+                catch (Exception ex) when (ex is FormatException or DecoderFallbackException)
+                {
+                    return "Mcp-Name contains an invalid Base64-encoded value.";
+                }
+            }
+            if (!string.Equals(providedName, requiredName, StringComparison.Ordinal))
+                return "Mcp-Name header does not match the tool/resource/prompt name.";
+        }
+        return null;
+    }
+
+    private static void AddModernResultMetadata(JsonObject response)
+    {
+        if (response["result"] is not JsonObject result) return;
+        result["resultType"] = "complete";
+        result["_meta"] = new JsonObject
+        {
+            ["io.modelcontextprotocol/serverInfo"] = new JsonObject
+            {
+                ["name"] = "LocalIdeBridge",
+                ["version"] = "1.0.0"
+            }
+        };
+    }
+
     private IResult HandleDeleteSession(HttpContext ctx)
     {
         var sid = ctx.Request.Headers["Mcp-Session-Id"].FirstOrDefault();
@@ -334,7 +428,11 @@ public sealed class McpServer
                 if (node is not JsonObject obj)
                     response = MakeError(null, -32600, "Expected JSON-RPC object.");
                 else
-                    (response, _, _) = await DispatchMessageAsync(obj, isStateless2026: false, ct);
+                {
+                    var modern = IsModernStdioRequest(obj);
+                    (response, _, _) = await DispatchMessageAsync(obj, modern, ct);
+                    if (modern && response is not null) AddModernResultMetadata(response);
+                }
             }
             catch (JsonException ex)
             {
@@ -399,8 +497,29 @@ public sealed class McpServer
 
         switch (method)
         {
+            case "server/discover":
+            {
+                if (!isStateless2026)
+                    return (MakeError(idNode, -32601, "server/discover requires MCP 2026-07-28."), null, DefaultProtocolVersion);
+                var result = new JsonObject
+                {
+                    ["supportedVersions"] = new JsonArray("2026-07-28"),
+                    ["capabilities"] = new JsonObject
+                    {
+                        ["tools"] = new JsonObject { ["listChanged"] = false },
+                        ["resources"] = new JsonObject { ["listChanged"] = false }
+                    },
+                    ["instructions"] = "Use tools/list, workspace_status, and job_start. For disconnect-safe writes use execute_once with a stable operationId.",
+                    ["ttlMs"] = 60000,
+                    ["cacheScope"] = "private"
+                };
+                return (MakeResult(idNode, result), null, "2026-07-28");
+            }
+
             case "initialize":
             {
+                if (isStateless2026)
+                    return (MakeError(idNode, -32601, "Modern MCP uses server/discover, not initialize."), null, "2026-07-28");
                 var clientVer = paramsObj.OptionalString("protocolVersion", DefaultProtocolVersion)!;
                 var negotiated = SupportedVersions.Contains(clientVer) ? clientVer : DefaultProtocolVersion;
                 string? sid = null;
@@ -450,12 +569,20 @@ public sealed class McpServer
                             ["title"] = t.Name,
                             ["readOnlyHint"] = t.IsReadOnly,
                             ["idempotentHint"] = t.IsIdempotent,
-                            ["destructiveHint"] = t.Name is "delete_file" or "git_push",
-                            ["openWorldHint"] = t.Name is "git_push" or "run_command"
+                            // Fail conservative: a tool which can mutate state must not claim
+                            // to be non-destructive merely because it has an undo path.
+                            ["destructiveHint"] = !t.IsReadOnly,
+                            ["openWorldHint"] = t.Category is "execution" or "build" or "test" or "git" or "jobs"
                         }
                     });
                 }
-                return (MakeResult(idNode, new JsonObject { ["tools"] = toolsArr }), null, DefaultProtocolVersion);
+                var toolListResult = new JsonObject { ["tools"] = toolsArr };
+                if (isStateless2026)
+                {
+                    toolListResult["ttlMs"] = 30000;
+                    toolListResult["cacheScope"] = "private";
+                }
+                return (MakeResult(idNode, toolListResult), null, DefaultProtocolVersion);
             }
 
             case "tools/call":
