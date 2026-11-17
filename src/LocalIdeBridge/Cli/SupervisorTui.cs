@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using LocalIdeBridge.Storage;
 using LocalIdeBridge.Tools;
