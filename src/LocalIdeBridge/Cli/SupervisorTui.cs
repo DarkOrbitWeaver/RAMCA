@@ -415,8 +415,7 @@ public sealed class SupervisorTui
         // A short card shows the useful tail; expanded details allow the longer
         // bounded excerpt without loading an entire historical log.
         var budget = Math.Max(0, remaining - (lines.Count > 0 ? 1 : 0));
-        var offset = _focusDetails ? Math.Min(entries.Length, _detailPage * Math.Max(1, budget)) :
-            Math.Max(0, entries.Length - budget);
+        var offset = Math.Max(0, entries.Length - (_focusDetails ? (_detailPage + 1) * Math.Max(1, budget) : budget));
         foreach (var entry in entries.Skip(offset).Take(budget))
         {
             var trimmed = entry.TrimEnd('\r');
@@ -533,7 +532,8 @@ public sealed class SupervisorTui
         Line($"Workspace : {workspace}  Branch: {_cachedGitBranch ?? "-"}");
         Line(Style(new string('─', Math.Max(1, w - 1)), UiTone.Muted));
         string Tab(ViewTab tab, string label) =>
-            _activeTab == tab ? $"\x1b[1m[{label}]\x1b[0m" : Style($" {label} ", UiTone.Muted);
+            _activeTab == tab ? (_useColor ? $"\x1b[1m[{label}]\x1b[0m" : $"[{label}]")
+                              : Style($" {label} ", UiTone.Muted);
         Line($"{Tab(ViewTab.Overview, "1:Activity")} {Tab(ViewTab.Edits, "2:Changes")} {Tab(ViewTab.Jobs, "3:Commands")} {Tab(ViewTab.GitAndSessions, "4:Git")} {Tab(ViewTab.Errors, "5:Errors")}");
 
         var bodyRows = Math.Max(1, h - 11);
@@ -548,7 +548,7 @@ public sealed class SupervisorTui
         Line(Style("[Up/Down] Select  [PgUp/PgDn] Page  [Enter] Details  [Esc] Back", UiTone.Muted));
         Line("[C] ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate");
         Line("[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
-        sb.Append(Style(Fit(_statusBanner, w - 1), UiTone.Muted)).Append("\x1b[0m\x1b[K");
+        sb.Append(ClipAnsi(Style(Fit(_statusBanner, w - 1), UiTone.Muted), w - 1)).Append("\x1b[0m\x1b[K");
         Console.Write(sb.ToString());
     }
 
@@ -662,14 +662,18 @@ public sealed class SupervisorTui
 
     private IReadOnlyList<UiLine> GetVerifiedDiff(EditJournalRecord edit)
     {
-        if (_cachedDiffKey == edit.EditId) return _cachedDiffLines;
         var result = new List<UiLine>();
+        string cacheKey = edit.EditId;
         try
         {
             using var scope = _host.Guard.UseInvocationWorkspace(edit.Workspace);
             var full = _host.Guard.ResolvePath(edit.RelativePath, explicitWorkspace: edit.Workspace);
             var backup = Path.Combine(_host.Paths.SessionsDir, PortablePaths.SanitizeId(edit.SessionId),
                 "edits", PortablePaths.SanitizeId(edit.EditId) + ".bak");
+            // Cheap file metadata invalidates the preview if another editor
+            // updates a file without sending RAMCA an activity notification.
+            cacheKey = $"{edit.EditId}:{File.GetLastWriteTimeUtc(full).Ticks}:{File.Exists(full)}:{File.GetLastWriteTimeUtc(backup).Ticks}";
+            if (_cachedDiffKey == cacheKey) return _cachedDiffLines;
             const long maxPreviewBytes = 256 * 1024;
             // Reject large previews before hashing or decoding them on every
             // TUI redraw. The edit metadata is still displayed.
@@ -703,7 +707,7 @@ public sealed class SupervisorTui
                 var tone = raw.StartsWith('+') ? UiTone.Good :
                     raw.StartsWith('-') ? UiTone.Error :
                     raw.StartsWith("@@") ? UiTone.Accent : UiTone.Muted;
-                result.Add(new UiLine(raw.TrimEnd('\r'), tone));
+                result.Add(new UiLine(_host.Credentials.Redact(raw.TrimEnd('\r')), tone));
             }
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException or WorkspaceViolationException or UnauthorizedAccessException or ArgumentException)
@@ -711,7 +715,7 @@ public sealed class SupervisorTui
             result.Add(new UiLine(ex.Message, UiTone.Warning));
             result.Add(new UiLine("Only trustworthy, matching pre/post-image diffs are displayed.", UiTone.Muted));
         }
-        _cachedDiffKey = edit.EditId;
+        _cachedDiffKey = cacheKey;
         _cachedDiffLines = result;
         return result;
     }
