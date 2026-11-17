@@ -143,7 +143,7 @@ public sealed class EditingAndGitTests
         var ok = await sb.Host.Registry.InvokeAsync("apply_patch", new JsonObject { ["patch"] = goodPatch });
         Assert.True(ok.Success);
         Assert.Equal("alpha\nBETA\nBETA_2\ngamma\n", await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "a.txt")));
-        Assert.Equal("created line 1\ncreated line 2\n", await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "c.txt")));
+        Assert.Equal(string.Join(Environment.NewLine, "created line 1", "created line 2", ""), await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "c.txt")));
 
         // Rename and reversible delete.
         var ren = await sb.Host.Registry.InvokeAsync("rename_file",

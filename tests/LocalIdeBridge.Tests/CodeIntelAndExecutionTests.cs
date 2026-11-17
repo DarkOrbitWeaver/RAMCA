@@ -278,7 +278,7 @@ public sealed class CodeIntelAndExecutionTests
             cfg.Save(paths);
 
             var hostDll = Path.Combine(AppContext.BaseDirectory, "LocalIdeBridge.dll");
-            var dotnetExe = Environment.ProcessPath!;
+            var dotnetExe = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
             var psi = new ProcessStartInfo(dotnetExe)
             {
                 UseShellExecute = false,
@@ -323,7 +323,12 @@ public sealed class CodeIntelAndExecutionTests
             await Task.Delay(150);
 
             // Remote listener MUST be gone immediately after termination.
-            await Assert.ThrowsAsync<HttpRequestException>(() => http.GetAsync($"{boundUrl}/health"));
+            var stoppedEndpoint = new Uri(boundUrl);
+            using (var stoppedClient = new System.Net.Sockets.TcpClient(System.Net.Sockets.AddressFamily.InterNetwork))
+            {
+                await Assert.ThrowsAnyAsync<System.Net.Sockets.SocketException>(
+                    () => stoppedClient.ConnectAsync(stoppedEndpoint.Host, stoppedEndpoint.Port));
+            }
 
             // Verify clean restart on the exact same portable directory works seamlessly.
             cfg.Connection.Mode = "localhost";

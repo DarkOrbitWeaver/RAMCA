@@ -71,7 +71,9 @@ public sealed class SecurityAndWorkspaceTests
 
         foreach (var logFile in Directory.EnumerateFiles(sb.Paths.LogsDir, "*.log"))
         {
-            var logText = await File.ReadAllTextAsync(logFile);
+            await using var stream = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            var logText = await reader.ReadToEndAsync();
             Assert.DoesNotContain(oldKey, logText);
             Assert.DoesNotContain(newKey, logText);
         }

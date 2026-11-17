@@ -410,7 +410,7 @@ public sealed class McpServer
         using var writer = new StreamWriter(output, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
         // Preserve line framing without ReadLineAsync (which can allocate an
         // unlimited string if a client sends a newline-free payload).
-        var maxChars = Math.Clamp(_config.Security.MaxRequestBodyBytes, 64 * 1024, 8 * 1024 * 1024);
+        var maxChars = (int)Math.Clamp(_config.Security.MaxRequestBodyBytes, 64 * 1024, 8 * 1024 * 1024);
         var frame = new StringBuilder(Math.Min(8192, maxChars));
         var buffer = new char[8192];
         var oversized = false;

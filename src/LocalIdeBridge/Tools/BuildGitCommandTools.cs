@@ -468,7 +468,7 @@ public static class BuildGitCommandTools
                 if (action == "add")
                 {
                     var branch = args.OptionalString("branch");
-                    if (branch is not null && branch.StartsWith('-', StringComparison.Ordinal))
+                    if (branch is not null && branch.StartsWith("-", StringComparison.Ordinal))
                         throw new ArgumentException("A Git worktree branch name may not begin with '-'.");
                     gitArgs = string.IsNullOrWhiteSpace(branch)
                         ? ["worktree", "add", "--detach", wtPath]

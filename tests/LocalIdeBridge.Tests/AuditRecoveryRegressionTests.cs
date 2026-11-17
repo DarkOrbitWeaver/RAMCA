@@ -95,7 +95,7 @@ public sealed class AuditRecoveryRegressionTests
         var result = await sb.Host.Registry.InvokeAsync("apply_patch", new JsonObject { ["patch"] = patch });
         Assert.True(result.Success, result.ErrorMessage);
         Assert.Equal("new\n", await File.ReadAllTextAsync(original));
-        Assert.Equal("created\n", await File.ReadAllTextAsync(second));
+        Assert.Equal("created" + Environment.NewLine, await File.ReadAllTextAsync(second));
         Assert.Empty(Directory.GetFiles(Path.Combine(sb.Paths.DataDir, "pending-patches"), "*.json"));
         var edits = JsonSerializer.SerializeToElement(result.Data).GetProperty("edits");
         Assert.Equal(2, edits.GetArrayLength());

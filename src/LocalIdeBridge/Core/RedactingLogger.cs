@@ -102,7 +102,7 @@ public sealed class RedactingLogger : IDisposable
         Directory.CreateDirectory(_paths.LogsDir);
         var suffix = _rollIndex == 0 ? "" : $".{_rollIndex}";
         var filePath = Path.Combine(_paths.LogsDir, $"bridge-{dateKey}{suffix}.log");
-        var fs = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read, 4096);
+        var fs = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, 4096);
         _currentFileBytes = fs.Length;
         _writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = true };
     }

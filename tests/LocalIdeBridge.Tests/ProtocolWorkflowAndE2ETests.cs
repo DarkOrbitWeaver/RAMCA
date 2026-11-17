@@ -100,9 +100,23 @@ public sealed class ProtocolWorkflowAndE2ETests
         // 7. Stateless 2026-07-28 MCP request succeeds without initialize or Mcp-Session-Id.
         var statelessReq = new HttpRequestMessage(HttpMethod.Post, "mcp")
         {
-            Content = TestSandbox.JsonBody(new { jsonrpc = "2.0", id = 6, method = "tools/list" })
+            Content = TestSandbox.JsonBody(new
+            {
+                jsonrpc = "2.0",
+                id = 6,
+                method = "tools/list",
+                @params = new
+                {
+                    _meta = new Dictionary<string, object>
+                    {
+                        ["io.modelcontextprotocol/protocolVersion"] = "2026-07-28",
+                        ["io.modelcontextprotocol/clientCapabilities"] = new { }
+                    }
+                }
+            })
         };
         statelessReq.Headers.Add("MCP-Protocol-Version", "2026-07-28");
+        statelessReq.Headers.Add("Mcp-Method", "tools/list");
         var statelessResp = await client.SendAsync(statelessReq);
         Assert.Equal(HttpStatusCode.OK, statelessResp.StatusCode);
         Assert.False(statelessResp.Headers.Contains("Mcp-Session-Id"));
@@ -212,10 +226,7 @@ public sealed class ProtocolWorkflowAndE2ETests
         await sb.Host.DisposeAsync();
 
         // Listener must be completely unreachable after shutdown.
-        using (var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(2) })
-        {
-            await Assert.ThrowsAsync<HttpRequestException>(() => probe.GetAsync($"{oldUrl}/health"));
-        }
+        await AssertPortClosedAsync(oldUrl);
         Assert.False(File.Exists(sb.Paths.HostLockFile));
 
         // Restart host on same portable directory -> crashed job marked interrupted_restart, NEVER replayed.
@@ -224,6 +235,14 @@ public sealed class ProtocolWorkflowAndE2ETests
         var recoveredJob = restarted.Database.GetJob(crashedJobId);
         Assert.NotNull(recoveredJob);
         Assert.Equal("interrupted_restart", recoveredJob!.Status);
+    }
+
+    private static async Task AssertPortClosedAsync(string baseUrl)
+    {
+        var endpoint = new Uri(baseUrl);
+        using var client = new System.Net.Sockets.TcpClient(System.Net.Sockets.AddressFamily.InterNetwork);
+        await Assert.ThrowsAnyAsync<System.Net.Sockets.SocketException>(
+            () => client.ConnectAsync(endpoint.Host, endpoint.Port));
     }
 
     [Fact]
