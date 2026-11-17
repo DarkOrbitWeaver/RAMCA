@@ -177,7 +177,7 @@ public sealed partial class TunnelManager : IDisposable
                             if (buffer[i] == '\n')
                             {
                                 HandleLine();
-                                // Deliberately discarded.
+                                line.Clear(); // Reset after each emitted line; never accumulate previous output.
 
                                 oversized = false;
                             }
