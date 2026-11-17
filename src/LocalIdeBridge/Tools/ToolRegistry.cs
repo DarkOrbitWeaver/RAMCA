@@ -82,14 +82,18 @@ public sealed class ToolRegistry
             return ToolResult.Fail("unknown_tool", $"Unknown tool '{toolName}'. Discover available tools via tools/list or GET /api/v1/tools.");
         }
 
-        if (_isPaused && !tool.IsReadOnly &&
+        var args = arguments ?? new JsonObject();
+        // Build-mode diagnostics may write bin/obj. Explicit Roslyn mode is read-only.
+        var diagnosticRoslyn = tool.Name.Equals("compiler_diagnostics", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(args.OptionalString("mode", "build"), "roslyn", StringComparison.OrdinalIgnoreCase);
+        var effectiveReadOnly = tool.IsReadOnly || diagnosticRoslyn;
+        if (_isPaused && !effectiveReadOnly &&
             tool.Name is not ("job_cancel" or "workflow_cancel" or "revert_edit"))
         {
             Interlocked.Increment(ref _totalErrors);
             return ToolResult.Fail("host_paused", "LocalIdeBridge execution is currently paused by the local supervisor. Read-only inspection remains available.");
         }
 
-        var args = arguments ?? new JsonObject();
         var ctx = context ?? new ToolExecutionContext(_db.ActiveSessionId);
         using var sessionScope = _db.UseInvocationSession(ctx.SessionId);
         var workspace = ctx.WorkspaceRoot ?? _guard.ActiveWorkspace;
@@ -98,15 +102,15 @@ public sealed class ToolRegistry
         try
         {
             using var workspaceScope = workspace is null ? null : _guard.UseInvocationWorkspace(workspace);
-            var needsWriteLock = !tool.IsReadOnly &&
-                                 !ctx.SkipWriteLock &&
-                                 tool.Category is "editing" or "git" or "build" or "execution" or "test" &&
-                                 workspace is not null;
+            var needsWriteLock = !effectiveReadOnly && !ctx.SkipWriteLock &&
+                workspace is not null &&
+                (tool.Category is "editing" or "git" or "build" or "execution" or "test" ||
+                 tool.Name.Equals("compiler_diagnostics", StringComparison.OrdinalIgnoreCase));
 
             if (needsWriteLock)
             {
                 using var _ = await _guard.AcquireWriteLockAsync(workspace!, ct).ConfigureAwait(false);
-                if (_isPaused && tool.Name is not ("job_cancel" or "workflow_cancel" or "revert_edit"))
+                if (_isPaused && !effectiveReadOnly && tool.Name is not ("job_cancel" or "workflow_cancel" or "revert_edit"))
                     return ToolResult.Fail("host_paused", "The supervisor paused execution while this operation waited for the write lock.");
                 result = await tool.Handler(args, ctx, ct).ConfigureAwait(false);
             }
