@@ -114,6 +114,12 @@ public sealed partial class CredentialStore
             _lastFileCheckMs = now;
             try
             {
+                // A deleted credential file must revoke the cached key, not leave it valid.
+                if (!File.Exists(_paths.SecretKeyFile))
+                {
+                    _currentHash = [];
+                    return;
+                }
                 var lastWrite = File.GetLastWriteTimeUtc(_paths.SecretKeyFile);
                 if (lastWrite <= LastRotatedUtc.UtcDateTime) return;
                 var newKey = File.ReadAllText(_paths.SecretKeyFile, Encoding.UTF8).Trim();
@@ -189,13 +195,17 @@ public sealed partial class CredentialStore
                     using var proc = Process.Start(new ProcessStartInfo
                     {
                         FileName = "icacls",
-                        ArgumentList = { path, "/inheritance:r", "/grant:r", $"{user}:(R,W)" },
+                        ArgumentList = { path, "/inheritance:r", "/grant:r", $"{Environment.UserDomainName}\\{user}:(R,W)" },
                         CreateNoWindow = true,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true
                     });
-                    proc?.WaitForExit(3000);
+                    if (proc is null || !proc.WaitForExit(3000) || proc.ExitCode != 0)
+                    {
+                        try { if (proc is { HasExited: false }) proc.Kill(entireProcessTree: true); } catch { }
+                        throw new IOException("Could not restrict RAMCA access-key file permissions.");
+                    }
                 }
             }
             else
@@ -203,9 +213,9 @@ public sealed partial class CredentialStore
                 File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Best-effort OS ACL tightening; never crash initialization.
+            throw new IOException("Could not secure RAMCA access-key file; refusing to start with unverified permissions.", ex);
         }
     }
 }

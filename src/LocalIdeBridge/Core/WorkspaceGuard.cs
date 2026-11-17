@@ -275,13 +275,15 @@ public sealed class WorkspaceGuard : IDisposable
         {
             var fi = new FileInfo(policyFile);
             if (fi.Length > 256 * 1024 || (fi.Attributes & FileAttributes.ReparsePoint) != 0)
-                return null;
+                throw new WorkspaceViolationException("Repository policy is oversized or a reparse point; execution refused.");
             var json = File.ReadAllText(policyFile);
-            return JsonSerializer.Deserialize<RepoPolicy>(json, AppConfig.JsonOptions);
+            return JsonSerializer.Deserialize<RepoPolicy>(json, AppConfig.JsonOptions)
+                ?? throw new WorkspaceViolationException("Repository policy is empty; execution refused.");
         }
-        catch
+        catch (WorkspaceViolationException) { throw; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
         {
-            return null;
+            throw new WorkspaceViolationException("Repository policy cannot be safely read or parsed; execution refused.");
         }
     }
 

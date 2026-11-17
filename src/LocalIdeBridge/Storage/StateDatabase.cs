@@ -683,7 +683,7 @@ public sealed class StateDatabase : IDisposable
             using var conn = OpenConnection();
             using var cmd = conn.CreateCommand();
             var setStarted = status == "running" ? ", started_at = COALESCE(started_at, $now)" : "";
-            var setCompleted = status is "succeeded" or "failed" or "cancelled" or "interrupted_restart" ? ", completed_at = $now" : "";
+            var setCompleted = status is "succeeded" or "failed" or "cancelled" or "timed_out" or "interrupted_restart" ? ", completed_at = $now" : "";
             cmd.CommandText = $"""
                 UPDATE jobs
                 SET status = $st {setStarted} {setCompleted},

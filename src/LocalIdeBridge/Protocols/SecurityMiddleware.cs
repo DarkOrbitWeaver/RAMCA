@@ -114,6 +114,17 @@ public sealed class SecurityMiddleware
             return;
         }
 
+        // Apply the configured request cap to authenticated traffic too.
+        // Separate its bucket from rejected credentials, so a scanner cannot
+        // consume the owner's allowance when requests share a tunnel IP.
+        if (IncrementCounter(_reqCounters, "auth:" + ipKey, nowMinute) > _config.Security.RequestsPerMinute)
+        {
+            context.Response.Headers["Retry-After"] = "60";
+            await WriteJsonError(context, StatusCodes.Status429TooManyRequests,
+                "request_rate_limited", "Authenticated request rate limit exceeded.");
+            return;
+        }
+
         try
         {
             await _next(context);

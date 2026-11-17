@@ -702,9 +702,9 @@ public sealed class SearchAndIntelTools
             Name: "compiler_diagnostics",
             Category: "code_intel",
             Description: "Collects structured C# compiler errors and warnings either via full MSBuild/dotnet build ('build' mode, includes NuGet packages) or fast in-process Roslyn syntax/semantic check ('roslyn' mode).",
-            IsReadOnly: true,
+            IsReadOnly: false, // Default build mode writes bin/obj and must obey pause/write locks.
             IsIdempotent: true,
-            SideEffects: "In 'build' mode runs dotnet build; in 'roslyn' mode performs read-only in-memory analysis.",
+            SideEffects: "Build mode runs dotnet build and writes outputs; roslyn mode analyzes in memory.",
             Parameters:
             [
                 new("mode", "string", "build (accurate with NuGet references) | roslyn (fast in-memory).", EnumValues: ["build", "roslyn"], Default: "build"),
@@ -768,9 +768,7 @@ public sealed class SearchAndIntelTools
                 var errs = filtered.Count(d => d.Severity == "error");
                 var warns = filtered.Count(d => d.Severity == "warning");
 
-                return ToolResult.Ok(
-                    $"Compiler diagnostics complete (exit={exec.ExitCode}): {errs} error(s), {warns} warning(s).",
-                    new
+                var diagnosticPayload = new
                     {
                         engine = "dotnet-msbuild-roslyn",
                         executionId = exec.ExecutionId,
@@ -779,8 +777,12 @@ public sealed class SearchAndIntelTools
                         errorCount = errs,
                         warningCount = warns,
                         diagnostics = filtered
-                    },
-                    exec.ExecutionId);
+                    };
+                var summary = $"Compiler diagnostics complete (exit={exec.ExitCode}): {errs} error(s), {warns} warning(s).";
+                return exec.ExitCode == 0
+                    ? ToolResult.Ok(summary, diagnosticPayload, exec.ExecutionId)
+                    : ToolResult.Fail(exec.TimedOut ? "timeout" : exec.Cancelled ? "cancelled" : "build_failed",
+                        summary, diagnosticPayload, exec.ExecutionId);
             });
     }
 
