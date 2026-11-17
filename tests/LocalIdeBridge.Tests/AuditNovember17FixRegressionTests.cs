@@ -19,6 +19,48 @@ public sealed class AuditNovember17FixRegressionTests
     }
 
     [Fact]
+    public async Task RoslynDiagnosticsRemainAvailableWhenPaused_ButBuildModeIsDenied()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "hello.cs"),
+            "public class Hello { }\n");
+        sb.Host.Registry.IsPaused = true;
+        try
+        {
+            var roslyn = await sb.Host.Registry.InvokeAsync("compiler_diagnostics",
+                new JsonObject { ["mode"] = "roslyn" });
+            Assert.True(roslyn.Success, roslyn.ErrorMessage);
+            var build = await sb.Host.Registry.InvokeAsync("compiler_diagnostics",
+                new JsonObject { ["mode"] = "build" });
+            Assert.False(build.Success);
+            Assert.Equal("host_paused", build.ErrorCode);
+        }
+        finally { sb.Host.Registry.IsPaused = false; }
+    }
+
+    [Fact]
+    public async Task BuildDiagnosticsWaitForWorkspaceWriteLock()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "Dummy.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "Dummy.cs"),
+            "public sealed class Dummy { }\n");
+        var mutex = await sb.Host.Guard.AcquireWriteLockAsync(sb.WorkspaceDir);
+        Task<ToolResult>? inFlight = null;
+        try
+        {
+            inFlight = sb.Host.Registry.InvokeAsync("compiler_diagnostics",
+                new JsonObject { ["mode"] = "build", ["target"] = "Dummy.csproj" });
+            await Task.Delay(150);
+            Assert.False(inFlight.IsCompleted, "Build-mode diagnostics must not bypass active workspace write lock.");
+        }
+        finally { mutex.Dispose(); }
+        var result = await inFlight!.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.True(result.Success, result.ErrorMessage);
+    }
+
+    [Fact]
     public async Task DeletedAccessKeyFile_RevokesPreviouslyCachedCredential()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);
