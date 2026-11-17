@@ -291,9 +291,32 @@ public sealed partial class ProcessRunner
     {
         if (OperatingSystem.IsWindows())
         {
-            return FindOnPath("pwsh.exe") ?? FindOnPath("powershell.exe") ?? "powershell.exe";
+            // A Microsoft Store App Execution Alias under WindowsApps can exist without
+            // a usable PowerShell installation. The alias sometimes exits immediately
+            // with -1, causing background commands to fail before cancellation arrives.
+            var pwsh = FindOnPath("pwsh.exe");
+            if (pwsh is not null && !IsWindowsAppExecutionAlias(pwsh))
+                return pwsh;
+
+            var windowsPowerShell = FindOnPath("powershell.exe");
+            if (windowsPowerShell is not null && !IsWindowsAppExecutionAlias(windowsPowerShell))
+                return windowsPowerShell;
+
+            // Let Windows resolve its inbox PowerShell normally if PATH is incomplete.
+            return "powershell.exe";
         }
         return FindOnPath("pwsh") ?? FindOnPath("bash") ?? "/bin/sh";
+    }
+
+    private static bool IsWindowsAppExecutionAlias(string path)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(localAppData)) return false;
+        var aliasDirectory = Path.Combine(localAppData, "Microsoft", "WindowsApps");
+        return Path.GetFullPath(path).StartsWith(
+            Path.GetFullPath(aliasDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     public IReadOnlyList<string> BuildShellArguments(string shellExe, string script)
