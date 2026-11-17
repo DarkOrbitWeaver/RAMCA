@@ -27,7 +27,7 @@ public static class JobAndWorkflowTools
                 new("arguments", "object", "Arguments object passed to the target tool."),
                 new("timeoutSeconds", "integer", "Optional job timeout in seconds.")
             ],
-            Handler: (args, _, _) =>
+            Handler: (args, ctx, _) =>
             {
                 var toolName = args.RequireString("tool");
                 JsonObject? innerArgs = null;
@@ -35,7 +35,10 @@ public static class JobAndWorkflowTools
                     innerArgs = obj;
                 int? timeout = args.ContainsKey("timeoutSeconds") ? args.OptionalInt("timeoutSeconds", 0) : null;
 
-                var rec = jobs.StartToolJob(toolName, innerArgs, timeout);
+                JobRecord rec;
+                try { rec = jobs.StartToolJob(toolName, innerArgs, timeout, ctx.SessionId, ctx.WorkspaceRoot); }
+                catch (InvalidOperationException ex) when (ex.Message.StartsWith("queue_full:", StringComparison.Ordinal))
+                { return Task.FromResult(ToolResult.Fail("queue_full", ex.Message)); }
                 return Task.FromResult(ToolResult.Ok(
                     $"Started background job '{rec.Id}' for '{rec.ToolName}'.",
                     new
@@ -159,18 +162,36 @@ public static class JobAndWorkflowTools
             [
                 new("jobId", "string", "Job identifier.", Required: true),
                 new("afterEventId", "integer", "Return only events strictly greater than this ID.", Default: 0),
-                new("limit", "integer", "Maximum events returned (1-200).", Default: 100)
+                new("limit", "integer", "Maximum events returned (1-200).", Default: 100),
+                new("waitMs", "integer", "Optional event-driven wait for progress or completion, 0..25000 milliseconds.", Default: 0)
             ],
-            Handler: (args, _, _) =>
+            Handler: async (args, _, ct) =>
             {
                 var jobId = args.RequireString("jobId");
+                var after = Math.Max(0, args.OptionalLong("afterEventId", 0));
+                var limit = args.OptionalInt("limit", 100);
+                var wait = Math.Clamp(args.OptionalInt("waitMs", 0), 0, 25_000);
                 var job = db.GetJob(jobId) ?? throw new KeyNotFoundException($"Job '{jobId}' not found.");
-                var evts = db.ListJobEvents(jobId, args.OptionalLong("afterEventId", 0), args.OptionalInt("limit", 100));
-                var lastId = evts.Count > 0 ? evts[^1].Id : args.OptionalLong("afterEventId", 0);
-
-                return Task.FromResult(ToolResult.Ok(
+                var evts = db.ListJobEvents(jobId, after, limit);
+                static bool Terminal(string status) => status is "succeeded" or "failed" or "timed_out" or
+                    "cancelled" or "interrupted_restart";
+                if (evts.Count == 0 && !Terminal(job.Status) && wait > 0)
+                {
+                    // Registration before this repeated read closes the missed-wake race.
+                    await jobs.WaitForChangeAsync(jobId, () =>
+                    {
+                        var latest = db.GetJob(jobId);
+                        return latest is null || Terminal(latest.Status) ||
+                            db.ListJobEvents(jobId, after, 1).Count > 0;
+                    }, wait, ct).ConfigureAwait(false);
+                    job = db.GetJob(jobId) ?? throw new KeyNotFoundException($"Job '{jobId}' expired while waiting.");
+                    evts = db.ListJobEvents(jobId, after, limit);
+                }
+                var lastId = evts.Count > 0 ? evts[^1].Id : after;
+                return ToolResult.Ok(
                     $"Retrieved {evts.Count} event(s) for job '{jobId}' (status={job.Status}).",
-                    new { jobId, jobStatus = job.Status, lastEventId = lastId, count = evts.Count, events = evts }));
+                    new { jobId, jobStatus = job.Status, lastEventId = lastId, changed = evts.Count > 0,
+                        terminal = Terminal(job.Status), count = evts.Count, events = evts, logExecId = job.LogExecId });
             });
 
         yield return new ToolDefinition(
@@ -298,7 +319,7 @@ public static class JobAndWorkflowTools
                 {
                     var syncArgs = (JsonObject)args.DeepClone();
                     syncArgs["async"] = false;
-                    var job = jobs.StartToolJob("workflow_run", syncArgs);
+                    var job = jobs.StartToolJob("workflow_run", syncArgs, pinnedSessionId: ctx.SessionId, pinnedWorkspace: ctx.WorkspaceRoot);
                     return ToolResult.Ok(
                         $"Started asynchronous workflow job '{job.Id}'.",
                         new { jobId = job.Id, status = job.Status });

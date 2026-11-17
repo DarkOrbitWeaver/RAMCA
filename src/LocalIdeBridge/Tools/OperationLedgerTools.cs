@@ -14,6 +14,21 @@ namespace LocalIdeBridge.Tools;
 /// </summary>
 public static class OperationLedgerTools
 {
+    // Object member order is semantically irrelevant for JSON object arguments.
+    // Canonicalize recursively; arrays remain ordered and values retain their types.
+    private static string CanonicalArguments(JsonNode node)
+    {
+        JsonNode? Normalize(JsonNode? value) => value switch
+        {
+            JsonObject obj => new JsonObject(obj.OrderBy(k => k.Key, StringComparer.Ordinal)
+                .Select(k => KeyValuePair.Create(k.Key, Normalize(k.Value)))),
+            JsonArray arr => new JsonArray(arr.Select(Normalize).ToArray()),
+            null => null,
+            _ => value.DeepClone()
+        };
+        return Normalize(node)!.ToJsonString();
+    }
+
     public static IEnumerable<ToolDefinition> Create(WorkspaceGuard guard, StateDatabase db, ToolRegistry registry)
     {
         yield return new ToolDefinition(
@@ -45,7 +60,7 @@ public static class OperationLedgerTools
                     return ToolResult.Fail("invalid_arguments", "arguments must be a JSON object.");
 
                 var workspace = guard.RequireActiveWorkspace();
-                var inputHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(inner.ToJsonString())));
+                var inputHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(CanonicalArguments(inner))));
                 var (operation, created) = db.TryReserveOperation(opId, ctx.SessionId, workspace, name, inputHash);
                 if (!string.Equals(operation.ToolName, name, StringComparison.Ordinal) ||
                     !string.Equals(operation.ArgumentsSha256, inputHash, StringComparison.Ordinal) ||

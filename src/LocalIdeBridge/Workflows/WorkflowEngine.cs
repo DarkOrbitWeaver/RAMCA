@@ -154,11 +154,21 @@ public sealed class WorkflowEngine
                 static bool IsGlobalFailureHandler(WorkflowStepSpec s) =>
                     s.DependsOn.Count == 0 &&
                     string.Equals(s.RunIf?.Trim(), "on_failure", StringComparison.OrdinalIgnoreCase);
+                bool DependsOnGlobalHandler(string stepId, HashSet<string> seen)
+                {
+                    if (!seen.Add(stepId)) return false;
+                    return specMap[stepId].DependsOn.Any(d => IsGlobalFailureHandler(specMap[d]) ||
+                        DependsOnGlobalHandler(d, seen));
+                }
+                // A dependent step must not prevent its own global failure
+                // handler from becoming runnable (the old rule deadlocked).
+                var outstandingIndependent = remaining.Any(id =>
+                    !IsGlobalFailureHandler(specMap[id]) &&
+                    !DependsOnGlobalHandler(id, new HashSet<string>(StringComparer.OrdinalIgnoreCase)));
                 var ready = remaining
                     .Select(id => specMap[id])
                     .Where(s => s.DependsOn.All(d => !remaining.Contains(d)))
-                    .Where(s => !IsGlobalFailureHandler(s) ||
-                        remaining.All(id => IsGlobalFailureHandler(specMap[id])))
+                    .Where(s => !IsGlobalFailureHandler(s) || !outstandingIndependent)
                     .ToList();
 
                 if (ready.Count == 0)
@@ -248,6 +258,22 @@ public sealed class WorkflowEngine
             PersistCheckpoint("cancelled");
             return BuildResult(wfId, sid, definition.Name, "cancelled", sw.ElapsedMilliseconds, definition.Steps, stepStates);
         }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            lock (stateLock)
+            {
+                foreach (var state in stepStates.Values.Where(s => s.Status is "running" or "pending"))
+                {
+                    state.Status = "failed";
+                    state.ErrorCode = "workflow_execution_error";
+                    state.Summary = $"{ex.GetType().Name}: {ex.Message}";
+                }
+            }
+            PersistCheckpoint("failed");
+            _logger.Error("workflow", $"Workflow '{wfId}' failed: {ex.GetType().Name}: {ex.Message}");
+            return BuildResult(wfId, sid, definition.Name, "failed", sw.ElapsedMilliseconds, definition.Steps, stepStates);
+        }
         finally
         {
             _active.TryRemove(wfId, out _);
@@ -276,7 +302,7 @@ public sealed class WorkflowEngine
         var tool = _registry.Find(spec.Tool)!;
         // Retrying an edit/command/commit after a timeout can execute it TWICE.
         // Retry only explicit idempotent operations; the caller can inspect and resume.
-        var maxAttempts = 1 + (tool.IsIdempotent || tool.IsReadOnly ? Math.Clamp(spec.Retries, 0, 5) : 0);
+        var maxAttempts = 1 + (tool.IsReadOnly ? Math.Clamp(spec.Retries, 0, 5) : 0);
         var stepSw = Stopwatch.StartNew();
         ToolResult? lastResult = null;
 
@@ -337,9 +363,21 @@ public sealed class WorkflowEngine
             // Best-effort Git checkpoint if workspace is a Git repository with a HEAD commit.
             try
             {
-                await _registry.InvokeAsync("git_checkpoint", new JsonObject { ["label"] = $"wf:{spec.Id}" }, new ToolExecutionContext(sessionId), wfCt).ConfigureAwait(false);
+                var checkpoint = await _registry.InvokeAsync("git_checkpoint", new JsonObject { ["label"] = $"wf:{spec.Id}" },
+                    new ToolExecutionContext(sessionId), wfCt).ConfigureAwait(false);
+                if (!checkpoint.Success)
+                {
+                    state.Status = "failed";
+                    state.ErrorCode = "checkpoint_failed";
+                    state.Summary = checkpoint.ErrorMessage;
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                state.Status = "failed";
+                state.ErrorCode = "checkpoint_failed";
+                state.Summary = ex.Message;
+            }
             saveCheckpoint();
         }
     }
@@ -403,8 +441,8 @@ public sealed class WorkflowEngine
                 throw new ArgumentException($"Duplicate workflow step id '{s.Id}'.");
             if (string.IsNullOrWhiteSpace(s.Tool) || _registry.Find(s.Tool) is null)
                 throw new ArgumentException($"Step '{s.Id}' references unknown tool '{s.Tool}'.");
-            if (s.Tool.Equals("workflow_run", StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException("Nested workflow_run inside a workflow step is not permitted.");
+            if (s.Tool is "workflow_run" or "job_start" or "execute_once")
+                throw new ArgumentException("Nested orchestrators are not permitted inside workflow steps; use declared DAG dependencies.");
             var cond = (s.RunIf ?? "on_success").Trim();
             if (!(cond.Equals("on_success", StringComparison.OrdinalIgnoreCase) ||
                   cond.Equals("on_failure", StringComparison.OrdinalIgnoreCase) ||

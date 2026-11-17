@@ -24,6 +24,36 @@ public sealed class JobManager : IDisposable
     private readonly CancellationTokenSource _hostCts = new();
     private readonly ConcurrentDictionary<string, RunningJob> _active = new(StringComparer.OrdinalIgnoreCase);
     private int _disposed;
+    private readonly object _admission = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _jobSignals = new();
+
+    private static TaskCompletionSource<bool> NewSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void SignalChange(string jobId)
+    {
+        _jobSignals.AddOrUpdate(jobId, _ => NewSignal(),
+            (_, previous) =>
+            {
+                previous.TrySetResult(true);
+                return NewSignal();
+            });
+    }
+
+    /// <summary>Waits without polling; caller must recheck durable state before and after registration.</summary>
+    public async Task<bool> WaitForChangeAsync(string jobId, Func<bool> hasUpdate, int waitMs, CancellationToken ct)
+    {
+        var observed = _jobSignals.GetOrAdd(jobId, _ => NewSignal());
+        if (hasUpdate()) return true; // Covers notification before registration.
+        if (waitMs <= 0) return false;
+        try
+        {
+            await observed.Task.WaitAsync(TimeSpan.FromMilliseconds(Math.Clamp(waitMs, 1, 25_000)), ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException) { return hasUpdate(); }
+    }
 
     public int ActiveJobCount => _active.Count;
 
@@ -42,9 +72,12 @@ public sealed class JobManager : IDisposable
         _concurrencyGate = new SemaphoreSlim(config.Resources.MaxConcurrentJobs, config.Resources.MaxConcurrentJobs);
     }
 
-    public JobRecord StartToolJob(string toolName, JsonObject? arguments, int? timeoutSeconds = null)
+    public JobRecord StartToolJob(string toolName, JsonObject? arguments, int? timeoutSeconds = null,
+        string? pinnedSessionId = null, string? pinnedWorkspace = null)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        if (timeoutSeconds is <= 0)
+            throw new ArgumentException("Job timeoutSeconds must be positive when provided.");
 
         var tool = _registry.Find(toolName)
             ?? throw new ArgumentException($"Unknown tool '{toolName}'.");
@@ -52,11 +85,12 @@ public sealed class JobManager : IDisposable
             throw new ArgumentException("Cannot recursively nest job_start inside job_start.");
 
         var jobId = $"job_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
-        var sessionId = _db.ActiveSessionId;
-        var ws = _guard.ActiveWorkspace ?? "";
+        var sessionId = pinnedSessionId ?? _db.InvocationSessionId;
+        var ws = pinnedWorkspace ?? _guard.ActiveWorkspace ?? "";
         var clonedArgs = arguments is null ? new JsonObject() : (JsonObject)arguments.DeepClone();
-
-        _db.CreateJob(jobId, sessionId, ws, tool.Name, clonedArgs.ToJsonString(), tool.IsIdempotent);
+        var serializedArgs = clonedArgs.ToJsonString();
+        if (System.Text.Encoding.UTF8.GetByteCount(serializedArgs) > 128 * 1024)
+            throw new ArgumentException("Background job arguments exceed 128 KiB; use a bounded workspace file or a smaller payload.");
 
         // An explicit timeout is not the same as the user cancelling a job.
         // Keep their cancellation causes separate in the persisted job status.
@@ -69,7 +103,27 @@ public sealed class JobManager : IDisposable
         }
 
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        _active[jobId] = new RunningJob(jobId, cts, completion.Task);
+        try
+        {
+            lock (_admission)
+            {
+                // Include queued tasks, not just actively running subprocesses.
+                // Admission happens BEFORE durable job creation and worker dispatch.
+                var capacity = Math.Max(8, _config.Resources.MaxConcurrentJobs * 8);
+                if (_active.Count >= capacity)
+                    throw new InvalidOperationException($"queue_full: {capacity} background jobs are already admitted.");
+                _db.CreateJob(jobId, sessionId, ws, tool.Name, serializedArgs, tool.IsIdempotent);
+                _active[jobId] = new RunningJob(jobId, cts, completion.Task);
+                SignalChange(jobId);
+            }
+        }
+        catch
+        {
+            cts.Dispose();
+            timeoutCts.Dispose();
+            throw;
+        }
+
         _ = Task.Run(async () =>
         {
             try { await ExecuteJobAsync(jobId, sessionId, ws, tool.Name, clonedArgs, cts, timeoutCts).ConfigureAwait(false); }
@@ -88,12 +142,17 @@ public sealed class JobManager : IDisposable
             gateAcquired = true;
 
             _db.UpdateJobStatus(jobId, "running", eventMessage: $"Executing tool '{toolName}'.");
+            SignalChange(jobId);
 
             var ctx = new ToolExecutionContext(
                 SessionId: sessionId,
                 JobId: jobId,
-                ReportProgress: msg => _db.AppendJobEvent(jobId, "progress", msg),
-                WorkspaceRoot: workspace);
+                ReportProgress: msg =>
+                {
+                    _db.AppendJobEvent(jobId, "progress", msg);
+                    SignalChange(jobId);
+                },
+                WorkspaceRoot: string.IsNullOrWhiteSpace(workspace) ? null : workspace);
 
             var result = await _registry.InvokeAsync(toolName, args, ctx, cts.Token).ConfigureAwait(false);
             var json = JsonSerializer.Serialize(result, AppConfig.JsonOptions);
@@ -135,6 +194,7 @@ public sealed class JobManager : IDisposable
         }
         finally
         {
+            SignalChange(jobId);
             if (gateAcquired)
             {
                 try { _concurrencyGate.Release(); }
@@ -151,6 +211,7 @@ public sealed class JobManager : IDisposable
         {
             try { running.Cts.Cancel(); } catch { }
             _db.AppendJobEvent(jobId, "cancel_requested", "Cancellation signal sent to job.");
+            SignalChange(jobId);
             _logger.Warn("job", $"Cancellation requested for job '{jobId}'.");
             return true;
         }
