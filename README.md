@@ -1,6 +1,6 @@
 # LocalIdeBridge
 
-> **Safety notice (2026-11-17):** RAMCA is undergoing a high-priority recovery/security audit repair. The branch `fix/audit-p0-safety-first-pass` is **not an approved release**. Read [Audit Repair Tracker](docs/AUDIT_REPAIR_TRACKER_2026-11-17.md) before attempting remote access or use on valuable workspaces.
+> **Safety notice (2026-11-17):** RAMCA has unresolved recovery and security audit findings. The audit-repair work documented in [Audit Repair Tracker](docs/AUDIT_REPAIR_TRACKER_2026-11-17.md) is **not independently validated or approved for release**. The referenced `fix/audit-p0-safety-first-pass` repair branch is not an active GitHub branch; do not assume those proposed fixes are included in `main`. Review the tracker before using RAMCA with remote access or valuable workspaces.
 
 
 **Release status:** This repository contains source code and earlier test/benchmark artifacts. Security and recovery fixes made on November 15, 2026 have **not** been rebuilt or tested on Windows. Run the validation commands below before enabling remote access. See [Fixes and validation](FIXES_AND_VALIDATION.md) and [Outstanding work](OUTSTANDING_WORK.md).
