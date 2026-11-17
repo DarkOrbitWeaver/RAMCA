@@ -171,6 +171,11 @@ public sealed class McpServer
         string negotiatedProtocol = reqProtoHeader is not null && SupportedVersions.Contains(reqProtoHeader)
             ? reqProtoHeader : DefaultProtocolVersion;
         var responses = new List<JsonObject>();
+        // Stateless modern clients frequently reuse JSON-RPC numeric IDs. IDs
+        // identify calls within a transport request, not across all clients.
+        // Legacy session-bearing clients keep their stable cancellation scope.
+        var dispatchScope = reqSessionId ??
+            (isStateless2026 ? $"stateless-{Guid.NewGuid():N}" : "http-" + ctx.Connection.Id);
 
         if (parsed is JsonArray batch)
         {
@@ -186,14 +191,14 @@ public sealed class McpServer
                     responses.Add(MakeError(null, -32600, "Batch item must be a JSON object."));
                     continue;
                 }
-                var (resp, newSid, negVer) = await DispatchMessageAsync(msgObj, isStateless2026, ct, reqSessionId ?? "http");
+                var (resp, newSid, negVer) = await DispatchMessageAsync(msgObj, isStateless2026, ct, dispatchScope);
                 if (newSid is not null) { mintedSessionId = newSid; negotiatedProtocol = negVer; }
                 if (resp is not null) responses.Add(resp);
             }
         }
         else if (parsed is JsonObject single)
         {
-            var (resp, newSid, negVer) = await DispatchMessageAsync(single, isStateless2026, ct, reqSessionId ?? "http");
+            var (resp, newSid, negVer) = await DispatchMessageAsync(single, isStateless2026, ct, dispatchScope);
             if (newSid is not null) { mintedSessionId = newSid; negotiatedProtocol = negVer; }
             if (resp is not null) responses.Add(resp);
         }
@@ -669,7 +674,9 @@ public sealed class McpServer
                     _pendingToolCalls.TryRemove(requestKey, out _);
                 }
                 var structuredNode = JsonSerializer.SerializeToNode(res, AppConfig.JsonOptions) as JsonObject ?? new JsonObject();
-                var textPayload = structuredNode.ToJsonString(AppConfig.JsonOptions);
+                // Keep MCP's interoperable text mirror, but do not pretty-print a
+                // second large copy of structured data for model-facing clients.
+                var textPayload = structuredNode.ToJsonString();
 
                 var callResult = new JsonObject
                 {
@@ -681,7 +688,7 @@ public sealed class McpServer
                             ["text"] = textPayload
                         }
                     },
-                    ["structuredContent"] = structuredNode.DeepClone(),
+                    ["structuredContent"] = structuredNode,
                     ["isError"] = !res.Success
                 };
                 return (MakeResult(idNode, callResult), null, DefaultProtocolVersion);

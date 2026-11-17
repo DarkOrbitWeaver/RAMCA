@@ -315,18 +315,40 @@ public static class BuildGitCommandTools
             Handler: async (args, _, ct) =>
             {
                 var ws = guard.RequireActiveWorkspace();
-                var statusRes = await runner.RunAsync("git", "git", ["status", "--porcelain=v1", "-b"], ws, timeoutSeconds: 20, ct: ct, stdoutCaptureLimit: 2_000_000);
+                var statusRes = await runner.RunAsync("git", "git", ["status", "--porcelain=v1", "-b", "-z"], ws, timeoutSeconds: 20, ct: ct, stdoutCaptureLimit: 2_000_000);
                 if (statusRes.ExitCode != 0)
                     return FormatCommandResult(statusRes);
 
                 if (statusRes.StdoutCaptureTruncated || statusRes.StdoutCapture is null)
                     return ToolResult.Fail("status_incomplete", "Git status output exceeded the bounded capture or was interrupted. Nothing about repository cleanliness is assumed; inspect the execution log.", new { executionId = statusRes.ExecutionId });
-                var lines = statusRes.StdoutCapture.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                    .Select(line => line.TrimEnd('\r')).ToList();
-                var branchLine = lines.FirstOrDefault(l => l.StartsWith("## ", StringComparison.Ordinal))?[3..] ?? "unknown";
-                var files = lines.Where(l => !l.StartsWith("## ", StringComparison.Ordinal) && l.Length >= 3)
-                    .Select(l => new { status = l[..2].Trim(), path = l[3..].Trim() })
-                    .ToList();
+                var fields = statusRes.StdoutCapture.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+                var branchLine = "unknown";
+                var files = new List<object>();
+                for (var i = 0; i < fields.Length; i++)
+                {
+                    var entry = fields[i].TrimEnd('\r', '\n');
+                    if (entry.StartsWith("## ", StringComparison.Ordinal))
+                    {
+                        branchLine = entry[3..];
+                        continue;
+                    }
+                    if (entry.Length < 4 || entry[2] != ' ') continue;
+                    var xy = entry[..2];
+                    var path = entry[3..]; // -z mode: unquoted, exact spaces/newlines.
+                    string? originalPath = null;
+                    if ((xy[0] is 'R' or 'C' || xy[1] is 'R' or 'C') && i + 1 < fields.Length)
+                        originalPath = fields[++i]; // -z rename outputs new path, then old.
+                    files.Add(new
+                    {
+                        status = xy.Trim(),
+                        indexStatus = xy[0].ToString(),
+                        workTreeStatus = xy[1].ToString(),
+                        staged = xy[0] is not ' ' and not '?',
+                        unstaged = xy[1] is not ' ' and not '?',
+                        path,
+                        originalPath
+                    });
+                }
 
                 var commitLimit = Math.Clamp(args.OptionalInt("recentCommits", 5), 0, 25);
                 var commits = new List<object>();

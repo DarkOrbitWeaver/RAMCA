@@ -325,6 +325,19 @@ public sealed partial class ProcessRunner
         return FindOnPath("pwsh") ?? FindOnPath("bash") ?? "/bin/sh";
     }
 
+    private static async Task<string> DrainProbeAsync(StreamReader reader)
+    {
+        var result = new StringBuilder(4096);
+        var buffer = new char[1024];
+        int read;
+        while ((read = await reader.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+        {
+            if (result.Length < 4096)
+                result.Append(buffer, 0, Math.Min(read, 4096 - result.Length));
+        }
+        return result.ToString();
+    }
+
     private static bool IsWindowsAppExecutionAlias(string path)
     {
         if (!OperatingSystem.IsWindows()) return false;
@@ -619,9 +632,19 @@ public sealed partial class ProcessRunner
                 using var proc = Process.Start(psi);
                 if (proc is not null)
                 {
-                    var outText = proc.StandardOutput.ReadToEnd();
-                    var errText = proc.StandardError.ReadToEnd();
-                    proc.WaitForExit(3000);
+                    // Drain both redirected streams concurrently; sequential
+                    // ReadToEnd blocks forever when the other pipe fills.
+                    // A probe timeout must actually terminate the child.
+                    var outTask = DrainProbeAsync(proc.StandardOutput);
+                    var errTask = DrainProbeAsync(proc.StandardError);
+                    if (!proc.WaitForExit(3000))
+                    {
+                        try { proc.Kill(entireProcessTree: true); } catch { }
+                        proc.WaitForExit(1500);
+                    }
+                    try { Task.WhenAll(outTask, errTask).Wait(TimeSpan.FromSeconds(2)); } catch { }
+                    var outText = outTask.IsCompletedSuccessfully ? outTask.Result : "";
+                    var errText = errTask.IsCompletedSuccessfully ? errTask.Result : "";
                     var combined = string.IsNullOrWhiteSpace(outText) ? errText : outText;
                     version = combined.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
                 }
