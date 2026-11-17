@@ -8,6 +8,13 @@ using Xunit;
 
 namespace LocalIdeBridge.Tests;
 
+// GC.GetTotalMemory measures the entire test process, not just this test.
+// Prevent allocations from unrelated concurrently running tests skewing the
+// bounded-memory regression check.
+[CollectionDefinition("BoundedMemorySerial", DisableParallelization = true)]
+public sealed class BoundedMemorySerialCollection { }
+
+[Collection("BoundedMemorySerial")]
 public sealed class ProtocolWorkflowAndE2ETests
 {
     [Fact]
@@ -205,7 +212,17 @@ public sealed class ProtocolWorkflowAndE2ETests
             Assert.Contains("succeeded", await jr.Content.ReadAsStringAsync());
         }
 
-        // 3. Bounded memory growth check across 500 synthetic operations.
+        // 3. Bounded *steady-state* memory growth over 500 synthetic operations.
+        // First-use JIT, serializer and SQLite initialization can inflate a cold
+        // process-wide heap snapshot without representing retained per-call memory.
+        // Warm the complete invocation path; then measure another full batch.
+        for (var i = 0; i < 500; i++)
+        {
+            var warmup = await sb.Host.Registry.InvokeAsync("read_range",
+                new JsonObject { ["path"] = "item.txt", ["startLine"] = 1, ["endLine"] = 5 });
+            Assert.True(warmup.Success);
+        }
+
         var baselineHeap = GC.GetTotalMemory(forceFullCollection: true);
         for (var i = 0; i < 500; i++)
         {
@@ -215,7 +232,8 @@ public sealed class ProtocolWorkflowAndE2ETests
         }
         var afterHeap = GC.GetTotalMemory(forceFullCollection: true);
         var growthMb = (afterHeap - baselineHeap) / (1024.0 * 1024.0);
-        Assert.True(growthMb < 8.0, $"Expected bounded live heap growth (<8 MB), measured {growthMb:F2} MB.");
+        Assert.True(growthMb < 8.0,
+            $"Expected bounded steady-state live heap growth (<8 MB over 500 calls), measured {growthMb:F2} MB.");
 
         // 4. Simulate an in-flight non-idempotent job left behind by a crash, verify shutdown & restart recovery!
         var crashedJobId = "job_simulated_crash_01";
