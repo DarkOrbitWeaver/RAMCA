@@ -123,9 +123,13 @@ public static class ContextReadTools
                                    new UTF8Encoding(false, true), detectEncodingFromByteOrderMarks: true))
                         {
                             var content = sr.ReadToEnd();
-                            lines = content.Length == 0 ? [] :
-                                content.Replace("\r\n", "\n").Replace('\r', '\n')
-                                    .TrimEnd('\n').Split('\n');
+                            if (content.Length == 0) lines = [];
+                            else
+                            {
+                                var normalized = content.Replace("\r\n", "\n").Replace('\r', '\n');
+                                var split = normalized.Split('\n');
+                                lines = normalized.EndsWith('\n') ? split[..^1] : split;
+                            }
                         }
                         if (includeVersion)
                             fileEntry["sha256"] = Convert.ToHexStringLower(SHA256.HashData(bytes));

@@ -72,12 +72,19 @@ public static partial class EditingTools
                     for (var i = 0; i < loaded.Lines.Length; i++)
                     {
                         var line = $"{i + 1,5}: {loaded.Lines[i]}";
-                        if (sb.Length + line.Length + 1 > maxChars && i > 0)
+                        var remaining = maxChars - sb.Length - (sb.Length > 0 ? 1 : 0);
+                        if (remaining <= 0) { truncated = true; break; }
+                        if (sb.Length > 0) sb.Append('\n');
+                        if (line.Length > remaining)
                         {
+                            // The first numbered line must obey the same budget
+                            // as all subsequent lines (including minified files).
+                            if (remaining > 0 && remaining < line.Length && char.IsHighSurrogate(line[remaining - 1]))
+                                remaining--;
+                            sb.Append(line.AsSpan(0, Math.Max(0, remaining)));
                             truncated = true;
                             break;
                         }
-                        if (sb.Length > 0) sb.Append('\n');
                         sb.Append(line);
                     }
                     text = sb.ToString();
