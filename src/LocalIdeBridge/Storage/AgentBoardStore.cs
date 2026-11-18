@@ -214,11 +214,21 @@ public sealed class AgentBoardStore
             if (resumeId is not null)
             {
                 if (string.IsNullOrEmpty(credential)) throw new UnauthorizedAccessException("Resume credential is required.");
-                using var existing = Cmd(conn, tx, "SELECT resume_hash FROM board_agents WHERE id=$id AND room_id=$room;",
+                using var existing = Cmd(conn, tx,
+                    "SELECT resume_hash,role FROM board_agents WHERE id=$id AND room_id=$room;",
                     ("$id", agentId), ("$room", room.Id));
-                var original = existing.ExecuteScalar() as byte[];
-                if (original is null || !CryptographicOperations.FixedTimeEquals(original, Hash(credential)))
+                byte[] original;
+                string previousRole;
+                using (var reader = existing.ExecuteReader())
+                {
+                    if (!reader.Read()) throw new UnauthorizedAccessException("Unknown agent identity.");
+                    original = (byte[])reader.GetValue(0);
+                    previousRole = reader.GetString(1);
+                }
+                if (!CryptographicOperations.FixedTimeEquals(original, Hash(credential)))
                     throw new UnauthorizedAccessException("Invalid agent identity or resume credential.");
+                if (!string.Equals(role, previousRole, StringComparison.OrdinalIgnoreCase))
+                    throw new UnauthorizedAccessException("Rejoining cannot change an agent's role.");
                 using var update = Cmd(conn, tx, """
                     UPDATE board_agents SET name=$name,role=$role,resume_hash=$hash,
                     generation=generation+1,last_seen_at=$now WHERE id=$id AND room_id=$room;
@@ -228,6 +238,14 @@ public sealed class AgentBoardStore
             }
             else
             {
+                if (role.Equals("coordinator", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var occupied = Cmd(conn, tx,
+                        "SELECT COUNT(1) FROM board_agents WHERE room_id=$room AND lower(role)='coordinator';",
+                        ("$room", room.Id));
+                    if (Convert.ToInt64(occupied.ExecuteScalar()) > 0)
+                        throw new UnauthorizedAccessException("This room already has a coordinator. Resume that identity instead.");
+                }
                 using var create = Cmd(conn, tx, """
                     INSERT INTO board_agents(id,room_id,name,role,resume_hash,generation,last_seen_at)
                     VALUES($id,$room,$name,$role,$hash,1,$now);
