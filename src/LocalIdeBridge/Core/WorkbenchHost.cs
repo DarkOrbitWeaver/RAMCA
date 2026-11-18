@@ -25,6 +25,7 @@ public sealed class WorkbenchHost : IAsyncDisposable
     public CredentialStore Credentials { get; }
     public RedactingLogger Logger { get; }
     public StateDatabase Database { get; }
+    public AgentBoardStore Board { get; }
     public LogStore Logs { get; }
     public WorkspaceGuard Guard { get; }
     public ChildProcessSupervisor ProcessSupervisor { get; }
@@ -79,6 +80,8 @@ public sealed class WorkbenchHost : IAsyncDisposable
             Guard = new WorkspaceGuard(Paths, Config);
             Database = new StateDatabase(Paths, Credentials, Config.Retention);
             RecoveredInterruptedItems = Database.Initialize(Guard.ActiveWorkspace ?? "", deferPruning: true);
+            Board = new AgentBoardStore(Paths, Credentials);
+            Board.Initialize();
             // Crash recovery is resolved before any command or network tool is exposed.
             // Unknown third-party changes intentionally block startup instead of being overwritten.
             EditingTools.RecoverPendingPatchTransactions(Paths, Guard, Database);
@@ -108,6 +111,7 @@ public sealed class WorkbenchHost : IAsyncDisposable
             Registry.RegisterRange(BuildGitCommandTools.Create(Paths, Config, Guard, Database, Logs, Runner, ProcessSupervisor));
             Registry.RegisterRange(JobAndWorkflowTools.Create(Guard, Database, Jobs, Workflows));
             Registry.RegisterRange(OperationLedgerTools.Create(Guard, Database, Registry));
+            Registry.RegisterRange(AgentBoardTools.Create(Guard, Board, Database));
 
             Instructions = new ConnectionInstructions(Config, Guard, Registry, Tunnel);
             Mcp = new McpServer(Config, Guard, Database, Registry, Instructions, Logger);
