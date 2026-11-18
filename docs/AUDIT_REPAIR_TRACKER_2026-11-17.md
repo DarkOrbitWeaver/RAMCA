@@ -2,7 +2,7 @@
 
 **Baseline audited:** `1fc09f17b3d2410a265a24f5c5469a0489d8867f`  
 **Source of findings:** uploaded `ramca-audit-1fc09f1.zip`, findings F-001 through F-038.  
-**Repair state:** working source on draft PR; **NOT RELEASED OR VALIDATED.**
+**Repair state (2026-11-18):** subsequent source repairs are being committed directly on `main` per owner policy; **NOT RELEASED OR VALIDATED**. The statuses below describe the original audit pass and must be reconciled against the current source before sign-off.
 
 The auditor's **5.6/10** was a rating of the original source, not the quality of the audit or a judgment of its author. Reported severity is guidance, not a substitute for verification.
 
@@ -11,11 +11,11 @@ The auditor's **5.6/10** was a rating of the original source, not the quality of
 - Never install or remotely expose this branch as a trusted tool bridge based on source changes alone.
 - Every destructive regression must be exercised against **disposable** repositories and large/test fixtures.
 - Require Windows .NET 10 clean restore, build, test, actual Windows 11 process/job tests, power-interruption simulation, authentic MCP client tests, secret handling and remote-access validation.
-- Keep `main` unchanged until all release blockers have passed; commit reviewed changes to draft PR, not to stable default.
+- Owner policy is `main` only, with small descriptive commits; no branches or worktrees without explicit authorization. Still require all release blockers to pass before deploying the portable binary.
 - A disconnected webchat cannot automatically resume a model's internal reasoning: RAMCA can only preserve durable local execution state and produce handoff briefs.
 - No tool can mathematically guarantee never losing data on uncontrolled hardware or arbitrary administrator-level shell code. Protect through backups, fail-closed operations, narrow permissions and independent restore tests.
 
-## Engineering changes in this repair branch
+## Historical engineering changes in the audit-repair source
 
 1. Host lock before database recovery and temp cleanup; lightweight connection-instructions path; invalid CLI workspace overrides rejected.
 2. File mutations: rename overwrite rejected; destructive worktree `--force` removed; large unbacked deletes refused even if `allowIrreversible=true`.
