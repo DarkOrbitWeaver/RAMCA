@@ -29,7 +29,7 @@ public static class AgentBoardTools
             [
                 new("room", "string", "Project room name (or an existing roomId).", Required: true),
                 new("name", "string", "Short agent name, such as Engine, UI, Reviewer or Lead.", Required: true),
-                new("role", "string", "Agent role, such as worker, reviewer or coordinator.", Required: true),
+                new("role", "string", "Agent role for direct joins: worker, reviewer or coordinator. Omit when using inviteCode."),
                 new("agentId", "string", "Existing agentId to resume (omit for a new identity)."),
                 new("credential", "string", "Existing scoped agent credential required when resuming."),
                 new("inviteCode", "string", "Optional one-time coordinator invitation for new or replacement agent.")
