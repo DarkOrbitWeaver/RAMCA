@@ -396,7 +396,7 @@ public sealed class AgentBoardStore
             {
                 using var update = Cmd(conn, tx, """
                     UPDATE board_agents SET name=$name,resume_hash=$hash,generation=generation+1,last_seen_at=$now
-                    WHERE id=$id AND room_id=$room AND role=$role;
+                    WHERE id=$id AND room_id=$room AND lower(role)=lower($role);
                     """, ("$name", name), ("$hash", Hash(nextSecret)), ("$now", Utc()),
                     ("$id", id), ("$room", room.Id), ("$role", role));
                 if (update.ExecuteNonQuery() != 1)
