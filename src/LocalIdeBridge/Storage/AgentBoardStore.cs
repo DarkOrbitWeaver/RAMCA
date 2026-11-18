@@ -540,6 +540,18 @@ public sealed class AgentBoardStore
     /// Task transitions are compare-and-swap operations. Expired leases are NOT silently
     /// stolen: a coordinator must inspect the workspace and explicitly release/reassign.
     /// </summary>
+    public BoardTask RequireActiveClaim(BoardRoom room, string agentId, string credential, string taskId)
+    {
+        using var conn = Open();
+        var agent = ValidateAgent(conn, null, room.Id, agentId, credential);
+        var task = ReadTaskById(conn, null, room.Id, taskId);
+        if (task.Status != "in_progress" || task.OwnerId != agent.Id ||
+            task.OwnerGeneration != agent.Generation || task.LeaseUntil <= DateTimeOffset.UtcNow)
+            throw new UnauthorizedAccessException(
+                "This task is not claimed by your current attachment with an active lease. Sync and reconcile before editing.");
+        return task;
+    }
+
     public BoardTask ChangeTask(BoardRoom room, string agentId, string credential,
         string taskId, string action, long expectedRevision, string? evidence = null,
         string? assigneeId = null, int leaseMinutes = 15)
