@@ -142,6 +142,10 @@ public sealed class ToolRegistry
         {
             result = ToolResult.Fail("not_found", _credentials.Redact(ex.Message));
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            result = ToolResult.Fail("authorization_required", _credentials.Redact(ex.Message));
+        }
         catch (OperationCanceledException)
         {
             result = ToolResult.Fail("cancelled", $"Tool '{tool.Name}' was cancelled.");
