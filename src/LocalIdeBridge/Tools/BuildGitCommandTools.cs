@@ -73,7 +73,7 @@ public static class BuildGitCommandTools
             Category: "build",
             Description: "Builds a .NET project or solution inside the trusted workspace and returns structured compiler diagnostics plus log retrieval reference.",
             IsReadOnly: false,
-            IsIdempotent: true,
+            IsIdempotent: false,
             SideEffects: "Compiles build outputs inside the workspace.",
             Parameters:
             [
@@ -118,7 +118,7 @@ public static class BuildGitCommandTools
             Category: "build",
             Description: "Invokes MSBuild (standalone Visual Studio MSBuild when installed, or 'dotnet msbuild' fallback) with structured compiler diagnostics.",
             IsReadOnly: false,
-            IsIdempotent: true,
+            IsIdempotent: false,
             SideEffects: "Executes MSBuild targets inside the workspace.",
             Parameters:
             [
@@ -153,7 +153,7 @@ public static class BuildGitCommandTools
             Category: "test",
             Description: "Runs 'dotnet test' with TRX structured reporting, returning exact total, passed, failed, skipped counts, failure stack traces, and log retrieval ID.",
             IsReadOnly: false,
-            IsIdempotent: true,
+            IsIdempotent: false,
             SideEffects: "Builds (unless noBuild=true) and runs tests in workspace; writes temporary TRX inside LocalIdeBridge/temp.",
             Parameters:
             [
@@ -522,7 +522,7 @@ public static class BuildGitCommandTools
             Category: "git",
             Description: "Stages specified workspace files (or all modified/new files when all=true) into the local Git index.",
             IsReadOnly: false,
-            IsIdempotent: true,
+            IsIdempotent: false,
             SideEffects: "Updates local .git/index.",
             Parameters:
             [
@@ -669,7 +669,7 @@ public static class BuildGitCommandTools
             Category: "git",
             Description: "Records the current local Git HEAD commit and branch as a durable named session checkpoint (or lists existing checkpoints).",
             IsReadOnly: false,
-            IsIdempotent: true,
+            IsIdempotent: false,
             SideEffects: "Persists a checkpoint record in data/state.db.",
             Parameters:
             [
