@@ -12,7 +12,7 @@ namespace LocalIdeBridge.Tools;
 public static class AgentBoardTools
 {
     public static IEnumerable<ToolDefinition> Create(WorkspaceGuard guard, AgentBoardStore board,
-        StateDatabase database)
+        StateDatabase database, ToolRegistry registry)
     {
         BoardRoom Room(JsonObject args) => board.RequireRoom(args.RequireString("roomId"),
             guard.RequireActiveWorkspace());
@@ -268,6 +268,99 @@ public static class AgentBoardTools
                 return Task.FromResult(ToolResult.Ok("Copy-ready agent handoff created from durable RAMCA records.",
                     new { prompt, roomId = room.Id, agentId = agent.Id,
                         acknowledgedCursor = acknowledged, pinCount = pins.Count, taskCount = tasks.Count }));
+            });
+
+        yield return new ToolDefinition(
+            Name: "board_work", Category: "board",
+            Description: "Run one agent task action under its current lease and RAMCA workspace write lock. Use execute_once around board_work for edits/commits if a response may be lost.",
+            IsReadOnly: false, IsIdempotent: false,
+            SideEffects: "Can edit, build, run commands or create a scoped Git commit, using the same host tool policies as direct tools.",
+            Parameters:
+            [
+                new("roomId", "string", "Room ID.", Required: true),
+                new("agentId", "string", "Current agent ID.", Required: true),
+                new("credential", "string", "Current scoped agent credential.", Required: true),
+                new("taskId", "string", "Currently claimed task ID.", Required: true),
+                new("tool", "string", "One engineering tool to invoke under task ownership.", Required: true),
+                new("arguments", "object", "Ordinary arguments for the selected engineering tool.", Required: true)
+            ],
+            Handler: async (args, ctx, ct) =>
+            {
+                var room = Room(args);
+                var agentId = args.RequireString("agentId");
+                var credential = args.RequireString("credential");
+                var taskId = args.RequireString("taskId");
+                var toolName = args.RequireString("tool");
+
+                // Keep this list small. Arbitrary workflows, pushes and branch changes
+                // should never be smuggled through a task claim.
+                var allowed = toolName is
+                    "create_file" or "replace_range" or "apply_patch" or "rename_file" or
+                    "delete_file" or "revert_edit" or "dotnet_build" or "dotnet_test" or
+                    "msbuild_run" or "run_command" or "git_commit";
+                if (!allowed || registry.Find(toolName) is null)
+                    return ToolResult.Fail("board_tool_denied",
+                        "This tool is not supported by board_work. Use direct read-only tools for inspection; branch changes, pushes, nested jobs and workflow launches are not allowed.");
+
+                if (args["arguments"] is not JsonObject inner)
+                    return ToolResult.Fail("invalid_arguments", "arguments must be an object.");
+
+                // Claim transitions take this same workspace lock. A task cannot be
+                // reassigned while one of its board_work operations is in progress.
+                using var writeLock = await guard.AcquireWriteLockAsync(room.Workspace, ct).ConfigureAwait(false);
+                var task = board.RequireActiveClaim(room, agentId, credential, taskId);
+
+                var gitHead = Path.Combine(room.Workspace, ".git", "HEAD");
+                if (!File.Exists(gitHead) ||
+                    !string.Equals(File.ReadAllText(gitHead).Trim(),
+                        "ref: refs/heads/main", StringComparison.Ordinal))
+                    return ToolResult.Fail("main_only", "Agent board writes require an ordinary Git checkout on main.");
+
+                if (toolName == "git_commit")
+                {
+                    if (inner.OptionalBool("stageAll", false) || inner.OptionalBool("allowPreviouslyStaged", false) ||
+                        inner.OptionalStringList("paths").Count == 0)
+                        return ToolResult.Fail("commit_scope_required",
+                            "Agent commits require explicit file paths and cannot include unrelated staged work.");
+                }
+
+                if (!string.IsNullOrWhiteSpace(task.WorkArea))
+                {
+                    var area = guard.ResolvePath(task.WorkArea, forWrite: true);
+                    string[] pathFields = toolName switch
+                    {
+                        "create_file" or "replace_range" or "delete_file" => ["path"],
+                        "rename_file" => ["sourcePath", "destinationPath"],
+                        "git_commit" => [],
+                        _ => []
+                    };
+                    foreach (var field in pathFields)
+                    {
+                        var full = guard.ResolvePath(inner.RequireString(field), forWrite: true);
+                        if (!WorkspaceGuard.IsEqualOrInside(full, area))
+                            return ToolResult.Fail("outside_task_area",
+                                $"'{field}' is outside the task's work area '{task.WorkArea}'.");
+                    }
+                    if (toolName == "git_commit")
+                    {
+                        foreach (var path in inner.OptionalStringList("paths"))
+                        {
+                            var full = guard.ResolvePath(path, forWrite: true);
+                            if (!WorkspaceGuard.IsEqualOrInside(full, area))
+                                return ToolResult.Fail("outside_task_area",
+                                    $"Commit path '{path}' is outside the task's work area.");
+                        }
+                    }
+                    if (toolName is "apply_patch" or "revert_edit" or "run_command")
+                        return ToolResult.Fail("unscoped_tool",
+                            "This operation cannot be confined to a task work area. Use narrowly scoped edits or a task without a restricted work area.");
+                }
+
+                // Inner tools must not reacquire the same non-reentrant write lock.
+                var result = await registry.InvokeAsync(toolName, (JsonObject)inner.DeepClone(),
+                    new ToolExecutionContext(ctx.SessionId, ctx.JobId, ctx.ReportProgress,
+                        SkipWriteLock: true, WorkspaceRoot: room.Workspace), ct).ConfigureAwait(false);
+                return result;
             });
     }
 }
