@@ -1118,29 +1118,88 @@ public sealed class SupervisorTui
         var workspace = _host.Guard.ActiveWorkspace;
         if (workspace is null)
         {
-            _statusBanner = "Select a trusted workspace before inviting an agent.";
+            _statusBanner = "Select a trusted workspace first.";
             return;
         }
+
         var rooms = _host.Board.ListRooms(workspace);
         if (rooms.Count == 0)
         {
-            _statusBanner = "Create a room using board_join from a connected agent first.";
+            _statusBanner = "Press C in Board to create a room first.";
             return;
         }
+
         var room = rooms[Math.Min(_scrollOffset, rooms.Count - 1)];
-        var invitation =
-            $"Join my RAMCA room '{room.Name}' for workspace '{room.Workspace}'.\n" +
-            $"Room ID: {room.Id}\n" +
-            "First connect to my RAMCA tools using your own supported ChatGPT MCP connection.\n" +
-            "Call board_join with this room ID, your name and worker/reviewer/coordinator role; " +
-            "save the returned scoped credential privately. Then call board_sync. " +
-            "Read the pins, tasks and messages before claiming work.\n" +
-            "Work directly on main, never create branches/worktrees, make distinct descriptive commits, " +
-            "and post your test/commit evidence and progress to the board.\n" +
-            "RAMCA queues messages; an inactive webchat will not act until it reconnects and calls board_sync.";
-        var (copied, _) = ConnectionInstructions.TryCopyToClipboard(invitation);
-        _statusBanner = copied ? $"Copied invitation for '{room.Name}' (no secrets)."
-            : "Could not copy invite; check clipboard access.";
+        var agents = _host.Board.ListAgents(room, 100);
+        var coordinator = agents.FirstOrDefault(a => a.Role == "coordinator");
+        Console.Write("\x1b[?25h\x1b[2J\x1b[H");
+        try
+        {
+            Console.WriteLine($"Invite a ChatGPT chat into '{room.Name}'");
+            Console.WriteLine("This creates a private, single-use code. The chat still needs its own RAMCA connection.");
+            foreach (var agent in agents)
+                Console.WriteLine($"  {agent.Name} ({agent.Role}): {agent.Id}");
+            Console.Write("Name for this chat (blank = cancel): ");
+            var name = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(name)) return;
+
+            string role;
+            string? targetId = null;
+            if (coordinator is null)
+            {
+                role = "coordinator";
+                Console.WriteLine("No coordinator exists. This invitation creates the coordinator.");
+            }
+            else
+            {
+                Console.Write("Replace existing agent ID (blank = new worker): ");
+                targetId = Console.ReadLine()?.Trim();
+                if (string.IsNullOrWhiteSpace(targetId)) targetId = null;
+
+                if (targetId is null)
+                {
+                    Console.Write("Role (worker/reviewer, default worker): ");
+                    role = Console.ReadLine()?.Trim().ToLowerInvariant() is "reviewer"
+                        ? "reviewer" : "worker";
+                }
+                else
+                {
+                    var replaced = agents.FirstOrDefault(a => a.Id == targetId);
+                    if (replaced is null)
+                    {
+                        _statusBanner = "The agent ID does not belong to this room.";
+                        return;
+                    }
+                    role = replaced.Role;
+                }
+            }
+
+            var invite = _host.Board.CreateOwnerInvitation(room, targetId, role, 7);
+            var prompt =
+                $"You are '{name}', the {invite.Role} for RAMCA room '{room.Name}'.\n" +
+                $"Workspace: {room.Workspace}\n" +
+                "Connect your own RAMCA tools first; this prompt alone cannot connect to the PC.\n" +
+                $"Call board_join with room='{room.Id}', name='{name}', " +
+                $"inviteCode='{invite.Code}'.\n" +
+                "Keep your returned scoped credential private. Then board_sync with includeSnapshot=true.\n" +
+                "Read pinned decisions and messages, inspect current Git state and claim/adopt a task before editing.\n" +
+                "Only work on main; never make branches or worktrees. Use scoped descriptive commits and HUMANIFY.\n" +
+                "Post blockers and task evidence to the room. Inactive chats only see updates on their next sync.\n" +
+                $"This invitation expires {invite.ExpiresAt:yyyy-MM-dd} and works once.";
+            var (copied, _) = ConnectionInstructions.TryCopyToClipboard(prompt);
+            _statusBanner = copied
+                ? $"Private one-use invitation for '{name}' copied. Do not share it publicly."
+                : "Invitation created but could not be copied. Generate another if necessary.";
+        }
+        catch (Exception ex) when (ex is ArgumentException or KeyNotFoundException
+                                      or UnauthorizedAccessException or InvalidOperationException or IOException)
+        {
+            _statusBanner = $"Invite not created: {ex.Message}";
+        }
+        finally
+        {
+            Console.Write("\x1b[?25l");
+        }
     }
 
     private void AddBoardRows(List<UiLine> lines, int count, int width)
