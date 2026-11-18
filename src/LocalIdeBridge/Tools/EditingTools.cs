@@ -362,15 +362,22 @@ public static partial class EditingTools
             {
                 var ws = guard.RequireActiveWorkspace();
                 var patchText = args.RequireRawString("patch");
+                if (patchText.Length > 1_000_000)
+                    return Task.FromResult(ToolResult.Fail("patch_too_large",
+                        "Patch exceeds the 1,000,000-character limit; split it into smaller reviewed transactions."));
                 var expectedSha = args.OptionalString("expectedSha256");
 
                 var filePatches = ParseUnifiedDiff(patchText);
+                if (filePatches.Count > 32)
+                    return Task.FromResult(ToolResult.Fail("too_many_patch_files",
+                        "A single patch transaction may change at most 32 files."));
                 if (filePatches.Count == 0)
                     return Task.FromResult(ToolResult.Fail("invalid_patch", "No valid unified diff file hunks found. Include --- a/file, +++ b/file, and @@ -l,c +l,c @@ headers."));
 
                 // A patch is a transaction, not a series of unrelated writes. Reject ambiguous
                 // file headers / repeated paths, compute all outputs, and preserve every source.
                 var staged = new List<(string RelPath, string FullPath, string Op, LoadedTextFile? Before, string? NewContent, Encoding Enc, int Added, int Removed)>();
+                long stagedBytes = 0;
                 var seen = new HashSet<string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
                 if (args["expectedSha256Map"] is not null && args["expectedSha256Map"] is not JsonObject)
                     return Task.FromResult(ToolResult.Fail("invalid_arguments", "expectedSha256Map must be a JSON object."));
@@ -432,6 +439,10 @@ public static partial class EditingTools
                         if (!File.Exists(full))
                             return Task.FromResult(ToolResult.Fail("not_found", $"File '{cleanRel}' does not exist."));
                         var before = LoadTextFile(full);
+                        stagedBytes += before.SizeBytes;
+                        if (stagedBytes > 64L * 1024 * 1024)
+                            return Task.FromResult(ToolResult.Fail("patch_source_budget",
+                                "Patch source files exceed the 64 MiB staging limit; split the operation."));
                         var requiredSha = filePatches.Count == 1 ? expectedSha : null;
                         if (normalizedMap.TryGetValue(cleanRel, out var mapHash))
                             requiredSha = mapHash;
@@ -463,17 +474,29 @@ public static partial class EditingTools
                 var journalEntries = new List<EditJournalRecord>();
                 var totalAdded = 0;
                 var totalRemoved = 0;
-                foreach (var item in staged)
+                try
                 {
-                    var editId = NewEditId();
-                    var backup = item.Before is null ? null : SaveBackupBytes(paths, ctx.SessionId, editId, item.FullPath);
-                    var proposedHash = item.Op == "patch_delete" ? "deleted" :
-                        Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(EncodeText(item.NewContent!, item.Enc)));
-                    tx.Items.Add(new PatchTransactionItem
+                    foreach (var item in staged)
                     {
-                        RelativePath = item.RelPath, EditId = editId, BackupPath = backup,
-                        BeforeHash = item.Before?.Sha256 ?? "none", AfterHash = proposedHash
-                    });
+                        var editId = NewEditId();
+                        var backup = item.Before is null ? null : SaveBackupBytes(paths, ctx.SessionId, editId, item.FullPath);
+                        var proposedHash = item.Op == "patch_delete" ? "deleted" :
+                            Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(EncodeText(item.NewContent!, item.Enc)));
+                        tx.Items.Add(new PatchTransactionItem
+                        {
+                            RelativePath = item.RelPath, EditId = editId, BackupPath = backup,
+                            BeforeHash = item.Before?.Sha256 ?? "none", AfterHash = proposedHash
+                        });
+                    }
+                }
+                catch
+                {
+                    // No workspace mutation has begun. Do not leave orphaned snapshots
+                    // when a later file cannot be backed up.
+                    foreach (var item in tx.Items)
+                        if (item.BackupPath is { } backup)
+                            try { File.Delete(backup); } catch (IOException) { }
+                    throw;
                 }
                 var txPath = GetTransactionPath(paths, tx.Id);
                 PortablePaths.AtomicWriteAllText(txPath, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
