@@ -334,6 +334,12 @@ public sealed class AgentBoardStore
                     "Room already has a coordinator. Replace that agent instead of creating a second one.");
         }
 
+        // Used or expired codes have no role in long-term agent history.
+        using (var cleanup = Cmd(conn, tx, """
+            DELETE FROM board_invites WHERE used_at IS NOT NULL OR expires_at<$now;
+            """, ("$now", Utc())))
+            cleanup.ExecuteNonQuery();
+
         var code = NewSecret();
         var expires = DateTimeOffset.UtcNow.AddDays(Math.Clamp(days, 1, 30));
         using var save = Cmd(conn, tx, """
