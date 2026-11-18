@@ -1134,6 +1134,28 @@ public sealed class StateDatabase : IDisposable
         return list;
     }
 
+    public IReadOnlyList<GitCheckpointRecord> ListWorkspaceGitCheckpoints(string workspace, int limit = 10)
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, session_id, workspace, branch, commit_sha, label, created_at
+            FROM git_checkpoints WHERE workspace = $ws
+            ORDER BY created_at DESC LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$ws", workspace);
+        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 100));
+        var list = new List<GitCheckpointRecord>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            list.Add(new GitCheckpointRecord(reader.GetString(0), reader.GetString(1),
+                reader.GetString(2), reader.GetString(3), reader.GetString(4),
+                reader.GetString(5), DateTimeOffset.Parse(reader.GetString(6))));
+        }
+        return list;
+    }
+
     public void SaveWorkflow(WorkflowRecord wf)
     {
         var safeJson = _credentials.Redact(wf.StateJson);
