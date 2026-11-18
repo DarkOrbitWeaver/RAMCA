@@ -175,6 +175,7 @@ public static class AgentBoardTools
                 new("title", "string", "Task title for create."),
                 new("details", "string", "Task acceptance criteria and requirements for create."),
                 new("workArea", "string", "Advisory file/subsystem scope for create."),
+                new("requestId", "string", "Stable unique request ID for task creation. Retain on retry."),
                 new("taskId", "string", "Task ID for a mutation."),
                 new("expectedRevision", "integer", "Revision returned by board_sync; required for mutations."),
                 new("evidence", "string", "Concise commit/test/blocker evidence."),
@@ -198,7 +199,8 @@ public static class AgentBoardTools
                 BoardTask task;
                 if (action == "create")
                     task = board.CreateTask(room, id, secret,
-                        args.RequireString("title"), args.RequireString("details"), args.OptionalString("workArea"));
+                        args.RequireString("title"), args.RequireString("details"), args.OptionalString("workArea"),
+                        args.RequireString("requestId"));
                 else
                 {
                     var revision = args.OptionalLong("expectedRevision", 0);
