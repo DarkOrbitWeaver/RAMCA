@@ -584,12 +584,49 @@ public sealed class AgentBoardStore
         return list;
     }
 
+    private static string WorkAreaPath(BoardRoom room, string? workArea)
+    {
+        if (string.IsNullOrWhiteSpace(workArea))
+            return room.Workspace;
+        if (Path.IsPathRooted(workArea))
+            throw new ArgumentException("Task work area must be relative to the workspace.");
+
+        var full = Path.GetFullPath(Path.Combine(room.Workspace, workArea));
+        if (!WorkspaceGuard.IsEqualOrInside(full, room.Workspace))
+            throw new ArgumentException("Task work area cannot escape the trusted workspace.");
+        return full;
+    }
+
+    private static void EnsureClaimDoesNotOverlap(SqliteConnection conn, SqliteTransaction tx,
+        BoardRoom room, BoardTask task)
+    {
+        var requested = WorkAreaPath(room, task.WorkArea);
+        using var query = Cmd(conn, tx, """
+            SELECT t.id,t.work_area
+            FROM board_tasks t JOIN board_rooms r ON r.id=t.room_id
+            WHERE r.workspace=$workspace AND t.status='in_progress'
+                AND t.id<>$task;
+            """, ("$workspace", room.Workspace), ("$task", task.Id));
+        using var reader = query.ExecuteReader();
+        while (reader.Read())
+        {
+            var other = reader.GetString(0);
+            var area = reader.IsDBNull(1) ? null : reader.GetString(1);
+            var existing = WorkAreaPath(room, area);
+            if (WorkspaceGuard.IsEqualOrInside(requested, existing) ||
+                WorkspaceGuard.IsEqualOrInside(existing, requested))
+                throw new InvalidOperationException(
+                    $"Task work area conflicts with in-progress task {other}. Review and release that task before taking ownership.");
+        }
+    }
+
     public BoardTask CreateTask(BoardRoom room, string agentId, string credential,
         string title, string details, string? workArea, string requestId)
     {
         title = Required(title, "Task title", 180);
         details = _secrets.Redact(Required(details, "Task details", 4000));
         workArea = string.IsNullOrWhiteSpace(workArea) ? null : Required(workArea, "Work area", 240);
+        _ = WorkAreaPath(room, workArea);
         requestId = Required(requestId, "Task request ID", 128);
         var inputHash = Convert.ToHexStringLower(Hash(title + "\0" + details + "\0" + workArea));
         lock (_writes)
@@ -715,6 +752,7 @@ public sealed class AgentBoardStore
                 case "claim":
                     if (status != "open" || owner is not null)
                         throw new InvalidOperationException("Task already claimed or not open; do not steal an expired lease.");
+                    EnsureClaimDoesNotOverlap(conn, tx, room, current);
                     status = "in_progress"; owner = agentId; generation = agent.Generation;
                     lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
                     break;
@@ -755,6 +793,7 @@ public sealed class AgentBoardStore
                     break;
                 case "assign":
                     if (!coordinator) throw new UnauthorizedAccessException("Only the coordinator can assign tasks.");
+                    EnsureClaimDoesNotOverlap(conn, tx, room, current);
                     if (string.IsNullOrWhiteSpace(assigneeId))
                         throw new ArgumentException("assigneeId is required for assign.");
                     using (var target = Cmd(conn, tx,
