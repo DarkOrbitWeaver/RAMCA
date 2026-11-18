@@ -47,7 +47,7 @@ public static class AgentBoardTools
                     room, agent,
                     credential = secret,
                     warning = "Save this scoped credential privately for board calls and future reattachment. It is not the RAMCA master key. Rejoining rotates it.",
-                    next = "Call board_sync with roomId, agentId and credential; review pinned decisions and task claims before editing."
+                    next = "Call board_sync with includeSnapshot=true, roomId, agentId and credential; review pins and tasks before editing."
                 }));
             });
 
@@ -62,7 +62,8 @@ public static class AgentBoardTools
                 new("credential", "string", "Scoped credential returned by board_join.", Required: true),
                 new("after", "integer", "Last processed event sequence; 0 starts at the beginning.", Default: 0),
                 new("limit", "integer", "Max events in the page, 1..100.", Default: 25),
-                new("taskOffset", "integer", "Task pagination offset.", Default: 0)
+                new("taskOffset", "integer", "Task pagination offset.", Default: 0),
+                new("includeSnapshot", "boolean", "Include task, pin and agent lists. Use true on first join; omit for quick subsequent event polling.", Default: false)
             ],
             Handler: (args, _, _) =>
             {
@@ -74,9 +75,11 @@ public static class AgentBoardTools
                 var (events, hasMore) = board.ReadEvents(room, after, limit,
                     agent.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase) ? null : agent.Id);
                 var next = events.Count == 0 ? after : events[^1].Sequence;
-                var tasks = board.ListTasks(room, 40, args.OptionalInt("taskOffset", 0));
-                var pins = board.ListPins(room, 40);
-                var members = board.ListAgents(room, 40);
+                var includeSnapshot = args.OptionalBool("includeSnapshot", false);
+                IReadOnlyList<BoardTask> tasks = includeSnapshot
+                    ? board.ListTasks(room, 40, args.OptionalInt("taskOffset", 0)) : [];
+                IReadOnlyList<BoardPin> pins = includeSnapshot ? board.ListPins(room, 40) : [];
+                IReadOnlyList<BoardAgent> members = includeSnapshot ? board.ListAgents(room, 40) : [];
                 var acknowledged = board.GetAcknowledged(room, agent.Id);
                 return Task.FromResult(ToolResult.Ok(
                     $"Room '{room.Name}': {events.Count} event(s), {tasks.Count} task(s), {pins.Count} pin(s).",
@@ -85,9 +88,33 @@ public static class AgentBoardTools
                         room, agent, events, nextCursor = next, hasMore,
                         acknowledgedCursor = acknowledged,
                         tasks, taskOffset = Math.Max(0, args.OptionalInt("taskOffset", 0)),
-                        pins, agents = members,
-                        note = "Events are delivered by polling, not pushed into dormant chats. Call board_ack after processing a page."
+                        pins, agents = members, snapshotIncluded = includeSnapshot,
+                        note = "Events arrive through active tool calls only. Call board_ack after processing a page."
                     }));
+            });
+
+        yield return new ToolDefinition(
+            Name: "board_wait", Category: "board",
+            Description: "Wait up to 20 seconds for a new room event without polling. Only an active connected agent can call this; dormant webchats remain idle.",
+            IsReadOnly: true, IsIdempotent: true, SideEffects: "None.",
+            Parameters:
+            [
+                new("roomId", "string", "Room ID.", Required: true),
+                new("agentId", "string", "Agent ID.", Required: true),
+                new("credential", "string", "Scoped credential.", Required: true),
+                new("after", "integer", "Last event sequence processed.", Default: 0),
+                new("waitMs", "integer", "Maximum waiting time in milliseconds, 1..20000.", Default: 15000)
+            ],
+            Handler: async (args, _, ct) =>
+            {
+                var room = Room(args);
+                Agent(args, room);
+                var after = Math.Max(0, args.OptionalLong("after", 0));
+                var waitMs = Math.Clamp(args.OptionalInt("waitMs", 15000), 1, 20_000);
+                var changed = await board.WaitForEventsAsync(room, after, waitMs, ct).ConfigureAwait(false);
+                return ToolResult.Ok(changed ? "New board events are available." : "No new board events.",
+                    new { changed, latestCursor = board.LatestSequence(room),
+                        next = changed ? "Call board_sync with your last event cursor." : "No action required." });
             });
 
         yield return new ToolDefinition(
