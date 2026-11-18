@@ -822,6 +822,124 @@ public static partial class EditingTools
             });
 
         yield return new ToolDefinition(
+            Name: "revert_rename",
+            Category: "editing",
+            Description: "Undo a verified rename as one crash-recoverable operation using the paired edit IDs returned by rename_file.",
+            IsReadOnly: false,
+            IsIdempotent: false,
+            SideEffects: "Restores the original path and removes the renamed copy, with linked reversible audit entries.",
+            Parameters:
+            [
+                new("sourceEditId", "string", "Source edit ID returned by rename_file.", Required: true),
+                new("destinationEditId", "string", "Destination edit ID returned by rename_file.", Required: true)
+            ],
+            Handler: (args, ctx, _) =>
+            {
+                var ws = guard.RequireActiveWorkspace();
+                var originalSourceId = args.RequireString("sourceEditId");
+                var originalDestinationId = args.RequireString("destinationEditId");
+                var srcEdit = db.GetEdit(originalSourceId);
+                var dstEdit = db.GetEdit(originalDestinationId);
+                if (srcEdit is null || dstEdit is null ||
+                    srcEdit.Operation != "rename_source" ||
+                    dstEdit.Operation != "rename_destination" ||
+                    srcEdit.Reverted || dstEdit.Reverted ||
+                    srcEdit.CreatedAtUtc != dstEdit.CreatedAtUtc ||
+                    srcEdit.SessionId != dstEdit.SessionId ||
+                    srcEdit.Workspace != ws || dstEdit.Workspace != ws ||
+                    srcEdit.AfterSha256 != "deleted" ||
+                    dstEdit.BeforeSha256 != "none" ||
+                    !string.Equals(srcEdit.BeforeSha256, dstEdit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                    return Task.FromResult(ToolResult.Fail("invalid_rename_pair",
+                        "Rename edit pair is missing, unrelated, already reverted or from another workspace."));
+
+                var src = guard.ResolvePath(srcEdit.RelativePath, forWrite: true);
+                var dst = guard.ResolvePath(dstEdit.RelativePath, forDelete: true);
+                if (File.Exists(src) || !File.Exists(dst))
+                    return Task.FromResult(ToolResult.Fail("undo_conflict",
+                        "Original path is already occupied or the renamed file no longer exists."));
+                if (!string.Equals(ComputeFileSha256(dst), dstEdit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                    return Task.FromResult(ToolResult.Fail("undo_conflict",
+                        "Renamed file was modified after the move; refusing to overwrite newer work."));
+
+                var sourceInverseId = NewEditId();
+                var destinationInverseId = NewEditId();
+                var destBackup = SaveBackupBytes(paths, ctx.SessionId, destinationInverseId, dst);
+                var tx = new PatchTransaction
+                {
+                    Id = $"patch_{Guid.NewGuid():N}", Workspace = ws, SessionId = ctx.SessionId,
+                    Items =
+                    [
+                        new PatchTransactionItem
+                        {
+                            RelativePath = srcEdit.RelativePath, EditId = sourceInverseId,
+                            BeforeHash = "none", AfterHash = dstEdit.AfterSha256,
+                            RevertsOriginalEditId = originalSourceId
+                        },
+                        new PatchTransactionItem
+                        {
+                            RelativePath = dstEdit.RelativePath, EditId = destinationInverseId,
+                            BackupPath = destBackup, BeforeHash = dstEdit.AfterSha256,
+                            AfterHash = "deleted", RevertsOriginalEditId = originalDestinationId
+                        }
+                    ]
+                };
+                var manifest = GetTransactionPath(paths, tx.Id);
+                PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+                try
+                {
+                    if (File.Exists(src) ||
+                        !string.Equals(ComputeFileSha256(dst), dstEdit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("Source or destination changed during rename undo.");
+
+                    File.Move(dst, src);
+                    if (File.Exists(dst) ||
+                        !string.Equals(ComputeFileSha256(src), dstEdit.AfterSha256, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("Rename undo checksum verification failed.");
+
+                    var now = DateTimeOffset.UtcNow;
+                    db.RecordRenameReversal(
+                        new EditJournalRecord(sourceInverseId, ctx.SessionId, ws,
+                            srcEdit.RelativePath, "revert_rename_source", "none",
+                            dstEdit.AfterSha256, false, null, 0, 0, false, now),
+                        new EditJournalRecord(destinationInverseId, ctx.SessionId, ws,
+                            dstEdit.RelativePath, "revert_rename_destination",
+                            dstEdit.AfterSha256, "deleted", true, destBackup, 0, 0, false, now),
+                        originalSourceId, originalDestinationId);
+
+                    tx.Committed = true;
+                    PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+                    try { File.Delete(manifest); } catch (IOException) { }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        RecoverTransaction(paths, guard, tx, db);
+                        File.Delete(manifest);
+                        return Task.FromResult(ToolResult.Fail("rename_undo_rolled_back",
+                            $"Rename undo failed without altering the saved renamed file: {ex.Message}"));
+                    }
+                    catch (Exception recovery)
+                    {
+                        return Task.FromResult(ToolResult.Fail("rename_undo_recovery_required",
+                            $"Rename undo failed ({ex.Message}); manual recovery check required ({recovery.Message}). Manifest: {manifest}"));
+                    }
+                }
+
+                onFileMutated?.Invoke(src);
+                onFileMutated?.Invoke(dst);
+                return Task.FromResult(ToolResult.Ok(
+                    $"Restored '{srcEdit.RelativePath}' from '{dstEdit.RelativePath}'.",
+                    new
+                    {
+                        sourcePath = srcEdit.RelativePath, destinationPath = dstEdit.RelativePath,
+                        sourceInverseId, destinationInverseId, changedFiles = new[]
+                            { srcEdit.RelativePath, dstEdit.RelativePath }
+                    }));
+            });
+
+        yield return new ToolDefinition(
             Name: "delete_file",
             Category: "editing",
             Description: "Deletes a workspace file only after preserving and verifying a reversible backup (up to 256 MiB); larger deletions are refused.",
