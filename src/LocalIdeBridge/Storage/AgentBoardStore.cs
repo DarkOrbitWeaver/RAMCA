@@ -837,6 +837,36 @@ public sealed class AgentBoardStore
         }
     }
 
+    public BoardTask CreateSupervisorTask(BoardRoom room, string title, string details, string? workArea)
+    {
+        title = Required(title, "Task title", 180);
+        details = _secrets.Redact(Required(details, "Task details", 4000));
+        workArea = string.IsNullOrWhiteSpace(workArea) ? null : Required(workArea, "Work area", 240);
+        _ = WorkAreaPath(room, workArea);
+
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            var id = NewId("task");
+            using (var command = Cmd(conn, tx, """
+                INSERT INTO board_tasks(id,room_id,title,details,status,revision,work_area,updated_at)
+                VALUES($id,$room,$title,$details,'open',1,$area,$now);
+                """, ("$id", id), ("$room", room.Id), ("$title", title),
+                ("$details", details), ("$area", workArea), ("$now", Utc())))
+                command.ExecuteNonQuery();
+            using (var post = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,'owner','status',$body,$now);
+                """, ("$room", room.Id), ("$body", $"Created task {id}: {title}"), ("$now", Utc())))
+                post.ExecuteNonQuery();
+            var result = ReadTaskById(conn, tx, room.Id, id);
+            tx.Commit();
+            Signal(room.Id);
+            return result;
+        }
+    }
+
     public BoardTask CreateTask(BoardRoom room, string agentId, string credential,
         string title, string details, string? workArea, string requestId)
     {
