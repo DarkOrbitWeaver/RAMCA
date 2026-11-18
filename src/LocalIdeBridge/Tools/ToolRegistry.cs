@@ -86,7 +86,9 @@ public sealed class ToolRegistry
         // Build-mode diagnostics may write bin/obj. Explicit Roslyn mode is read-only.
         var diagnosticRoslyn = tool.Name.Equals("compiler_diagnostics", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(args.OptionalString("mode", "build"), "roslyn", StringComparison.OrdinalIgnoreCase);
-        var effectiveReadOnly = tool.IsReadOnly || diagnosticRoslyn;
+        var boardRead = (tool.Name == "board_task" || tool.Name == "board_pin") &&
+            string.Equals(args.OptionalString("action"), "list", StringComparison.OrdinalIgnoreCase);
+        var effectiveReadOnly = tool.IsReadOnly || diagnosticRoslyn || boardRead;
         if (_isPaused && !effectiveReadOnly &&
             tool.Name is not ("job_cancel" or "workflow_cancel" or "revert_edit"))
         {
@@ -105,7 +107,8 @@ public sealed class ToolRegistry
             var needsWriteLock = !effectiveReadOnly && !ctx.SkipWriteLock &&
                 workspace is not null &&
                 (tool.Category is "editing" or "git" or "build" or "execution" or "test" ||
-                 tool.Name.Equals("compiler_diagnostics", StringComparison.OrdinalIgnoreCase));
+                 tool.Name.Equals("compiler_diagnostics", StringComparison.OrdinalIgnoreCase) ||
+                 tool.Name is "board_join" or "board_task");
 
             if (needsWriteLock)
             {
