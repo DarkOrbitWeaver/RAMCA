@@ -18,7 +18,9 @@ namespace LocalIdeBridge.Cli;
 /// </summary>
 public sealed class SupervisorTui
 {
-    private enum ViewTab { Overview = 1, Edits = 2, Jobs = 3, GitAndSessions = 4, Errors = 5 }
+    private enum ViewTab { Overview = 1, Edits = 2, Jobs = 3, GitAndSessions = 4, Errors = 5, Board = 6 }
+    private enum BoardMode { Chat, Tasks, Pins }
+    private BoardMode _boardMode = BoardMode.Chat;
 
     private readonly WorkbenchHost _host;
     private readonly SemaphoreSlim _wakeSignal = new(1, 1);
@@ -221,6 +223,22 @@ public sealed class SupervisorTui
             case ConsoleKey.D3: SelectTab(ViewTab.Jobs); break;
             case ConsoleKey.D4: SelectTab(ViewTab.GitAndSessions); break;
             case ConsoleKey.D5: SelectTab(ViewTab.Errors); break;
+            case ConsoleKey.D6: SelectTab(ViewTab.Board); break;
+            case ConsoleKey.B:
+                if (_activeTab == ViewTab.Board)
+                {
+                    _boardMode = _boardMode switch
+                    {
+                        BoardMode.Chat => BoardMode.Tasks,
+                        BoardMode.Tasks => BoardMode.Pins,
+                        _ => BoardMode.Chat
+                    };
+                    _statusBanner = $"Board view: {_boardMode}. Press B to switch Chat/Tasks/Pins.";
+                }
+                break;
+            case ConsoleKey.J:
+                if (_activeTab == ViewTab.Board) CopyBoardInvite();
+                break;
             case ConsoleKey.UpArrow: MoveSelection(-1); break;
             case ConsoleKey.DownArrow: MoveSelection(1); break;
             case ConsoleKey.PageUp: MoveSelection(-Math.Max(1, _lastListSlots - 1)); break;
@@ -519,6 +537,7 @@ public sealed class SupervisorTui
             ViewTab.Jobs => index < RecentCommands().Count,
             ViewTab.GitAndSessions => _host.Database.ListSessions(1, index).Count > 0,
             ViewTab.Errors => _host.Database.ListToolCalls(null, 1, index, errorsOnly: true).Count > 0,
+            ViewTab.Board => _host.Guard.ActiveWorkspace is { } ws && index < _host.Board.ListRooms(ws).Count,
             _ => false
         };
     }
@@ -602,7 +621,7 @@ public sealed class SupervisorTui
         string Tab(ViewTab tab, string label) =>
             _activeTab == tab ? (_useColor ? $"\x1b[1m[{label}]\x1b[0m" : $"[{label}]")
                               : Style($" {label} ", UiTone.Muted);
-        Line($"{Tab(ViewTab.Overview, "1:Activity")} {Tab(ViewTab.Edits, "2:Changes")} {Tab(ViewTab.Jobs, "3:Commands")} {Tab(ViewTab.GitAndSessions, "4:Git")} {Tab(ViewTab.Errors, "5:Errors")}");
+        Line($"{Tab(ViewTab.Overview, "1:Activity")} {Tab(ViewTab.Edits, "2:Changes")} {Tab(ViewTab.Jobs, "3:Commands")} {Tab(ViewTab.GitAndSessions, "4:Git")} {Tab(ViewTab.Errors, "5:Errors")} {Tab(ViewTab.Board, "6:Board")}");
 
         var bodyRows = Math.Max(1, h - 13);
         var rows = BuildVisibleRows(bodyRows, w - 2);
@@ -615,7 +634,9 @@ public sealed class SupervisorTui
         Line(Style(new string('─', Math.Max(1, w - 1)), UiTone.Muted));
         Line(Style("[Up/Down] Select  [PgUp/PgDn] Page  [Enter] Details  [Esc] Back", UiTone.Muted));
         Line("[C] ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate");
-        Line("[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
+        Line(_activeTab == ViewTab.Board
+            ? "[B] Chat/Tasks/Pins  [J] Copy room invite  [W] Workspace  [Q] Quit"
+            : "[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
         sb.Append(ClipAnsi(Style(Fit(_statusBanner, w - 1), UiTone.Muted), w - 1)).Append("\x1b[0m\x1b[K");
         Console.Write(sb.ToString());
     }
@@ -632,6 +653,7 @@ public sealed class SupervisorTui
                 case ViewTab.Jobs: AddCommandRows(lines, count, width); break;
                 case ViewTab.GitAndSessions: AddGitRows(lines, count, width); break;
                 case ViewTab.Errors: AddErrorRows(lines, count, width); break;
+                case ViewTab.Board: AddBoardRows(lines, count, width); break;
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
@@ -923,6 +945,102 @@ public sealed class SupervisorTui
         foreach (var (session, index) in sessions.Select((v, i) => (v, i)))
             lines.Add(new UiLine(Fit(
                 $"    {(_scrollOffset + index == _scrollOffset ? '›' : ' ')} {session.Status,-7} {session.Id}  calls {session.ToolCallCount}  err {session.ErrorCount}", width)));
+    }
+
+    private void CopyBoardInvite()
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        if (workspace is null)
+        {
+            _statusBanner = "Select a trusted workspace before inviting an agent.";
+            return;
+        }
+        var rooms = _host.Board.ListRooms(workspace);
+        if (rooms.Count == 0)
+        {
+            _statusBanner = "Create a room using board_join from a connected agent first.";
+            return;
+        }
+        var room = rooms[Math.Min(_scrollOffset, rooms.Count - 1)];
+        var invitation =
+            $"Join my RAMCA room '{room.Name}' for workspace '{room.Workspace}'.\n" +
+            $"Room ID: {room.Id}\n" +
+            "First connect to my RAMCA tools using your own supported ChatGPT MCP connection.\n" +
+            "Call board_join with this room ID, your name and worker/reviewer/coordinator role; " +
+            "save the returned scoped credential privately. Then call board_sync. " +
+            "Read the pins, tasks and messages before claiming work.\n" +
+            "Work directly on main, never create branches/worktrees, make distinct descriptive commits, " +
+            "and post your test/commit evidence and progress to the board.\n" +
+            "RAMCA queues messages; an inactive webchat will not act until it reconnects and calls board_sync.";
+        var (copied, _) = ConnectionInstructions.TryCopyToClipboard(invitation);
+        _statusBanner = copied ? $"Copied invitation for '{room.Name}' (no secrets)."
+            : "Could not copy invite; check clipboard access.";
+    }
+
+    private void AddBoardRows(List<UiLine> lines, int count, int width)
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        if (workspace is null)
+        {
+            lines.Add(new UiLine("  Choose a workspace to view agent rooms.", UiTone.Warning));
+            return;
+        }
+        var rooms = _host.Board.ListRooms(workspace);
+        if (rooms.Count == 0)
+        {
+            lines.Add(new UiLine("  No multi-chat rooms yet.", UiTone.Muted));
+            lines.Add(new UiLine("  A connected agent can call board_join with room='VESPER' to create one.", UiTone.Muted));
+            lines.Add(new UiLine("  Chatboard, taskboard and pinboard history then persist inside RAMCA.", UiTone.Muted));
+            return;
+        }
+
+        _scrollOffset = Math.Min(_scrollOffset, rooms.Count - 1);
+        _lastListSlots = Math.Min(rooms.Count, 5);
+        var selected = rooms[_scrollOffset];
+        lines.Add(new UiLine(Fit($"  Agent rooms ({rooms.Count})  ·  [Up/Down] select  ·  [B] change view  ·  [J] invite", width), UiTone.Accent));
+        foreach (var (room, index) in rooms.Select((v, i) => (v, i)).Take(5))
+            lines.Add(new UiLine(Fit($"  {(index == _scrollOffset ? '›' : ' ')} {room.Name}  {room.Id}", width),
+                index == _scrollOffset ? UiTone.Accent : UiTone.Muted));
+
+        var members = _host.Board.ListAgents(selected, 40);
+        var tasks = _host.Board.ListTasks(selected, 30);
+        var pins = _host.Board.ListPins(selected, 30);
+        var events = _host.Board.ReadLatestEvents(selected, 30);
+        var inProgress = tasks.Count(t => t.Status == "in_progress");
+        var blocked = tasks.Count(t => t.Status == "blocked");
+        lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents {members.Count}  |  active {inProgress}  |  blocked {blocked}  |  {_boardMode}", width), UiTone.Accent));
+        if (_boardMode == BoardMode.Chat)
+        {
+            if (events.Count == 0) lines.Add(new UiLine("  No messages. Connected agents can use board_post.", UiTone.Muted));
+            // Read the most recent events; do not materialize or retain unlimited histories.
+            foreach (var item in events.TakeLast(Math.Max(1, count - lines.Count)))
+            {
+                var author = members.FirstOrDefault(a => a.Id == item.Author)?.Name ?? item.Author;
+                var target = item.Target is null ? "" : " -> " +
+                    (members.FirstOrDefault(a => a.Id == item.Target)?.Name ?? item.Target);
+                lines.Add(new UiLine(Fit($"  #{item.Sequence} {item.CreatedAt.ToLocalTime():HH:mm}  {author}{target} [{item.Kind}] {item.Body}", width),
+                    item.Kind is "blocker" or "steering" ? UiTone.Warning : UiTone.Normal));
+            }
+        }
+        else if (_boardMode == BoardMode.Tasks)
+        {
+            if (tasks.Count == 0) lines.Add(new UiLine("  No tasks yet. Use board_task create/claim to coordinate work.", UiTone.Muted));
+            foreach (var task in tasks.Take(Math.Max(1, count - lines.Count)))
+            {
+                var owner = members.FirstOrDefault(a => a.Id == task.OwnerId)?.Name ?? "unassigned";
+                var text = $"  {task.Status,-11}  {task.Title}  ({owner})  r{task.Revision}";
+                lines.Add(new UiLine(Fit(text, width), task.Status == "blocked" ? UiTone.Warning :
+                    task.Status == "done" ? UiTone.Good : UiTone.Normal));
+            }
+        }
+        else
+        {
+            if (pins.Count == 0) lines.Add(new UiLine("  No pins yet. Use board_pin save to preserve decisions.", UiTone.Muted));
+            foreach (var pin in pins.Take(Math.Max(1, count - lines.Count)))
+            {
+                lines.Add(new UiLine(Fit($"  [{pin.Key}] {pin.Title}  ·  {pin.Body}", width), UiTone.Normal));
+            }
+        }
     }
 
     private void AddErrorRows(List<UiLine> lines, int count, int width)
