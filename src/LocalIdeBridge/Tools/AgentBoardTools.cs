@@ -136,7 +136,7 @@ public static class AgentBoardTools
 
         yield return new ToolDefinition(
             Name: "board_task", Category: "board",
-            Description: "Create, list, claim, renew, assign, release, complete, block or reopen durable tasks with revision checks. Expired claims require reconciliation.",
+            Description: "Create, list, claim, adopt, renew, assign, release, complete, block or reopen durable tasks with revision checks. Expired claims require reconciliation.",
             IsReadOnly: false, IsIdempotent: false,
             SideEffects: "Lists or changes durable task state. No project files are edited.",
             Parameters:
@@ -144,7 +144,7 @@ public static class AgentBoardTools
                 new("roomId", "string", "Room ID.", Required: true),
                 new("agentId", "string", "Agent ID.", Required: true),
                 new("credential", "string", "Scoped credential.", Required: true),
-                new("action", "string", "list | create | claim | renew | release | complete | block | reopen | assign.", Required: true),
+                new("action", "string", "list | create | claim | adopt | renew | release | complete | block | reopen | assign.", Required: true),
                 new("title", "string", "Task title for create."),
                 new("details", "string", "Task acceptance criteria and requirements for create."),
                 new("workArea", "string", "Advisory file/subsystem scope for create."),
