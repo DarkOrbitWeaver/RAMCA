@@ -415,6 +415,16 @@ public static class AgentBoardTools
                 if (args["arguments"] is not JsonObject inner)
                     return ToolResult.Fail("invalid_arguments", "arguments must be an object.");
 
+                var needsFileVersion = toolName is "replace_range" or "delete_file" or "rename_file" ||
+                    toolName == "create_file" && inner.OptionalBool("overwrite", false);
+                if (needsFileVersion && string.IsNullOrWhiteSpace(inner.OptionalString("expectedSha256")))
+                    return ToolResult.Fail("expected_version_required",
+                        "Board-controlled edits require expectedSha256 from a recent read. Refusing to overwrite changes made by another agent or editor.");
+                if (toolName == "apply_patch" && string.IsNullOrWhiteSpace(inner.OptionalString("expectedSha256")) &&
+                    inner["expectedSha256Map"] is not JsonObject)
+                    return ToolResult.Fail("expected_version_required",
+                        "Board-controlled patches require expectedSha256 or expectedSha256Map for every target file.");
+
                 // Claim transitions take this same workspace lock. A task cannot be
                 // reassigned while one of its board_work operations is in progress.
                 using var writeLock = await guard.AcquireWriteLockAsync(room.Workspace, ct).ConfigureAwait(false);
