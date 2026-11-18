@@ -36,6 +36,9 @@ public sealed partial class TunnelManager : IDisposable
     private Process? _tunnelProcess;
     private string? _announcedEndpoint;
     private readonly object _lock = new();
+    private readonly SemaphoreSlim _chatGptStartGate = new(1, 1);
+    private CancellationTokenSource? _chatGptReconnect;
+    private int _chatGptQuickExits;
 
     [GeneratedRegex(@"https://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?::\d+)?", RegexOptions.Compiled)]
     private static partial Regex HttpsUrlRegex();
@@ -216,69 +219,129 @@ public sealed partial class TunnelManager : IDisposable
     /// when the host exits. The saved API key is supplied only through the child environment.
     /// Remote callers must still pass RAMCA's own key, injected locally by tunnel-client.
     /// </summary>
-    public Task<bool> StartChatGptIfConfiguredAsync(string localOriginUrl, CancellationToken ct = default)
+    public async Task<bool> StartChatGptIfConfiguredAsync(
+        string localOriginUrl, CancellationToken ct = default, bool automaticRestart = false)
     {
-        if (!ChatGptTunnelSetup.IsConfigured(_paths)) return Task.FromResult(false);
-        if (_config.Connection.Mode != "localhost")
-            throw new InvalidOperationException("ChatGPT private tunnel requires connection.mode=localhost; do not enable a second public tunnel simultaneously.");
-        var binary = ChatGptTunnelSetup.FindBinary(_paths)
-            ?? throw new FileNotFoundException("ChatGPT tunnel-client missing from RAMCA/tools/tunnel-client/.");
-        var origin = new Uri(localOriginUrl);
-        if (origin.Scheme != Uri.UriSchemeHttp ||
-            origin.Host is not ("127.0.0.1" or "localhost" or "::1"))
-            throw new InvalidOperationException("Refusing non-local ChatGPT tunnel origin.");
+        await _chatGptStartGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!ChatGptTunnelSetup.IsConfigured(_paths)) return false;
+            if (_config.Connection.Mode != "localhost")
+                throw new InvalidOperationException("Private ChatGPT tunnel requires localhost mode.");
+            var binary = ChatGptTunnelSetup.FindBinary(_paths)
+                ?? throw new FileNotFoundException("ChatGPT tunnel-client missing from RAMCA/tools/tunnel-client/.");
+            var origin = new Uri(localOriginUrl);
+            if (origin.Scheme != Uri.UriSchemeHttp ||
+                origin.Host is not ("127.0.0.1" or "localhost" or "::1"))
+                throw new InvalidOperationException("Refusing a non-local ChatGPT tunnel origin.");
 
-        lock (_lock)
-        {
-            if (_tunnelProcess is { HasExited: false }) return Task.FromResult(true);
-        }
-        var profile = ChatGptTunnelSetup.CreateProfile(_paths, localOriginUrl.TrimEnd('/') + "/mcp");
-        var key = File.ReadAllText(ChatGptTunnelSetup.KeyFile(_paths)).Trim();
-        if (!key.StartsWith("sk-", StringComparison.Ordinal))
-            throw new InvalidOperationException("Stored ChatGPT tunnel runtime key is invalid. Run connect-chatgpt again.");
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = binary,
-            WorkingDirectory = _paths.RootDir,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            RedirectStandardInput = true
-        };
-        psi.ArgumentList.Add("run");
-        psi.ArgumentList.Add("--profile-file");
-        psi.ArgumentList.Add(profile);
-        psi.Environment["CONTROL_PLANE_API_KEY"] = key;
-        var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        if (!proc.Start()) throw new InvalidOperationException("Could not start OpenAI tunnel-client.");
-        try { _supervisor.Register(proc); }
-        catch
-        {
-            ChildProcessSupervisor.TryKillTree(proc);
-            proc.Dispose();
-            throw;
-        }
-        try { proc.StandardInput.Close(); } catch { }
-        lock (_lock)
-        {
-            _tunnelProcess = proc;
-            _announcedEndpoint = "OpenAI private tunnel (configured)";
-        }
-        proc.Exited += (_, _) =>
-        {
             lock (_lock)
             {
-                if (!ReferenceEquals(_tunnelProcess, proc)) return;
+                if (!automaticRestart) _chatGptQuickExits = 0;
+                if (_tunnelProcess is { HasExited: false }) return true;
+                _chatGptReconnect ??= new CancellationTokenSource();
             }
-            try { _logger.Warn("tunnel", "OpenAI tunnel-client exited. RAMCA's localhost tools remain available; press C to reconnect."); }
+
+            var profile = ChatGptTunnelSetup.CreateProfile(_paths, localOriginUrl.TrimEnd('/') + "/mcp");
+            var key = File.ReadAllText(ChatGptTunnelSetup.KeyFile(_paths)).Trim();
+            if (!key.StartsWith("sk-", StringComparison.Ordinal))
+                throw new InvalidOperationException("Stored tunnel runtime key is invalid. Run connect-chatgpt again.");
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = binary,
+                WorkingDirectory = _paths.RootDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                RedirectStandardInput = true
+            };
+            psi.ArgumentList.Add("run");
+            psi.ArgumentList.Add("--profile-file");
+            psi.ArgumentList.Add(profile);
+            psi.Environment["CONTROL_PLANE_API_KEY"] = key;
+
+            var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            if (!proc.Start()) throw new InvalidOperationException("Could not start OpenAI tunnel-client.");
+            try { _supervisor.Register(proc); }
+            catch
+            {
+                ChildProcessSupervisor.TryKillTree(proc);
+                proc.Dispose();
+                throw;
+            }
+            try { proc.StandardInput.Close(); } catch { }
+            var startedAt = DateTimeOffset.UtcNow;
+            lock (_lock)
+            {
+                _tunnelProcess = proc;
+                _announcedEndpoint = "OpenAI private tunnel (process running)";
+            }
+
+            void OnExited()
+            {
+                CancellationToken restartToken = default;
+                int retryDelay = 0;
+                lock (_lock)
+                {
+                    if (!ReferenceEquals(_tunnelProcess, proc)) return;
+                    _tunnelProcess = null;
+                    _announcedEndpoint = null;
+                    var ranFor = DateTimeOffset.UtcNow - startedAt;
+                    _chatGptQuickExits = ranFor >= TimeSpan.FromMinutes(2)
+                        ? 1 : _chatGptQuickExits + 1;
+                    if (_chatGptReconnect is { IsCancellationRequested: false })
+                    {
+                        if (_chatGptQuickExits <= 5)
+                        {
+                            restartToken = _chatGptReconnect.Token;
+                            retryDelay = Math.Min(30, 1 << (_chatGptQuickExits - 1));
+                        }
+                    }
+                }
+                try { _supervisor.Unregister(proc.Id); } catch { }
+                try { proc.Dispose(); } catch { }
+                try
+                {
+                    _logger.Warn("tunnel", retryDelay > 0
+                        ? $"ChatGPT tunnel-client exited; reconnecting in {retryDelay} second(s)."
+                        : "ChatGPT tunnel-client exited too often. Press C to retry after checking configuration.");
+                }
+                catch (ObjectDisposedException) { }
+
+                if (retryDelay > 0)
+                {
+                    _ = RetryChatGptTunnelAsync(localOriginUrl, retryDelay, restartToken);
+                }
+            }
+
+            proc.Exited += (_, _) => OnExited();
+            if (proc.HasExited) OnExited();
+            _ = DrainRedactedAsync(proc.StandardOutput, CancellationToken.None);
+            _ = DrainRedactedAsync(proc.StandardError, CancellationToken.None);
+            _logger.Info("tunnel", "Private ChatGPT tunnel process started. Connection readiness requires a real MCP client call.");
+            return true;
+        }
+        finally
+        {
+            _chatGptStartGate.Release();
+        }
+    }
+
+    private async Task RetryChatGptTunnelAsync(string origin, int delaySeconds, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), ct).ConfigureAwait(false);
+            await StartChatGptIfConfiguredAsync(origin, ct, automaticRestart: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            try { _logger.Warn("tunnel", $"Automatic reconnect failed: {ex.GetType().Name}. Press C to retry manually."); }
             catch (ObjectDisposedException) { }
-        };
-        _ = DrainRedactedAsync(proc.StandardOutput, ct: CancellationToken.None);
-        _ = DrainRedactedAsync(proc.StandardError, ct: CancellationToken.None);
-        _logger.Info("tunnel", "OpenAI Secure MCP Tunnel process started. Select the existing tunnel in ChatGPT; connection readiness is not yet verified.");
-        return Task.FromResult(true);
+        }
     }
 
     private static async Task DrainRedactedAsync(StreamReader reader, CancellationToken ct)
@@ -298,11 +361,20 @@ public sealed partial class TunnelManager : IDisposable
     public void Stop()
     {
         Process? proc;
+        CancellationTokenSource? reconnect;
         lock (_lock)
         {
             proc = _tunnelProcess;
             _tunnelProcess = null;
             _announcedEndpoint = null;
+            reconnect = _chatGptReconnect;
+            _chatGptReconnect = null;
+            _chatGptQuickExits = 0;
+        }
+        if (reconnect is not null)
+        {
+            reconnect.Cancel();
+            reconnect.Dispose();
         }
 
         if (proc is not null)
