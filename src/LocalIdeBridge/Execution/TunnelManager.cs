@@ -316,10 +316,14 @@ public sealed partial class TunnelManager : IDisposable
                 }
             }
 
+            // Capture both pipes before the exit callback can dispose the Process.
+            var output = proc.StandardOutput;
+            var errors = proc.StandardError;
+            _ = DrainRedactedAsync(output, CancellationToken.None);
+            _ = DrainRedactedAsync(errors, CancellationToken.None);
             proc.Exited += (_, _) => OnExited();
-            if (proc.HasExited) OnExited();
-            _ = DrainRedactedAsync(proc.StandardOutput, CancellationToken.None);
-            _ = DrainRedactedAsync(proc.StandardError, CancellationToken.None);
+            try { if (proc.HasExited) OnExited(); }
+            catch (ObjectDisposedException) { }
             _logger.Info("tunnel", "Private ChatGPT tunnel process started. Connection readiness requires a real MCP client call.");
             return true;
         }
