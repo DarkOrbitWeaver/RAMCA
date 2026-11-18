@@ -76,9 +76,11 @@ public static class AgentBoardTools
                     agent.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase) ? null : agent.Id);
                 var next = events.Count == 0 ? after : events[^1].Sequence;
                 var includeSnapshot = args.OptionalBool("includeSnapshot", false);
-                IReadOnlyList<BoardTask> tasks = includeSnapshot
-                    ? board.ListTasks(room, 40, args.OptionalInt("taskOffset", 0)) : [];
-                IReadOnlyList<BoardPin> pins = includeSnapshot ? board.ListPins(room, 40) : [];
+                IReadOnlyList<BoardTask> taskPage = includeSnapshot
+                    ? board.ListTasks(room, 41, args.OptionalInt("taskOffset", 0)) : [];
+                IReadOnlyList<BoardTask> tasks = taskPage.Take(40).ToArray();
+                IReadOnlyList<BoardPin> pinPage = includeSnapshot ? board.ListPins(room, 41) : [];
+                IReadOnlyList<BoardPin> pins = pinPage.Take(40).ToArray();
                 IReadOnlyList<BoardAgent> members = includeSnapshot ? board.ListAgents(room, 40) : [];
                 var acknowledged = board.GetAcknowledged(room, agent.Id);
                 return Task.FromResult(ToolResult.Ok(
@@ -89,6 +91,7 @@ public static class AgentBoardTools
                         acknowledgedCursor = acknowledged,
                         tasks, taskOffset = Math.Max(0, args.OptionalInt("taskOffset", 0)),
                         pins, agents = members, snapshotIncluded = includeSnapshot,
+                        taskHasMore = taskPage.Count > 40, pinHasMore = pinPage.Count > 40,
                         note = "Events arrive through active tool calls only. Call board_ack after processing a page."
                     }));
             });
@@ -193,9 +196,11 @@ public static class AgentBoardTools
                 var action = args.RequireString("action");
                 if (action == "list")
                 {
-                    var tasks = board.ListTasks(room, 40, args.OptionalInt("offset", 0));
-                    return Task.FromResult(ToolResult.Ok($"Retrieved {tasks.Count} task(s).",
-                        new { tasks, offset = args.OptionalInt("offset", 0), pageSize = 40 }));
+                    var page = board.ListTasks(room, 41, args.OptionalInt("offset", 0));
+                    var tasks = page.Take(40).ToArray();
+                    return Task.FromResult(ToolResult.Ok($"Retrieved {tasks.Length} task(s).",
+                        new { tasks, offset = args.OptionalInt("offset", 0), pageSize = 40,
+                            hasMore = page.Count > 40 }));
                 }
                 BoardTask task;
                 if (action == "create")
@@ -266,8 +271,10 @@ public static class AgentBoardTools
             {
                 var room = Room(args);
                 var agent = Agent(args, room);
-                var tasks = board.ListTasks(room, 40);
-                var pins = board.ListPins(room, 25);
+                var taskPage = board.ListTasks(room, 41);
+                var pinPage = board.ListPins(room, 26);
+                var tasks = taskPage.Take(40).ToArray();
+                var pins = pinPage.Take(25).ToArray();
                 var acknowledged = board.GetAcknowledged(room, agent.Id);
                 var sb = new StringBuilder();
                 sb.AppendLine($"You are continuing RAMCA agent '{agent.Name}' ({agent.Role}) in room '{room.Name}'.");
@@ -286,10 +293,12 @@ public static class AgentBoardTools
                 sb.AppendLine($"Previously acknowledged board event: {acknowledged}. After rejoining, call board_sync to read new events.");
                 sb.AppendLine("Pins:");
                 foreach (var pin in pins)
-                    sb.AppendLine($"- {pin.Key}: {pin.Title} — {pin.Body}");
+                    sb.AppendLine($"- {pin.Key}: {pin.Title} - {pin.Body}");
+                if (pinPage.Count > 25) sb.AppendLine("More pins exist. Call board_pin list to inspect them.");
                 sb.AppendLine("Tasks:");
                 foreach (var task in tasks)
                     sb.AppendLine($"- {task.Id} [{task.Status}] ({task.OwnerId ?? "unassigned"}) {task.Title}; revision={task.Revision}; area={task.WorkArea ?? "unspecified"}; evidence={task.Evidence ?? "none"}");
+                if (taskPage.Count > 40) sb.AppendLine("More tasks exist. Call board_task list with offset=40 to continue.");
                 var checkpoints = database.ListGitCheckpoints(limit: 3);
                 if (checkpoints.Count > 0)
                 {
@@ -304,7 +313,8 @@ public static class AgentBoardTools
                         "Handoff exceeded 16,000 characters; shorten pins/task descriptions before exporting."));
                 return Task.FromResult(ToolResult.Ok("Copy-ready agent handoff created from durable RAMCA records.",
                     new { prompt, roomId = room.Id, agentId = agent.Id,
-                        acknowledgedCursor = acknowledged, pinCount = pins.Count, taskCount = tasks.Count }));
+                        acknowledgedCursor = acknowledged, pinCount = pins.Length, taskCount = tasks.Length,
+                        pinsTruncated = pinPage.Count > 25, tasksTruncated = taskPage.Count > 40 }));
             });
 
         yield return new ToolDefinition(
