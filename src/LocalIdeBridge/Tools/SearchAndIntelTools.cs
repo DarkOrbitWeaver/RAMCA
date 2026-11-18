@@ -276,7 +276,7 @@ public sealed class SearchAndIntelTools
                                 line = span.StartLinePosition.Line + 1,
                                 column = span.StartLinePosition.Character + 1,
                                 engine = "roslyn-syntax",
-                                isSemantic = true
+                                isSemantic = false
                             });
                             if (results.Count >= maxResults) break;
                         }
@@ -327,7 +327,7 @@ public sealed class SearchAndIntelTools
                     }
                 }
 
-                var primaryEngine = usedRoslyn && usedFallback ? "roslyn+text-fallback" : (usedRoslyn ? "roslyn" : "text-fallback");
+                var primaryEngine = usedRoslyn && usedFallback ? "roslyn-syntax+text-fallback" : (usedRoslyn ? "roslyn-syntax" : "text-fallback");
                 return Task.FromResult(ToolResult.Ok(
                     $"Found {results.Count} symbol(s) matching '{query}' (engine={primaryEngine}).",
                     new { engine = primaryEngine, query, count = results.Count, symbols = results }));
