@@ -559,13 +559,14 @@ public sealed class AgentBoardStore
         return LatestSequence(room, agentId) > after;
     }
 
-    public IReadOnlyList<BoardEvent> ReadLatestEvents(BoardRoom room, int limit = 25)
+    public IReadOnlyList<BoardEvent> ReadLatestEvents(BoardRoom room, int limit = 25, int offset = 0)
     {
         using var conn = Open();
         using var query = Cmd(conn, null, """
             SELECT sequence,room_id,author_id,target_id,kind,body,created_at
-            FROM board_events WHERE room_id=$room ORDER BY sequence DESC LIMIT $limit;
-            """, ("$room", room.Id), ("$limit", Math.Clamp(limit, 1, 100)));
+            FROM board_events WHERE room_id=$room ORDER BY sequence DESC LIMIT $limit OFFSET $offset;
+            """, ("$room", room.Id), ("$limit", Math.Clamp(limit, 1, 100)),
+            ("$offset", Math.Clamp(offset, 0, 1_000_000)));
         using var r = query.ExecuteReader();
         var result = new List<BoardEvent>();
         while (r.Read()) result.Add(ReadEvent(r));
@@ -802,13 +803,14 @@ public sealed class AgentBoardStore
         }
     }
 
-    public IReadOnlyList<BoardPin> ListPins(BoardRoom room, int limit = 50)
+    public IReadOnlyList<BoardPin> ListPins(BoardRoom room, int limit = 50, int offset = 0)
     {
         using var conn = Open();
         using var query = Cmd(conn, null, """
             SELECT id,room_id,pin_key,title,body,revision,updated_at
-            FROM board_pins WHERE room_id=$room ORDER BY updated_at DESC LIMIT $limit;
-            """, ("$room", room.Id), ("$limit", Math.Clamp(limit, 1, 100)));
+            FROM board_pins WHERE room_id=$room ORDER BY updated_at DESC LIMIT $limit OFFSET $offset;
+            """, ("$room", room.Id), ("$limit", Math.Clamp(limit, 1, 100)),
+            ("$offset", Math.Clamp(offset, 0, 1_000_000)));
         using var r = query.ExecuteReader();
         var list = new List<BoardPin>();
         while (r.Read()) list.Add(ReadPin(r));
