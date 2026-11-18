@@ -52,7 +52,7 @@ Legend: **Implemented (unverified)** = source change intended to address, needs 
 | Finding | State | Remaining concern |
 |---|---|---|
 | F-001 second host corrupts state | Implemented (unverified) | Independent CLI/stdio concurrency lifecycle tests on Windows |
-| F-002 rename overwrite data loss | Contained (unverified) | Overwrite rejected; ergonomic reversible rename/undo remains open |
+| F-002 rename overwrite data loss | Implemented in source (unverified) | No-overwrite move, paired journal and one-action revert_rename added; Windows crash/ACL validation pending |
 | F-003 forced worktree remove | Implemented (unverified) | Dirty/untracked Windows worktree regression |
 | F-004 multifile patch silent corruption | Partial | Real crash/failpoint injection, shell/editor races, executable-mode preservation |
 | F-005 symlink/denied-path bypass | Partial | NTFS handle-level identity / Windows short names, security fuzz |
@@ -76,18 +76,18 @@ Legend: **Implemented (unverified)** = source change intended to address, needs 
 | F-023 MCP cancel/validation/stdio | Partial | Invalid method guarded; MCP stdio framed; opt-in execute-once added; automatic MCP cancellation/deduplication and stdio HOL still open |
 | F-024 workflow conditions/retry safety | Partial | Durable workflow state, pause/resume recovery and fan-out stress |
 | F-025 symlink traversal loops | Implemented (unverified) | Very deep Windows junction test |
-| F-026 Roslyn false positives | Open | Proper MSBuildWorkspace/project references/semantic validation |
+| F-026 Roslyn false positives | Partial | Syntax-only symbol search no longer claims semantic results; project-reference-aware compilation still open |
 | F-027 inaccurate git status/diff | Implemented (unverified) | Large repository benchmark / paginated diff UX |
 | F-028 file metadata/ACL on replace | Partial | Windows ACL, ADS, signed-files, readonly attributes test |
 | F-029 power-loss edits/SQLite | Partial | Crash manifests and fsync added; actual power-loss/volume-failure tests not done |
 | F-030 NTFS ADS/alias | Partial | ADS/reserved names guarded; Windows 8.3, device paths remain for fuzzing |
 | F-031 JobObject assignment race | Partial | Assignment failure kills child; suspended-start race-free launch unimplemented |
-| F-032 inaccurate MCP tool annotations | Open | Audit all isReadOnly/idempotent/destructive hints |
+| F-032 inaccurate MCP tool annotations | Partial | Build/test/stage/checkpoint no longer claim replay safety; dynamic action hints and full audit still open |
 | F-033 database per-call overhead | Open | Profile first; avoid persistent DB process if idle cost rises |
-| F-034 unacknowledged local steering | Open | Acknowledged inbox and client capability negotiation |
+| F-034 unacknowledged local steering | Implemented in source (unverified) | Durable targeted messages, explicit ack cursor, queued/seen view, agent polling; live client capability checks pending |
 | F-035 read/edit edge cases | Partial | Opaque encodings, long paths, empty/trailing-newline fixture coverage |
 | F-036 asynchronous jobs race/timeouts | Partial | Job registration race fixed; timeout vs user cancel distinction open |
-| F-037 tunnel process monitoring | Partial | Failed process supervision kills spawned tunnel; live restart/health checks and no-orphan Windows tests open |
+| F-037 tunnel process monitoring | Partial | Bounded reconnect/backoff and immediate-exit reporting in source; authenticated readiness and no-orphan Windows tests pending |
 | F-038 MCP redundant work/protocol | Open | Profile payload overhead and version negotiation tests |
 
 ## Remaining release-blocking acceptance tests
