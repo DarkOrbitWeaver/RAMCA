@@ -208,4 +208,102 @@ public sealed class AgentBoardTests
         var events = board.ReadLatestEvents(room);
         Assert.Contains(events, e => e.Kind == "status" && e.Body.Contains("create_file completed"));
     }
+    [Fact]
+    public async Task OnlyCoordinatorCanInviteAndInvitesAreOneUse()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var board = sb.Host.Board;
+        var room = board.GetOrCreateRoom("VESPER", sb.WorkspaceDir);
+        var (lead, leadKey) = board.Join(room, "Lead", "coordinator");
+        var (other, otherKey) = board.Join(room, "Reader", "reviewer");
+
+        Assert.Throws<UnauthorizedAccessException>(() =>
+            board.CreateInvitation(room, other.Id, otherKey, null, "worker"));
+
+        var invite = board.CreateInvitation(room, lead.Id, leadKey, null, "worker");
+        var (worker, workerKey) = board.RedeemInvitation(room, "Engine", invite.Code);
+        Assert.Equal("worker", worker.Role);
+        Assert.NotEmpty(workerKey);
+        Assert.Throws<UnauthorizedAccessException>(() =>
+            board.RedeemInvitation(room, "Duplicate", invite.Code));
+        Assert.Throws<UnauthorizedAccessException>(() =>
+            board.Join(room, "Engine", "coordinator", worker.Id, workerKey));
+    }
+
+    [Fact]
+    public async Task CoordinatorCanInviteNewChatToTakeOverAnExistingWorker()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var board = sb.Host.Board;
+        var room = board.GetOrCreateRoom("VESPER", sb.WorkspaceDir);
+        var (lead, leadKey) = board.Join(room, "Lead", "coordinator");
+        var (before, oldKey) = board.Join(room, "Engine", "worker");
+        var task = board.CreateTask(room, before.Id, oldKey, "Fix resolver",
+            "Resolve a test fixture", "engine", "takeover-request");
+        var claimed = board.ChangeTask(room, before.Id, oldKey, task.Id, "claim", task.Revision);
+
+        var invite = board.CreateInvitation(room, lead.Id, leadKey, before.Id, "worker");
+        var (after, newKey) = board.RedeemInvitation(room, "Engine Replaced", invite.Code);
+        Assert.Equal(before.Id, after.Id);
+        Assert.Equal(before.Generation + 1, after.Generation);
+        Assert.Throws<UnauthorizedAccessException>(() => board.Authenticate(room, before.Id, oldKey));
+        Assert.Throws<UnauthorizedAccessException>(() =>
+            board.RequireActiveClaim(room, after.Id, newKey, task.Id));
+
+        var adopted = board.ChangeTask(room, after.Id, newKey, task.Id, "adopt",
+            claimed.Revision, evidence: "Reviewed current engine diff and running jobs");
+        Assert.Equal(after.Generation, adopted.OwnerGeneration);
+    }
+
+    [Fact]
+    public async Task OverlappingTaskClaimsAcrossRoomsRequireReconciliation()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var board = sb.Host.Board;
+        var engineRoom = board.GetOrCreateRoom("VESPER", sb.WorkspaceDir);
+        var testRoom = board.GetOrCreateRoom("VESPER Review", sb.WorkspaceDir);
+        var (engine, engineKey) = board.Join(engineRoom, "Engine", "worker");
+        var (reviewer, reviewerKey) = board.Join(testRoom, "Reviewer", "reviewer");
+
+        var engineTask = board.CreateTask(engineRoom, engine.Id, engineKey, "Engine task",
+            "Implement transfer behavior", "src/engine", "area-one");
+        var claimed = board.ChangeTask(engineRoom, engine.Id, engineKey, engineTask.Id,
+            "claim", engineTask.Revision);
+        Assert.Equal("in_progress", claimed.Status);
+
+        var overlap = board.CreateTask(testRoom, reviewer.Id, reviewerKey, "Touch the same code",
+            "Conflict", "src/engine/http", "area-two");
+        Assert.Throws<InvalidOperationException>(() =>
+            board.ChangeTask(testRoom, reviewer.Id, reviewerKey, overlap.Id, "claim", overlap.Revision));
+
+        var independent = board.CreateTask(testRoom, reviewer.Id, reviewerKey, "Review docs",
+            "No overlapping edits", "docs", "area-three");
+        var independentClaim = board.ChangeTask(testRoom, reviewer.Id, reviewerKey,
+            independent.Id, "claim", independent.Revision);
+        Assert.Equal("in_progress", independentClaim.Status);
+
+        var newRevision = board.ChangeTask(engineRoom, engine.Id, engineKey, engineTask.Id,
+            "release", claimed.Revision);
+        Assert.Equal("open", newRevision.Status);
+        var afterRelease = board.ChangeTask(testRoom, reviewer.Id, reviewerKey,
+            overlap.Id, "claim", overlap.Revision);
+        Assert.Equal("in_progress", afterRelease.Status);
+    }
+
+    [Fact]
+    public async Task LocalOwnerCanPinAndSteerWithoutImpersonatingAnAgent()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var board = sb.Host.Board;
+        var room = board.GetOrCreateRoom("VESPER", sb.WorkspaceDir);
+        var pin = board.SaveSupervisorPin(room, "git", "Branch policy", "Main only");
+        Assert.Equal("Main only", pin.Body);
+        var eventRecord = board.PostSupervisor(room, "No branch creation.");
+        Assert.Equal("owner", eventRecord.Author);
+        Assert.Equal("steering", eventRecord.Kind);
+        Assert.Contains(board.ReadLatestEvents(room), e => e.Author == "owner" && e.Kind == "decision");
+        board.DeleteSupervisorPin(room, "git");
+        Assert.Empty(board.ListPins(room));
+    }
+
 }
