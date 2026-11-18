@@ -468,6 +468,7 @@ public sealed class AgentBoardStore
             throw new ArgumentException("Unsupported board message kind.");
         body = Required(body, "Message body", 4000);
         requestId = Required(requestId, "Request ID", 128);
+        targetId = string.IsNullOrWhiteSpace(targetId) ? null : Required(targetId, "Target agent ID", 96);
         lock (_writes)
         {
             using var conn = Open();
