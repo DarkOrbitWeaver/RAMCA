@@ -718,7 +718,7 @@ public sealed class SearchAndIntelTools
             Category: "code_intel",
             Description: "Collects structured C# compiler errors and warnings either via full MSBuild/dotnet build ('build' mode, includes NuGet packages) or fast in-process Roslyn syntax/semantic check ('roslyn' mode).",
             IsReadOnly: false, // Default build mode writes bin/obj and must obey pause/write locks.
-            IsIdempotent: true,
+            IsIdempotent: false,
             SideEffects: "Build mode runs dotnet build and writes outputs; roslyn mode analyzes in memory.",
             Parameters:
             [
