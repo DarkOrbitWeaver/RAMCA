@@ -630,7 +630,8 @@ public sealed class McpServer
                             // Fail conservative: a tool which can mutate state must not claim
                             // to be non-destructive merely because it has an undo path.
                             ["destructiveHint"] = !t.IsReadOnly,
-                            ["openWorldHint"] = t.Category is "execution" or "build" or "test" or "git" or "jobs"
+                            ["openWorldHint"] = t.Category is "execution" or "build" or "test" or "git" or "jobs" ||
+                                t.Name == "board_work"
                         }
                     });
                 }
