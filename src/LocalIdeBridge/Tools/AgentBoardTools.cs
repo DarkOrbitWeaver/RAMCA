@@ -31,7 +31,8 @@ public static class AgentBoardTools
                 new("name", "string", "Short agent name, such as Engine, UI, Reviewer or Lead.", Required: true),
                 new("role", "string", "Agent role, such as worker, reviewer or coordinator.", Required: true),
                 new("agentId", "string", "Existing agentId to resume (omit for a new identity)."),
-                new("credential", "string", "Existing scoped agent credential required when resuming.")
+                new("credential", "string", "Existing scoped agent credential required when resuming."),
+                new("inviteCode", "string", "Optional one-time coordinator invitation for new or replacement agent.")
             ],
             Handler: (args, _, _) =>
             {
@@ -40,8 +41,14 @@ public static class AgentBoardTools
                 var room = identifier.StartsWith("room_", StringComparison.Ordinal)
                     ? board.RequireRoom(identifier, workspace)
                     : board.GetOrCreateRoom(identifier, workspace);
-                var (agent, secret) = board.Join(room, args.RequireString("name"),
-                    args.RequireString("role"), args.OptionalString("agentId"), args.OptionalString("credential"));
+                var inviteCode = args.OptionalString("inviteCode");
+                if (inviteCode is not null && (args.OptionalString("agentId") is not null ||
+                    args.OptionalString("credential") is not null))
+                    throw new ArgumentException("Use either inviteCode or agentId/credential, not both.");
+                var (agent, secret) = inviteCode is null
+                    ? board.Join(room, args.RequireString("name"), args.RequireString("role"),
+                        args.OptionalString("agentId"), args.OptionalString("credential"))
+                    : board.RedeemInvitation(room, args.RequireString("name"), inviteCode);
                 return Task.FromResult(ToolResult.Ok($"Joined room '{room.Name}' as {agent.Name}.", new
                 {
                     room, agent,
@@ -49,6 +56,45 @@ public static class AgentBoardTools
                     warning = "Save this scoped credential privately for board calls and future reattachment. It is not the RAMCA master key. Rejoining rotates it.",
                     next = "Call board_sync with includeSnapshot=true, roomId, agentId and credential; review pins and tasks before editing."
                 }));
+            });
+
+        yield return new ToolDefinition(
+            Name: "board_invite", Category: "board",
+            Description: "Coordinator issues a single-use invitation for a new worker or replacement of an existing agent. Copy the prompt to a new connected chat; it expires automatically.",
+            IsReadOnly: false, IsIdempotent: false,
+            SideEffects: "Saves one hashed one-use join/rejoin invitation; the code is shown only in this response.",
+            Parameters:
+            [
+                new("roomId", "string", "Room ID.", Required: true),
+                new("agentId", "string", "Coordinator ID.", Required: true),
+                new("credential", "string", "Coordinator scoped credential.", Required: true),
+                new("name", "string", "Human-readable name for the joining chat.", Required: true),
+                new("role", "string", "worker or reviewer for new agents; an existing agent's role for replacement.", Default: "worker"),
+                new("targetAgentId", "string", "Existing agent to replace, preserving its task identity and history."),
+                new("validDays", "integer", "Invitation lifetime in days, 1..30.", Default: 7)
+            ],
+            Handler: (args, _, _) =>
+            {
+                var room = Room(args);
+                var name = args.RequireString("name");
+                var invite = board.CreateInvitation(room, args.RequireString("agentId"),
+                    args.RequireString("credential"), args.OptionalString("targetAgentId"),
+                    args.OptionalString("role", "worker")!, args.OptionalInt("validDays", 7));
+                var prompt = new StringBuilder()
+                    .AppendLine($"You are {name}, a {invite.Role} in the RAMCA room '{room.Name}'.")
+                    .AppendLine("Your RAMCA MCP connection must be configured and reachable before invoking tools.")
+                    .AppendLine($"Workspace: {room.Workspace}")
+                    .AppendLine("Stay on main, do not create branches or worktrees, and follow HUMANIFY.")
+                    .AppendLine($"Call board_join with room='{room.Id}', name='{name}', inviteCode='{invite.Code}'.")
+                    .AppendLine("Save the returned new agentId and scoped credential privately.")
+                    .AppendLine("Call board_sync with includeSnapshot=true and read pins, assigned tasks and messages.")
+                    .AppendLine("Claim or adopt your specific task before writing. Post progress and evidence to the board.")
+                    .AppendLine("An inactive webchat does not receive or act on messages until it reconnects.")
+                    .ToString();
+                return Task.FromResult(ToolResult.Ok(
+                    $"Invitation created for '{name}' (expires {invite.ExpiresAt:yyyy-MM-dd}).",
+                    new { roomId = room.Id, invite.AgentId, invite.Role, invite.ExpiresAt,
+                        privatePrompt = prompt, note = "Treat this one-use invitation as private; never store it in public project files." }));
             });
 
         yield return new ToolDefinition(
