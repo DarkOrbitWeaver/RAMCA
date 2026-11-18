@@ -283,17 +283,19 @@ public sealed partial class TunnelManager : IDisposable
             {
                 CancellationToken restartToken = default;
                 int retryDelay = 0;
+                bool wasActive;
                 lock (_lock)
                 {
-                    if (!ReferenceEquals(_tunnelProcess, proc)) return;
-                    _tunnelProcess = null;
-                    _announcedEndpoint = null;
-                    var ranFor = DateTimeOffset.UtcNow - startedAt;
-                    _chatGptQuickExits = ranFor >= TimeSpan.FromMinutes(2)
-                        ? 1 : _chatGptQuickExits + 1;
-                    if (_chatGptReconnect is { IsCancellationRequested: false })
+                    wasActive = ReferenceEquals(_tunnelProcess, proc);
+                    if (wasActive)
                     {
-                        if (_chatGptQuickExits <= 5)
+                        _tunnelProcess = null;
+                        _announcedEndpoint = null;
+                        var ranFor = DateTimeOffset.UtcNow - startedAt;
+                        _chatGptQuickExits = ranFor >= TimeSpan.FromMinutes(2)
+                            ? 1 : _chatGptQuickExits + 1;
+                        if (_chatGptReconnect is { IsCancellationRequested: false } &&
+                            _chatGptQuickExits <= 5)
                         {
                             restartToken = _chatGptReconnect.Token;
                             retryDelay = Math.Min(30, 1 << (_chatGptQuickExits - 1));
@@ -302,6 +304,7 @@ public sealed partial class TunnelManager : IDisposable
                 }
                 try { _supervisor.Unregister(proc.Id); } catch { }
                 try { proc.Dispose(); } catch { }
+                if (!wasActive) return;
                 try
                 {
                     _logger.Warn("tunnel", retryDelay > 0
