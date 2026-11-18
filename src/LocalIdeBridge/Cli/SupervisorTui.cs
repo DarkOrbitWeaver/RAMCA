@@ -1294,7 +1294,9 @@ public sealed class SupervisorTui
         lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents shown {members.Count}  |  active shown {inProgress}  |  blocked shown {blocked}  |  {_boardMode} page {_boardPage + 1} (PgUp/PgDn)", width), UiTone.Accent));
         if (_boardMode == BoardMode.Chat)
         {
-            if (events.Count == 0) lines.Add(new UiLine("  No messages. Connected agents can use board_post.", UiTone.Muted));
+            if (events.Count == 0) lines.Add(new UiLine(_boardPage == 0
+                ? "  No messages. Connected agents can use board_post."
+                : "  No older messages. Press PageUp.", UiTone.Muted));
             // Read the most recent events; do not materialize or retain unlimited histories.
             foreach (var item in events.TakeLast(Math.Max(1, count - lines.Count)))
             {
@@ -1309,7 +1311,9 @@ public sealed class SupervisorTui
         }
         else if (_boardMode == BoardMode.Tasks)
         {
-            if (tasks.Count == 0) lines.Add(new UiLine("  No tasks yet. Use board_task create/claim to coordinate work.", UiTone.Muted));
+            if (tasks.Count == 0) lines.Add(new UiLine(_boardPage == 0
+                ? "  No tasks yet. Use board_task create/claim to coordinate work."
+                : "  No older tasks. Press PageUp.", UiTone.Muted));
             foreach (var task in tasks.Take(Math.Max(1, count - lines.Count)))
             {
                 var owner = members.FirstOrDefault(a => a.Id == task.OwnerId)?.Name ?? "unassigned";
@@ -1320,7 +1324,9 @@ public sealed class SupervisorTui
         }
         else
         {
-            if (pins.Count == 0) lines.Add(new UiLine("  No pins yet. Use board_pin save to preserve decisions.", UiTone.Muted));
+            if (pins.Count == 0) lines.Add(new UiLine(_boardPage == 0
+                ? "  No pins yet. Use board_pin save to preserve decisions."
+                : "  No older pins. Press PageUp.", UiTone.Muted));
             foreach (var pin in pins.Take(Math.Max(1, count - lines.Count)))
             {
                 lines.Add(new UiLine(Fit($"  [{pin.Key}] {pin.Title}  ·  {pin.Body}", width), UiTone.Normal));
