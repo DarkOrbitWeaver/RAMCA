@@ -1032,15 +1032,36 @@ public static partial class EditingTools
                 }
 
                 var edit = db.GetEdit(editId) ?? throw new KeyNotFoundException($"Edit '{editId}' not found.");
-                var full = guard.ResolvePath(edit.RelativePath, explicitWorkspace: edit.Workspace);
-                var oldLines = edit.BackupFilePath is not null && File.Exists(ResolveBackupPath(paths, edit))
-                    ? LoadTextFile(ResolveBackupPath(paths, edit)).Lines
-                    : [];
-                var curLines = File.Exists(full) ? LoadTextFile(full).Lines : [];
-                var diff = BuildCompactUnifiedDiff(edit.RelativePath, oldLines, curLines);
+                if (!string.Equals(WorkspaceGuard.NormalizeRoot(ws), WorkspaceGuard.NormalizeRoot(edit.Workspace),
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                    return Task.FromResult(ToolResult.Fail("wrong_workspace",
+                        "Select the edit's original workspace before inspecting its diff."));
+
+                var full = guard.ResolvePath(edit.RelativePath);
+                var backupPath = edit.BackupFilePath is null ? null : ResolveBackupPath(paths, edit);
+                var beforeExists = backupPath is not null && File.Exists(backupPath);
+                var afterExists = File.Exists(full);
+
+                // A deleted file can be much larger than the text editor's 8 MiB cap.
+                // Don't report an error or invent a text diff for binary snapshots.
+                var canReadText = (!beforeExists || new FileInfo(backupPath!).Length <= MaxEditableFileBytes) &&
+                                  (!afterExists || new FileInfo(full).Length <= MaxEditableFileBytes);
+                string? diff = null;
+                if (canReadText)
+                {
+                    try
+                    {
+                        var oldLines = beforeExists ? LoadTextFile(backupPath!).Lines : [];
+                        var curLines = afterExists ? LoadTextFile(full).Lines : [];
+                        diff = BuildCompactUnifiedDiff(edit.RelativePath, oldLines, curLines);
+                    }
+                    catch (InvalidOperationException) { }
+                    catch (DecoderFallbackException) { }
+                }
 
                 return Task.FromResult(ToolResult.Ok(
-                    $"Computed diff for edit '{edit.EditId}' on '{edit.RelativePath}'.",
+                    diff is null ? $"Edit '{edit.EditId}' has binary or oversized content; showing checksums only."
+                                 : $"Computed diff for edit '{edit.EditId}' on '{edit.RelativePath}'.",
                     new
                     {
                         edit.EditId,
@@ -1051,7 +1072,9 @@ public static partial class EditingTools
                         edit.LinesAdded,
                         edit.LinesRemoved,
                         edit.Reverted,
-                        diff
+                        diffAvailable = diff is not null,
+                        diff,
+                        note = diff is null ? "Text diff unavailable for binary, non-text or oversized files. Use saved SHA-256 and edit journal instead." : null
                     }));
             });
 
