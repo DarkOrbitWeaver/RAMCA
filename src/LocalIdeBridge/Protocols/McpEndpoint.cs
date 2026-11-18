@@ -675,9 +675,17 @@ public sealed class McpServer
                     _pendingToolCalls.TryRemove(requestKey, out _);
                 }
                 var structuredNode = JsonSerializer.SerializeToNode(res, AppConfig.JsonOptions) as JsonObject ?? new JsonObject();
-                // Keep MCP's interoperable text mirror, but do not pretty-print a
-                // second large copy of structured data for model-facing clients.
+                // Legacy clients may only read text. Modern clients can use
+                // structuredContent, so avoid sending the same large payload twice.
                 var textPayload = structuredNode.ToJsonString();
+                if (isStateless2026 && textPayload.Length > 2_000)
+                {
+                    textPayload = new JsonObject
+                    {
+                        ["summary"] = res.Summary,
+                        ["fullResultInStructuredContent"] = true
+                    }.ToJsonString();
+                }
 
                 var callResult = new JsonObject
                 {
