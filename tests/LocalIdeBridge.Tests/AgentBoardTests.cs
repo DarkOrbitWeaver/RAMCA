@@ -385,4 +385,50 @@ public sealed class AgentBoardTests
         Assert.Equal(1L, board.ReadEvents(room, 0, 1).Events[0].Sequence);
     }
 
+    [Fact]
+    public async Task BoardWorkRequiresAFileVersionBeforeReplacingExistingContent()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var room = sb.Host.Board.GetOrCreateRoom("VESPER", sb.WorkspaceDir);
+        var (agent, key) = sb.Host.Board.Join(room, "Engine", "worker");
+        var task = sb.Host.Board.CreateTask(room, agent.Id, key,
+            "Edit a file", "Preserve another editor's changes", null, "version-check");
+        sb.Host.Board.ChangeTask(room, agent.Id, key, task.Id, "claim", task.Revision);
+
+        Directory.CreateDirectory(Path.Combine(sb.WorkspaceDir, ".git"));
+        File.WriteAllText(Path.Combine(sb.WorkspaceDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+        var file = Path.Combine(sb.WorkspaceDir, "file.txt");
+        await File.WriteAllTextAsync(file, "before\n");
+
+        JsonObject Replace(string? sha)
+        {
+            var editArgs = new JsonObject
+            {
+                ["path"] = "file.txt", ["startLine"] = 1, ["endLine"] = 1,
+                ["newText"] = "after"
+            };
+            if (sha is not null) editArgs["expectedSha256"] = sha;
+            return new JsonObject
+            {
+                ["roomId"] = room.Id, ["agentId"] = agent.Id, ["credential"] = key,
+                ["taskId"] = task.Id, ["tool"] = "replace_range", ["arguments"] = editArgs
+            };
+        }
+
+        var missing = await sb.Host.Registry.InvokeAsync("board_work", Replace(null));
+        Assert.False(missing.Success);
+        Assert.Equal("expected_version_required", missing.ErrorCode);
+
+        var stale = await sb.Host.Registry.InvokeAsync("board_work", Replace(new string('0', 64)));
+        Assert.False(stale.Success);
+        Assert.Equal("stale_file", stale.ErrorCode);
+        Assert.Equal("before\n", await File.ReadAllTextAsync(file));
+
+        var current = Convert.ToHexStringLower(
+            System.Security.Cryptography.SHA256.HashData(await File.ReadAllBytesAsync(file)));
+        var changed = await sb.Host.Registry.InvokeAsync("board_work", Replace(current));
+        Assert.True(changed.Success, changed.ErrorMessage);
+        Assert.StartsWith("after", await File.ReadAllTextAsync(file));
+    }
+
 }
