@@ -667,6 +667,66 @@ public sealed class AgentBoardStore
         new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3),
             r.GetString(4), r.GetInt64(5), Time(r.GetString(6)));
 
+    public BoardPin SaveSupervisorPin(BoardRoom room, string key, string title, string body)
+    {
+        key = Required(key, "Pin key", 64);
+        title = Required(title, "Pin title", 120);
+        body = _secrets.Redact(Required(body, "Pin content", 4000));
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            using (var save = Cmd(conn, tx, """
+                INSERT INTO board_pins(id,room_id,pin_key,title,body,revision,updated_at)
+                VALUES($id,$room,$key,$title,$body,1,$now)
+                ON CONFLICT(room_id,pin_key) DO UPDATE SET
+                    title=excluded.title,body=excluded.body,revision=board_pins.revision+1,
+                    updated_at=excluded.updated_at;
+                """, ("$id", NewId("pin")), ("$room", room.Id), ("$key", key),
+                ("$title", title), ("$body", body), ("$now", Utc())))
+                save.ExecuteNonQuery();
+            using var query = Cmd(conn, tx, """
+                SELECT id,room_id,pin_key,title,body,revision,updated_at
+                FROM board_pins WHERE room_id=$room AND pin_key=$key;
+                """, ("$room", room.Id), ("$key", key));
+            BoardPin pin;
+            using (var reader = query.ExecuteReader())
+            {
+                if (!reader.Read()) throw new InvalidOperationException("Supervisor pin not found after save.");
+                pin = ReadPin(reader);
+            }
+            using (var post = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,'owner','decision',$body,$now);
+                """, ("$room", room.Id), ("$body", $"Pinned {key}: {title}"), ("$now", Utc())))
+                post.ExecuteNonQuery();
+            tx.Commit();
+            Signal(room.Id);
+            return pin;
+        }
+    }
+
+    public void DeleteSupervisorPin(BoardRoom room, string key)
+    {
+        key = Required(key, "Pin key", 64);
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            using (var remove = Cmd(conn, tx,
+                "DELETE FROM board_pins WHERE room_id=$room AND pin_key=$key;",
+                ("$room", room.Id), ("$key", key)))
+                if (remove.ExecuteNonQuery() == 0) throw new KeyNotFoundException("Pin not found.");
+            using (var post = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,'owner','decision',$body,$now);
+                """, ("$room", room.Id), ("$body", $"Removed pin {key}"), ("$now", Utc())))
+                post.ExecuteNonQuery();
+            tx.Commit();
+            Signal(room.Id);
+        }
+    }
+
     public void DeletePin(BoardRoom room, string agentId, string credential,
         string key, long expectedRevision)
     {
