@@ -242,6 +242,12 @@ public sealed class SupervisorTui
             case ConsoleKey.M:
                 if (_activeTab == ViewTab.Board) PromptBoardSteering();
                 break;
+            case ConsoleKey.L:
+                if (_activeTab == ViewTab.Board) PromptBoardPin();
+                break;
+            case ConsoleKey.X:
+                if (_activeTab == ViewTab.Board) PromptDeleteBoardPin();
+                break;
             case ConsoleKey.UpArrow: MoveSelection(-1); break;
             case ConsoleKey.DownArrow: MoveSelection(1); break;
             case ConsoleKey.PageUp: MoveSelection(-Math.Max(1, _lastListSlots - 1)); break;
@@ -264,6 +270,11 @@ public sealed class SupervisorTui
             }
             case ConsoleKey.C:
             {
+                if (_activeTab == ViewTab.Board)
+                {
+                    PromptCreateBoardRoom();
+                    break;
+                }
                 if (!ChatGptTunnelSetup.IsConfigured(_host.Paths))
                 {
                     Console.Write("\x1b[?25h\x1b[2J\x1b[H");
@@ -638,7 +649,7 @@ public sealed class SupervisorTui
         Line(Style("[Up/Down] Select  [PgUp/PgDn] Page  [Enter] Details  [Esc] Back", UiTone.Muted));
         Line("[C] ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate");
         Line(_activeTab == ViewTab.Board
-            ? "[B] Chat/Tasks/Pins  [J] Invite  [M] Steer agent  [W] Workspace  [Q] Quit"
+            ? "[B] Views  [C] New room  [J] Invite  [M] Steer  [L] Pin  [X] Unpin  [Q] Quit"
             : "[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
         sb.Append(ClipAnsi(Style(Fit(_statusBanner, w - 1), UiTone.Muted), w - 1)).Append("\x1b[0m\x1b[K");
         Console.Write(sb.ToString());
@@ -948,6 +959,110 @@ public sealed class SupervisorTui
         foreach (var (session, index) in sessions.Select((v, i) => (v, i)))
             lines.Add(new UiLine(Fit(
                 $"    {(_scrollOffset + index == _scrollOffset ? '›' : ' ')} {session.Status,-7} {session.Id}  calls {session.ToolCallCount}  err {session.ErrorCount}", width)));
+    }
+
+    private void PromptCreateBoardRoom()
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        if (workspace is null)
+        {
+            _statusBanner = "Select a trusted workspace before creating a room.";
+            return;
+        }
+
+        Console.Write("\x1b[?25h\x1b[2J\x1b[H");
+        try
+        {
+            Console.WriteLine($"New RAMCA agent room for {workspace}");
+            Console.Write("Room name (blank = cancel): ");
+            var name = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(name)) return;
+            var room = _host.Board.GetOrCreateRoom(name, workspace);
+            _statusBanner = $"Room '{room.Name}' is ready. Press J to copy an invitation.";
+            var rooms = _host.Board.ListRooms(workspace);
+            var selected = rooms.ToList().FindIndex(r => r.Id == room.Id);
+            if (selected >= 0) _scrollOffset = selected;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or InvalidOperationException)
+        {
+            _statusBanner = $"Could not create room: {ex.Message}";
+        }
+        finally { Console.Write("\x1b[?25l"); }
+    }
+
+    private void PromptBoardPin()
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        var rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
+        if (rooms.Count == 0)
+        {
+            _statusBanner = "Create or select a board room first.";
+            return;
+        }
+        var room = rooms[Math.Min(_scrollOffset, rooms.Count - 1)];
+        Console.Write("\x1b[?25h\x1b[2J\x1b[H");
+        try
+        {
+            Console.WriteLine($"Pin a decision in '{room.Name}'");
+            foreach (var p in _host.Board.ListPins(room, 15))
+                Console.WriteLine($"  {p.Key}: {p.Title}");
+            Console.Write("Pin key (blank = cancel): ");
+            var key = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(key)) return;
+            var old = _host.Board.ListPins(room, 100).FirstOrDefault(p => p.Key == key);
+            if (old is not null)
+            {
+                Console.Write($"This replaces '{old.Title}'. Type yes to continue: ");
+                if (Console.ReadLine()?.Trim() != "yes")
+                {
+                    _statusBanner = "Pin unchanged.";
+                    return;
+                }
+            }
+            Console.Write("Title: ");
+            var title = Console.ReadLine();
+            Console.Write("Content: ");
+            var content = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(content)) return;
+            var saved = _host.Board.SaveSupervisorPin(room, key, title, content);
+            _statusBanner = $"Saved pin '{saved.Key}' (revision {saved.Revision}).";
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or InvalidOperationException)
+        {
+            _statusBanner = $"Pin not saved: {ex.Message}";
+        }
+        finally { Console.Write("\x1b[?25l"); }
+    }
+
+    private void PromptDeleteBoardPin()
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        var rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
+        if (rooms.Count == 0)
+        {
+            _statusBanner = "No board room selected.";
+            return;
+        }
+        var room = rooms[Math.Min(_scrollOffset, rooms.Count - 1)];
+        Console.Write("\x1b[?25h\x1b[2J\x1b[H");
+        try
+        {
+            Console.WriteLine($"Remove a pin from '{room.Name}'");
+            foreach (var p in _host.Board.ListPins(room, 30))
+                Console.WriteLine($"  {p.Key}: {p.Title}");
+            Console.Write("Key to remove (blank = cancel): ");
+            var key = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(key)) return;
+            Console.Write($"Type yes to remove '{key}': ");
+            if (Console.ReadLine()?.Trim() != "yes") return;
+            _host.Board.DeleteSupervisorPin(room, key.Trim());
+            _statusBanner = $"Removed pin '{key.Trim()}'.";
+        }
+        catch (Exception ex) when (ex is ArgumentException or KeyNotFoundException or IOException)
+        {
+            _statusBanner = $"Pin not removed: {ex.Message}";
+        }
+        finally { Console.Write("\x1b[?25l"); }
     }
 
     private void PromptBoardSteering()
