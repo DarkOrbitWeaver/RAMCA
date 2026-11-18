@@ -164,7 +164,7 @@ public static class AgentBoardTools
 
         yield return new ToolDefinition(
             Name: "board_task", Category: "board",
-            Description: "Create, list, claim, adopt, renew, assign, release, complete, block or reopen durable tasks with revision checks. Expired claims require reconciliation.",
+            Description: "Create, list, claim, adopt, renew, assign, release, complete, block, reopen or revise durable tasks with revision checks. Expired claims require reconciliation.",
             IsReadOnly: false, IsIdempotent: false,
             SideEffects: "Lists or changes durable task state. No project files are edited.",
             Parameters:
@@ -172,7 +172,7 @@ public static class AgentBoardTools
                 new("roomId", "string", "Room ID.", Required: true),
                 new("agentId", "string", "Agent ID.", Required: true),
                 new("credential", "string", "Scoped credential.", Required: true),
-                new("action", "string", "list | create | claim | adopt | renew | release | complete | block | reopen | assign.", Required: true),
+                new("action", "string", "list | create | claim | adopt | renew | release | complete | block | reopen | assign | revise.", Required: true),
                 new("title", "string", "Task title for create."),
                 new("details", "string", "Task acceptance criteria and requirements for create."),
                 new("workArea", "string", "Advisory file/subsystem scope for create."),
@@ -207,7 +207,8 @@ public static class AgentBoardTools
                     var revision = args.OptionalLong("expectedRevision", 0);
                     task = board.ChangeTask(room, id, secret, args.RequireString("taskId"), action,
                         revision, args.OptionalString("evidence"), args.OptionalString("assigneeId"),
-                        args.OptionalInt("leaseMinutes", 15));
+                        args.OptionalInt("leaseMinutes", 15),
+                        args.OptionalString("title"), args.OptionalString("details"));
                 }
                 return Task.FromResult(ToolResult.Ok($"Task '{task.Title}' is {task.Status} (revision {task.Revision}).", task));
             });
@@ -222,7 +223,7 @@ public static class AgentBoardTools
                 new("roomId", "string", "Room ID.", Required: true),
                 new("agentId", "string", "Agent ID.", Required: true),
                 new("credential", "string", "Scoped credential.", Required: true),
-                new("action", "string", "list or save.", Required: true),
+                new("action", "string", "list, save or delete.", Required: true),
                 new("key", "string", "Stable pin key for save."),
                 new("title", "string", "Pin title for save."),
                 new("body", "string", "Pin content for save."),
@@ -235,8 +236,14 @@ public static class AgentBoardTools
                 if (args.RequireString("action") == "list")
                     return Task.FromResult(ToolResult.Ok("Room pins.",
                         new { pins = board.ListPins(room) }));
+                if (args.RequireString("action") == "delete")
+                {
+                    board.DeletePin(room, args.RequireString("agentId"), args.RequireString("credential"),
+                        args.RequireString("key"), args.OptionalLong("expectedRevision", 0));
+                    return Task.FromResult(ToolResult.Ok("Pin removed.", new { key = args.RequireString("key") }));
+                }
                 if (args.RequireString("action") != "save")
-                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "Pin action must be list or save."));
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "Pin action must be list, save or delete."));
                 long? revision = args.TryGetPropertyValue("expectedRevision", out var r) && r is not null
                     ? args.OptionalLong("expectedRevision", 0) : null;
                 var pin = board.SavePin(room, args.RequireString("agentId"), args.RequireString("credential"),
