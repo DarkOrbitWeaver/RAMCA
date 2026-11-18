@@ -349,6 +349,43 @@ public sealed class AgentBoardStore
         return result;
     }
 
+    /// <summary>Local supervisor-only steering; no remote caller may impersonate this author.</summary>
+    public BoardEvent PostSupervisor(BoardRoom room, string body, string? targetAgentId = null)
+    {
+        body = _secrets.Redact(Required(body, "Supervisor message", 4000));
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            if (targetAgentId is not null)
+            {
+                using var target = Cmd(conn, tx, "SELECT COUNT(1) FROM board_agents WHERE room_id=$room AND id=$id;",
+                    ("$room", room.Id), ("$id", targetAgentId));
+                if (Convert.ToInt64(target.ExecuteScalar()) != 1)
+                    throw new ArgumentException("Target agent not found in this room.");
+            }
+            using (var command = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,target_id,kind,body,created_at)
+                VALUES($room,'owner',$target,'steering',$body,$now);
+                """, ("$room", room.Id), ("$target", targetAgentId), ("$body", body), ("$now", Utc())))
+                command.ExecuteNonQuery();
+            using var id = Cmd(conn, tx, "SELECT last_insert_rowid();");
+            var sequence = Convert.ToInt64(id.ExecuteScalar());
+            using var query = Cmd(conn, tx, """
+                SELECT sequence,room_id,author_id,target_id,kind,body,created_at
+                FROM board_events WHERE sequence=$sequence;
+                """, ("$sequence", sequence));
+            BoardEvent result;
+            using (var r = query.ExecuteReader())
+            {
+                if (!r.Read()) throw new InvalidOperationException("Supervisor steering event was not saved.");
+                result = ReadEvent(r);
+            }
+            tx.Commit();
+            return result;
+        }
+    }
+
     public void Acknowledge(BoardRoom room, string agentId, string credential, long sequence)
     {
         if (sequence < 0) throw new ArgumentException("Acknowledgment cursor must be nonnegative.");
@@ -412,6 +449,12 @@ public sealed class AgentBoardStore
                 if (!r.Read()) throw new InvalidOperationException("Pin not found after update.");
                 result = ReadPin(r);
             }
+            using (var eventCommand = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,$author,'decision',$body,$now);
+                """, ("$room", room.Id), ("$author", agentId),
+                ("$body", $"Updated pin {key}: {title}"), ("$now", Utc())))
+                eventCommand.ExecuteNonQuery();
             tx.Commit();
             return result;
         }
@@ -452,6 +495,12 @@ public sealed class AgentBoardStore
                 """, ("$id", id), ("$room", room.Id), ("$title", title),
                 ("$details", details), ("$area", workArea), ("$now", Utc())))
                 insert.ExecuteNonQuery();
+            using (var eventCommand = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,$author,'status',$body,$now);
+                """, ("$room", room.Id), ("$author", agentId),
+                ("$body", $"Created task {id}: {title}"), ("$now", Utc())))
+                eventCommand.ExecuteNonQuery();
             var result = ReadTaskById(conn, tx, room.Id, id);
             tx.Commit();
             return result;
@@ -496,7 +545,7 @@ public sealed class AgentBoardStore
         string? assigneeId = null, int leaseMinutes = 15)
     {
         if (expectedRevision < 1) throw new ArgumentException("expectedRevision must be positive.");
-        if (action is not ("claim" or "renew" or "release" or "complete" or "block" or "reopen" or "assign"))
+        if (action is not ("claim" or "renew" or "release" or "complete" or "block" or "reopen" or "assign" or "adopt"))
             throw new ArgumentException("Unknown task action.");
         if (evidence is not null) evidence = _secrets.Redact(Required(evidence, "Evidence", 2000));
         lock (_writes)
@@ -519,6 +568,14 @@ public sealed class AgentBoardStore
                     if (status != "open" || owner is not null)
                         throw new InvalidOperationException("Task already claimed or not open; do not steal an expired lease.");
                     status = "in_progress"; owner = agentId; generation = agent.Generation;
+                    lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
+                    break;
+                case "adopt":
+                    if (current.OwnerId != agentId || current.OwnerGeneration >= agent.Generation ||
+                        current.Status != "in_progress" || string.IsNullOrWhiteSpace(evidence))
+                        throw new InvalidOperationException(
+                            "Can only adopt your own stale attachment after inspecting prior work and supplying reconciliation evidence.");
+                    generation = agent.Generation;
                     lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
                     break;
                 case "renew":
@@ -550,6 +607,8 @@ public sealed class AgentBoardStore
                         if (value is null) throw new ArgumentException("Target agent is not part of the room.");
                         generation = Convert.ToInt64(value);
                     }
+                    if (current.OwnerId is not null && string.IsNullOrWhiteSpace(evidence))
+                        throw new InvalidOperationException("Reassignment requires reconciliation evidence when another agent owns this task.");
                     status = "in_progress"; owner = assigneeId;
                     lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
                     break;
@@ -565,6 +624,13 @@ public sealed class AgentBoardStore
             {
                 if (update.ExecuteNonQuery() != 1) throw new InvalidOperationException("Concurrent task change; sync first.");
             }
+            using (var eventCommand = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,$author,'status',$body,$now);
+                """, ("$room", room.Id), ("$author", agentId),
+                ("$body", $"Task {taskId}: {action} -> {status}; {evidence ?? "no evidence supplied"}"),
+                ("$now", Utc())))
+                eventCommand.ExecuteNonQuery();
             var updated = ReadTaskById(conn, tx, room.Id, taskId);
             tx.Commit();
             return updated;
