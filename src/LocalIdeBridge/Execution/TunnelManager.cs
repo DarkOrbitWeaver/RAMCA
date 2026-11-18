@@ -325,8 +325,15 @@ public sealed partial class TunnelManager : IDisposable
             _ = DrainRedactedAsync(output, CancellationToken.None);
             _ = DrainRedactedAsync(errors, CancellationToken.None);
             proc.Exited += (_, _) => OnExited();
-            try { if (proc.HasExited) OnExited(); }
-            catch (ObjectDisposedException) { }
+            try
+            {
+                if (proc.HasExited)
+                {
+                    OnExited();
+                    return false;
+                }
+            }
+            catch (ObjectDisposedException) { return false; }
             _logger.Info("tunnel", "Private ChatGPT tunnel process started. Connection readiness requires a real MCP client call.");
             return true;
         }
