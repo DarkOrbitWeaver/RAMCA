@@ -1291,7 +1291,7 @@ public sealed class SupervisorTui
         var acks = _host.Board.ListAcknowledgments(selected);
         var inProgress = tasks.Count(t => t.Status == "in_progress");
         var blocked = tasks.Count(t => t.Status == "blocked");
-        lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents {members.Count}  |  active {inProgress}  |  blocked {blocked}  |  {_boardMode} page {_boardPage + 1} (PgUp/PgDn)", width), UiTone.Accent));
+        lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents shown {members.Count}  |  active shown {inProgress}  |  blocked shown {blocked}  |  {_boardMode} page {_boardPage + 1} (PgUp/PgDn)", width), UiTone.Accent));
         if (_boardMode == BoardMode.Chat)
         {
             if (events.Count == 0) lines.Add(new UiLine("  No messages. Connected agents can use board_post.", UiTone.Muted));
