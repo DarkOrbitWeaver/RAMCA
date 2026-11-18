@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using LocalIdeBridge.Core;
@@ -22,6 +23,19 @@ public sealed class AgentBoardStore
     private readonly string _connectionString;
     private readonly CredentialStore _secrets;
     private readonly object _writes = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _signals = new();
+
+    private static TaskCompletionSource<bool> NewSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void Signal(string roomId)
+    {
+        _signals.AddOrUpdate(roomId, _ => NewSignal(), (_, previous) =>
+        {
+            previous.TrySetResult(true);
+            return NewSignal();
+        });
+    }
 
     public AgentBoardStore(PortablePaths paths, CredentialStore secrets)
     {
@@ -226,6 +240,7 @@ public sealed class AgentBoardStore
                 agent = ReadAgent(r);
             }
             tx.Commit();
+            Signal(room.Id);
             return (agent, nextSecret);
         }
     }
@@ -306,6 +321,7 @@ public sealed class AgentBoardStore
             if (result.Kind != kind || result.Body != safe || result.Target != targetId)
                 throw new InvalidOperationException("requestId was reused with different message content.");
             tx.Commit();
+            Signal(room.Id);
             return result;
         }
     }
@@ -333,6 +349,30 @@ public sealed class AgentBoardStore
         var hasMore = result.Count > limit;
         if (hasMore) result.RemoveAt(result.Count - 1);
         return (result, hasMore);
+    }
+
+    public long LatestSequence(BoardRoom room)
+    {
+        using var conn = Open();
+        using var cmd = Cmd(conn, null,
+            "SELECT COALESCE(MAX(sequence),0) FROM board_events WHERE room_id=$room;",
+            ("$room", room.Id));
+        return Convert.ToInt64(cmd.ExecuteScalar());
+    }
+
+    /// <summary>No polling loop; each waiter either sees a new event or times out.</summary>
+    public async Task<bool> WaitForEventsAsync(BoardRoom room, long after, int waitMs, CancellationToken ct)
+    {
+        var signal = _signals.GetOrAdd(room.Id, _ => NewSignal());
+        if (LatestSequence(room) > after) return true;
+        if (waitMs < 1) return false;
+        try
+        {
+            await signal.Task.WaitAsync(TimeSpan.FromMilliseconds(Math.Clamp(waitMs, 1, 20_000)), ct)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException) { }
+        return LatestSequence(room) > after;
     }
 
     public IReadOnlyList<BoardEvent> ReadLatestEvents(BoardRoom room, int limit = 25)
@@ -382,6 +422,7 @@ public sealed class AgentBoardStore
                 result = ReadEvent(r);
             }
             tx.Commit();
+            Signal(room.Id);
             return result;
         }
     }
@@ -404,6 +445,7 @@ public sealed class AgentBoardStore
                 """, ("$seq", sequence), ("$now", Utc()), ("$id", agentId), ("$room", room.Id));
             update.ExecuteNonQuery();
             tx.Commit();
+            Signal(room.Id);
         }
     }
 
@@ -456,6 +498,7 @@ public sealed class AgentBoardStore
                 ("$body", $"Updated pin {key}: {title}"), ("$now", Utc())))
                 eventCommand.ExecuteNonQuery();
             tx.Commit();
+            Signal(room.Id);
             return result;
         }
     }
@@ -503,6 +546,7 @@ public sealed class AgentBoardStore
                 eventCommand.ExecuteNonQuery();
             var result = ReadTaskById(conn, tx, room.Id, id);
             tx.Commit();
+            Signal(room.Id);
             return result;
         }
     }
@@ -645,6 +689,7 @@ public sealed class AgentBoardStore
                 eventCommand.ExecuteNonQuery();
             var updated = ReadTaskById(conn, tx, room.Id, taskId);
             tx.Commit();
+            Signal(room.Id);
             return updated;
         }
     }
