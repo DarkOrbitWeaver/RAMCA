@@ -397,6 +397,23 @@ public static class AgentBoardTools
                 var result = await registry.InvokeAsync(toolName, (JsonObject)inner.DeepClone(),
                     new ToolExecutionContext(ctx.SessionId, ctx.JobId, ctx.ReportProgress,
                         SkipWriteLock: true, WorkspaceRoot: room.Workspace), ct).ConfigureAwait(false);
+
+                // The action already ran. A failed board receipt must never invite a blind retry.
+                try
+                {
+                    var summary = result.Summary;
+                    if (summary.Length > 1200) summary = summary[..1200];
+                    board.Post(room, agentId, credential,
+                        result.Success ? "status" : "blocker",
+                        $"Task {taskId}: {toolName} {(result.Success ? "completed" : "failed")}. {summary}",
+                        "work_" + Guid.NewGuid().ToString("N"));
+                }
+                catch (Exception ex)
+                {
+                    return ToolResult.Fail("board_receipt_missing",
+                        $"The tool already ran, but its board report could not be saved ({ex.GetType().Name}). Check the actual result before retrying.",
+                        new { executedResult = result }, result.ExecutionId);
+                }
                 return result;
             });
     }
