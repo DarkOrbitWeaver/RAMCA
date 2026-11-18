@@ -322,6 +322,7 @@ public static class AgentBoardTools
                 var tasks = taskPage.Take(40).ToArray();
                 var pins = pinPage.Take(25).ToArray();
                 var acknowledged = board.GetAcknowledged(room, agent.Id);
+                var executions = database.ListWorkspaceExecutionSummaries(room.Workspace, 12);
                 var sb = new StringBuilder();
                 sb.AppendLine($"You are continuing RAMCA agent '{agent.Name}' ({agent.Role}) in room '{room.Name}'.");
                 sb.AppendLine("First connect your own compatible RAMCA MCP tools. Pasting this prompt alone does not connect tools.");
@@ -352,6 +353,12 @@ public static class AgentBoardTools
                     foreach (var cp in checkpoints)
                         sb.AppendLine($"- {cp.Branch}@{cp.CommitSha}: {cp.Label}");
                 }
+                sb.AppendLine("Recent jobs and workflows (recorded status, check live state):");
+                foreach (var execution in executions)
+                    sb.AppendLine($"- {execution.Kind} {execution.Id} [{execution.Status}]: {execution.Name}" +
+                        (execution.LogExecId is null ? "" : $"; logExecId={execution.LogExecId}"));
+                if (executions.Any(e => e.Status is "running" or "queued" or "interrupted_restart"))
+                    sb.AppendLine("Inspect pending/interrupted jobs before starting new mutations. Never blindly retry them.");
                 sb.AppendLine("Never claim a tool/test/commit succeeded without verifying it. Inspect the current Git state and task claim before writing.");
                 var prompt = sb.ToString();
                 if (prompt.Length > 16_000)
@@ -360,7 +367,8 @@ public static class AgentBoardTools
                 return Task.FromResult(ToolResult.Ok("Copy-ready agent handoff created from durable RAMCA records.",
                     new { prompt, roomId = room.Id, agentId = agent.Id,
                         acknowledgedCursor = acknowledged, pinCount = pins.Length, taskCount = tasks.Length,
-                        pinsTruncated = pinPage.Count > 25, tasksTruncated = taskPage.Count > 40 }));
+                        pinsTruncated = pinPage.Count > 25, tasksTruncated = taskPage.Count > 40,
+                        jobCountIncluded = executions.Count }));
             });
 
         yield return new ToolDefinition(
