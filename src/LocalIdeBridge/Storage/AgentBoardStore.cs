@@ -63,7 +63,7 @@ public sealed class AgentBoardStore
     private static string Required(string value, string label, int max)
     {
         value = value.Trim();
-        if (value.Length == 0 || value.Length > max || value.Any(char.IsControl))
+        if (value.Length == 0 || value.Length > max || value.Any(c => char.IsControl(c) && c is not ('\n' or '\r' or '\t')))
             throw new ArgumentException($"{label} must contain 1 to {max} characters without control characters.");
         return value;
     }
@@ -127,6 +127,20 @@ public sealed class AgentBoardStore
             r.IsDBNull(8) ? null : Time(r.GetString(8)),
             r.IsDBNull(9) ? null : r.GetString(9),
             r.IsDBNull(10) ? null : r.GetString(10), Time(r.GetString(11)));
+
+    public IReadOnlyList<BoardRoom> ListRooms(string workspace, int limit = 40)
+    {
+        using var conn = Open();
+        using var cmd = Cmd(conn, null, """
+            SELECT id,name,workspace,created_at FROM board_rooms WHERE workspace=$ws
+            ORDER BY created_at ASC LIMIT $limit;
+            """, ("$ws", WorkspaceGuard.NormalizeRoot(workspace)),
+            ("$limit", Math.Clamp(limit, 1, 100)));
+        using var r = cmd.ExecuteReader();
+        var result = new List<BoardRoom>();
+        while (r.Read()) result.Add(ReadRoom(r));
+        return result;
+    }
 
     public BoardRoom GetOrCreateRoom(string name, string workspace)
     {
@@ -319,6 +333,20 @@ public sealed class AgentBoardStore
         var hasMore = result.Count > limit;
         if (hasMore) result.RemoveAt(result.Count - 1);
         return (result, hasMore);
+    }
+
+    public IReadOnlyList<BoardEvent> ReadLatestEvents(BoardRoom room, int limit = 25)
+    {
+        using var conn = Open();
+        using var query = Cmd(conn, null, """
+            SELECT sequence,room_id,author_id,target_id,kind,body,created_at
+            FROM board_events WHERE room_id=$room ORDER BY sequence DESC LIMIT $limit;
+            """, ("$room", room.Id), ("$limit", Math.Clamp(limit, 1, 100)));
+        using var r = query.ExecuteReader();
+        var result = new List<BoardEvent>();
+        while (r.Read()) result.Add(ReadEvent(r));
+        result.Reverse();
+        return result;
     }
 
     public void Acknowledge(BoardRoom room, string agentId, string credential, long sequence)
