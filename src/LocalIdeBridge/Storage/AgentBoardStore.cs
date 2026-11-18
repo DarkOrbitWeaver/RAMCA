@@ -442,11 +442,17 @@ public sealed class AgentBoardStore
         {
             using var conn = Open();
             using var tx = conn.BeginTransaction();
-            ValidateAgent(conn, tx, room.Id, agentId, credential);
-            using var maxQuery = Cmd(conn, tx, "SELECT COALESCE(MAX(sequence),0) FROM board_events WHERE room_id=$room;",
-                ("$room", room.Id));
-            var max = Convert.ToInt64(maxQuery.ExecuteScalar());
-            if (sequence > max) throw new ArgumentException("Cannot acknowledge an event sequence that does not exist.");
+            var agent = ValidateAgent(conn, tx, room.Id, agentId, credential);
+            if (sequence > 0)
+            {
+                var visibleTo = agent.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase) ? null : agentId;
+                using var check = Cmd(conn, tx, """
+                    SELECT COUNT(1) FROM board_events WHERE room_id=$room AND sequence=$seq
+                    AND ($agent IS NULL OR target_id IS NULL OR target_id=$agent OR author_id=$agent);
+                    """, ("$room", room.Id), ("$seq", sequence), ("$agent", visibleTo));
+                if (Convert.ToInt64(check.ExecuteScalar()) != 1)
+                    throw new ArgumentException("This event was not visible to this agent; it cannot be acknowledged.");
+            }
             using var update = Cmd(conn, tx, """
                 UPDATE board_agents SET acknowledged_sequence=MAX(acknowledged_sequence,$seq),last_seen_at=$now
                 WHERE id=$id AND room_id=$room;
