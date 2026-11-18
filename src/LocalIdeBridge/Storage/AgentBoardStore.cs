@@ -280,10 +280,6 @@ public sealed class AgentBoardStore
     public BoardInvitation CreateInvitation(BoardRoom room, string coordinatorId, string credential,
         string? targetAgentId, string role, int days = 7)
     {
-        role = Required(role, "Invited role", 32);
-        if (role is not ("worker" or "reviewer" or "coordinator"))
-            throw new ArgumentException("Invited role must be worker, reviewer or coordinator.");
-
         lock (_writes)
         {
             using var conn = Open();
@@ -291,30 +287,62 @@ public sealed class AgentBoardStore
             var coordinator = ValidateAgent(conn, tx, room.Id, coordinatorId, credential);
             if (!coordinator.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase))
                 throw new UnauthorizedAccessException("Only a room coordinator can create an invitation.");
-
-            if (!string.IsNullOrWhiteSpace(targetAgentId))
-            {
-                using var old = Cmd(conn, tx, "SELECT role FROM board_agents WHERE room_id=$room AND id=$id;",
-                    ("$room", room.Id), ("$id", targetAgentId));
-                var previousRole = old.ExecuteScalar() as string;
-                if (previousRole is null) throw new KeyNotFoundException("Target agent was not found.");
-                if (!string.Equals(previousRole, role, StringComparison.OrdinalIgnoreCase))
-                    throw new ArgumentException("Resuming an agent cannot change its role.");
-            }
-            else if (role == "coordinator")
-                throw new ArgumentException("New coordinator identities cannot be issued through invitations.");
-
-            var code = NewSecret();
-            var expires = DateTimeOffset.UtcNow.AddDays(Math.Clamp(days, 1, 30));
-            using var save = Cmd(conn, tx, """
-                INSERT INTO board_invites(code_hash,room_id,target_agent_id,role,expires_at)
-                VALUES($hash,$room,$agent,$role,$expires);
-                """, ("$hash", Hash(code)), ("$room", room.Id),
-                ("$agent", targetAgentId), ("$role", role), ("$expires", expires.ToString("O")));
-            save.ExecuteNonQuery();
+            var result = CreateInvitationCore(conn, tx, room, targetAgentId, role, days);
             tx.Commit();
-            return new BoardInvitation(code, expires, targetAgentId, role);
+            return result;
         }
+    }
+
+    // This is callable by the local supervisor UI, never registered as a remote MCP tool.
+    public BoardInvitation CreateOwnerInvitation(BoardRoom room, string? targetAgentId,
+        string role, int days = 7)
+    {
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            var result = CreateInvitationCore(conn, tx, room, targetAgentId, role, days);
+            tx.Commit();
+            return result;
+        }
+    }
+
+    private static BoardInvitation CreateInvitationCore(SqliteConnection conn, SqliteTransaction tx,
+        BoardRoom room, string? targetAgentId, string role, int days)
+    {
+        role = Required(role, "Invited role", 32).ToLowerInvariant();
+        if (role is not ("worker" or "reviewer" or "coordinator"))
+            throw new ArgumentException("Role must be worker, reviewer or coordinator.");
+
+        if (!string.IsNullOrWhiteSpace(targetAgentId))
+        {
+            using var existing = Cmd(conn, tx,
+                "SELECT role FROM board_agents WHERE room_id=$room AND id=$id;",
+                ("$room", room.Id), ("$id", targetAgentId));
+            var previousRole = existing.ExecuteScalar() as string;
+            if (previousRole is null) throw new KeyNotFoundException("Target agent was not found.");
+            if (!string.Equals(previousRole, role, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("Resuming an agent cannot change its role.");
+        }
+        else if (role == "coordinator")
+        {
+            using var count = Cmd(conn, tx,
+                "SELECT COUNT(1) FROM board_agents WHERE room_id=$room AND lower(role)='coordinator';",
+                ("$room", room.Id));
+            if (Convert.ToInt64(count.ExecuteScalar()) > 0)
+                throw new InvalidOperationException(
+                    "Room already has a coordinator. Replace that agent instead of creating a second one.");
+        }
+
+        var code = NewSecret();
+        var expires = DateTimeOffset.UtcNow.AddDays(Math.Clamp(days, 1, 30));
+        using var save = Cmd(conn, tx, """
+            INSERT INTO board_invites(code_hash,room_id,target_agent_id,role,expires_at)
+            VALUES($hash,$room,$agent,$role,$expires);
+            """, ("$hash", Hash(code)), ("$room", room.Id),
+            ("$agent", targetAgentId), ("$role", role), ("$expires", expires.ToString("O")));
+        save.ExecuteNonQuery();
+        return new BoardInvitation(code, expires, targetAgentId, role);
     }
 
     public (BoardAgent Agent, string Credential) RedeemInvitation(BoardRoom room,
