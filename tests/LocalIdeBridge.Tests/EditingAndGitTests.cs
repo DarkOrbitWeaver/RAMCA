@@ -162,6 +162,65 @@ public sealed class EditingAndGitTests
     }
 
     [Fact]
+    public async Task RenameCreatesPairedUndoRecordsAndPreservesBinaryBytes()
+    {
+        await using var sb = await TestSandbox.CreateAsync();
+        var source = Path.Combine(sb.WorkspaceDir, "original.bin");
+        var destination = Path.Combine(sb.WorkspaceDir, "sub", "renamed.bin");
+        var bytes = new byte[1024 * 1024 + 111];
+        new Random(19).NextBytes(bytes);
+        await File.WriteAllBytesAsync(source, bytes);
+
+        var move = await sb.Host.Registry.InvokeAsync("rename_file", new JsonObject
+        {
+            ["sourcePath"] = "original.bin",
+            ["destinationPath"] = "sub/renamed.bin"
+        });
+        Assert.True(move.Success, move.Summary);
+        Assert.False(File.Exists(source));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(destination));
+
+        var response = JsonSerializer.SerializeToElement(move.Data);
+        var destinationEditId = response.GetProperty("destinationEditId").GetString()!;
+        var sourceEditId = response.GetProperty("sourceEditId").GetString()!;
+
+        var undoDest = await sb.Host.Registry.InvokeAsync("revert_edit", new JsonObject
+        {
+            ["editId"] = destinationEditId
+        });
+        Assert.True(undoDest.Success, undoDest.Summary);
+        Assert.False(File.Exists(destination));
+
+        var undoSource = await sb.Host.Registry.InvokeAsync("revert_edit", new JsonObject
+        {
+            ["editId"] = sourceEditId
+        });
+        Assert.True(undoSource.Success, undoSource.Summary);
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(source));
+    }
+
+    [Fact]
+    public async Task RenameNeverOverwritesAnExistingDestination()
+    {
+        await using var sb = await TestSandbox.CreateAsync();
+        var source = Path.Combine(sb.WorkspaceDir, "source.txt");
+        var destination = Path.Combine(sb.WorkspaceDir, "destination.txt");
+        await File.WriteAllTextAsync(source, "source");
+        await File.WriteAllTextAsync(destination, "human work");
+
+        var result = await sb.Host.Registry.InvokeAsync("rename_file", new JsonObject
+        {
+            ["sourcePath"] = "source.txt",
+            ["destinationPath"] = "destination.txt",
+            ["overwrite"] = true
+        });
+        Assert.False(result.Success);
+        Assert.Equal("unsafe_overwrite_blocked", result.ErrorCode);
+        Assert.Equal("source", await File.ReadAllTextAsync(source));
+        Assert.Equal("human work", await File.ReadAllTextAsync(destination));
+    }
+
+    [Fact]
     public async Task DeletingFileLargerThanTextEditLimit_PreservesRestorableBackup()
     {
         await using var sb = await TestSandbox.CreateAsync();
