@@ -306,4 +306,83 @@ public sealed class AgentBoardTests
         Assert.Empty(board.ListPins(room));
     }
 
+    [Fact]
+    public async Task CoordinatorAndWorkerCanJoinThroughTheActualToolRegistry()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var join = await sb.Host.Registry.InvokeAsync("board_join", new JsonObject
+        {
+            ["room"] = "VESPER",
+            ["name"] = "Lead",
+            ["role"] = "coordinator"
+        });
+        Assert.True(join.Success, join.ErrorMessage);
+        var leader = JsonSerializer.SerializeToNode(join.Data, LocalIdeBridge.Core.AppConfig.JsonOptions)!;
+        var room = leader["room"]!["id"]!.GetValue<string>();
+        var leaderId = leader["agent"]!["id"]!.GetValue<string>();
+        var leaderKey = leader["credential"]!.GetValue<string>();
+
+        var invite = sb.Host.Board.CreateInvitation(
+            sb.Host.Board.RequireRoom(room, sb.WorkspaceDir), leaderId, leaderKey, null, "worker");
+        var workerJoin = await sb.Host.Registry.InvokeAsync("board_join", new JsonObject
+        {
+            ["room"] = room,
+            ["name"] = "Engine",
+            ["inviteCode"] = invite.Code
+        });
+        Assert.True(workerJoin.Success, workerJoin.ErrorMessage);
+        var worker = JsonSerializer.SerializeToNode(workerJoin.Data, LocalIdeBridge.Core.AppConfig.JsonOptions)!;
+        var workerId = worker["agent"]!["id"]!.GetValue<string>();
+        var workerKey = worker["credential"]!.GetValue<string>();
+
+        var task = await sb.Host.Registry.InvokeAsync("board_task", new JsonObject
+        {
+            ["roomId"] = room, ["agentId"] = leaderId, ["credential"] = leaderKey,
+            ["action"] = "create", ["requestId"] = "registry-task-1",
+            ["title"] = "Make resolver reliable", ["details"] = "Handle HTTP errors without corrupting files",
+            ["workArea"] = "src/resolver"
+        });
+        Assert.True(task.Success, task.ErrorMessage);
+
+        var sync = await sb.Host.Registry.InvokeAsync("board_sync", new JsonObject
+        {
+            ["roomId"] = room, ["agentId"] = workerId, ["credential"] = workerKey,
+            ["includeSnapshot"] = true
+        });
+        Assert.True(sync.Success, sync.ErrorMessage);
+        var payload = JsonSerializer.SerializeToNode(sync.Data, LocalIdeBridge.Core.AppConfig.JsonOptions)!;
+        Assert.Contains(payload["tasks"]!.AsArray(),
+            item => item?["title"]?.GetValue<string>() == "Make resolver reliable");
+
+        var handoff = await sb.Host.Registry.InvokeAsync("board_handoff", new JsonObject
+        {
+            ["roomId"] = room, ["agentId"] = workerId, ["credential"] = workerKey
+        });
+        Assert.True(handoff.Success, handoff.ErrorMessage);
+        var prompt = JsonSerializer.SerializeToNode(handoff.Data,
+            LocalIdeBridge.Core.AppConfig.JsonOptions)!["prompt"]!.GetValue<string>();
+        Assert.Contains("Make resolver reliable", prompt);
+        Assert.Contains("main", prompt);
+        Assert.DoesNotContain(workerKey, prompt);
+    }
+
+    [Fact]
+    public async Task BoardPaginationKeepsOlderMessagesAvailable()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var board = sb.Host.Board;
+        var room = board.GetOrCreateRoom("VESPER", sb.WorkspaceDir);
+        var (agent, key) = board.Join(room, "Lead", "coordinator");
+
+        for (var i = 0; i < 130; i++)
+            board.Post(room, agent.Id, key, "message", "Message " + i, "page-" + i);
+
+        var first = board.ReadLatestEvents(room, 30, 0);
+        var older = board.ReadLatestEvents(room, 30, 30);
+        Assert.Equal(30, first.Count);
+        Assert.Equal(30, older.Count);
+        Assert.True(first[0].Sequence > older[^1].Sequence);
+        Assert.Equal(1L, board.ReadEvents(room, 0, 1).Events[0].Sequence);
+    }
+
 }
