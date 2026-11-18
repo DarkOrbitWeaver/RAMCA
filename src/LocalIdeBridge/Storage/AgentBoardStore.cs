@@ -13,6 +13,7 @@ public sealed record BoardTask(string Id, string RoomId, string Title, string De
     string? OwnerId, long Revision, long OwnerGeneration, DateTimeOffset? LeaseUntil,
     string? WorkArea, string? Evidence, DateTimeOffset UpdatedAt);
 public sealed record BoardPin(string Id, string RoomId, string Key, string Title, string Body, long Revision, DateTimeOffset UpdatedAt);
+public sealed record BoardInvitation(string Code, DateTimeOffset ExpiresAt, string? AgentId, string Role);
 
 /// <summary>
 /// Durable, paged coordination for independent AI clients. The board is not an inference
@@ -100,6 +101,14 @@ public sealed class AgentBoardStore
                     last_seen_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_board_agents_room ON board_agents(room_id);
+                CREATE TABLE IF NOT EXISTS board_invites (
+                    code_hash BLOB PRIMARY KEY,
+                    room_id TEXT NOT NULL REFERENCES board_rooms(id),
+                    target_agent_id TEXT,
+                    role TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS board_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     room_id TEXT NOT NULL REFERENCES board_rooms(id),
@@ -261,6 +270,118 @@ public sealed class AgentBoardStore
             {
                 if (!r.Read()) throw new InvalidOperationException("Joined agent could not be retrieved.");
                 agent = ReadAgent(r);
+            }
+            tx.Commit();
+            Signal(room.Id);
+            return (agent, nextSecret);
+        }
+    }
+
+    public BoardInvitation CreateInvitation(BoardRoom room, string coordinatorId, string credential,
+        string? targetAgentId, string role, int days = 7)
+    {
+        role = Required(role, "Invited role", 32);
+        if (role is not ("worker" or "reviewer" or "coordinator"))
+            throw new ArgumentException("Invited role must be worker, reviewer or coordinator.");
+
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            var coordinator = ValidateAgent(conn, tx, room.Id, coordinatorId, credential);
+            if (!coordinator.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase))
+                throw new UnauthorizedAccessException("Only a room coordinator can create an invitation.");
+
+            if (!string.IsNullOrWhiteSpace(targetAgentId))
+            {
+                using var old = Cmd(conn, tx, "SELECT role FROM board_agents WHERE room_id=$room AND id=$id;",
+                    ("$room", room.Id), ("$id", targetAgentId));
+                var previousRole = old.ExecuteScalar() as string;
+                if (previousRole is null) throw new KeyNotFoundException("Target agent was not found.");
+                if (!string.Equals(previousRole, role, StringComparison.OrdinalIgnoreCase))
+                    throw new ArgumentException("Resuming an agent cannot change its role.");
+            }
+            else if (role == "coordinator")
+                throw new ArgumentException("New coordinator identities cannot be issued through invitations.");
+
+            var code = NewSecret();
+            var expires = DateTimeOffset.UtcNow.AddDays(Math.Clamp(days, 1, 30));
+            using var save = Cmd(conn, tx, """
+                INSERT INTO board_invites(code_hash,room_id,target_agent_id,role,expires_at)
+                VALUES($hash,$room,$agent,$role,$expires);
+                """, ("$hash", Hash(code)), ("$room", room.Id),
+                ("$agent", targetAgentId), ("$role", role), ("$expires", expires.ToString("O")));
+            save.ExecuteNonQuery();
+            tx.Commit();
+            return new BoardInvitation(code, expires, targetAgentId, role);
+        }
+    }
+
+    public (BoardAgent Agent, string Credential) RedeemInvitation(BoardRoom room,
+        string name, string invitation)
+    {
+        name = Required(name, "Agent name", 64);
+        if (invitation.Length > 256 || invitation.Length == 0)
+            throw new UnauthorizedAccessException("Invalid board invitation.");
+
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            using var find = Cmd(conn, tx, """
+                SELECT target_agent_id,role,expires_at,used_at
+                FROM board_invites WHERE room_id=$room AND code_hash=$hash;
+                """, ("$room", room.Id), ("$hash", Hash(invitation)));
+            string? targetId;
+            string role;
+            DateTimeOffset expires;
+            using (var reader = find.ExecuteReader())
+            {
+                if (!reader.Read()) throw new UnauthorizedAccessException("Invitation not found.");
+                targetId = reader.IsDBNull(0) ? null : reader.GetString(0);
+                role = reader.GetString(1);
+                expires = Time(reader.GetString(2));
+                if (!reader.IsDBNull(3) || expires <= DateTimeOffset.UtcNow)
+                    throw new UnauthorizedAccessException("Invitation has expired or was already used.");
+            }
+
+            var nextSecret = NewSecret();
+            var id = targetId ?? NewId("agent");
+            if (targetId is null)
+            {
+                using var insert = Cmd(conn, tx, """
+                    INSERT INTO board_agents(id,room_id,name,role,resume_hash,generation,last_seen_at)
+                    VALUES($id,$room,$name,$role,$hash,1,$now);
+                    """, ("$id", id), ("$room", room.Id), ("$name", name),
+                    ("$role", role), ("$hash", Hash(nextSecret)), ("$now", Utc()));
+                insert.ExecuteNonQuery();
+            }
+            else
+            {
+                using var update = Cmd(conn, tx, """
+                    UPDATE board_agents SET name=$name,resume_hash=$hash,generation=generation+1,last_seen_at=$now
+                    WHERE id=$id AND room_id=$room AND role=$role;
+                    """, ("$name", name), ("$hash", Hash(nextSecret)), ("$now", Utc()),
+                    ("$id", id), ("$room", room.Id), ("$role", role));
+                if (update.ExecuteNonQuery() != 1)
+                    throw new InvalidOperationException("Agent role or identity changed; invitation cannot be redeemed.");
+            }
+
+            using (var mark = Cmd(conn, tx, """
+                UPDATE board_invites SET used_at=$now WHERE room_id=$room AND code_hash=$hash AND used_at IS NULL;
+                """, ("$now", Utc()), ("$room", room.Id), ("$hash", Hash(invitation))))
+            {
+                if (mark.ExecuteNonQuery() != 1)
+                    throw new InvalidOperationException("Invitation was already redeemed.");
+            }
+            using var query = Cmd(conn, tx,
+                "SELECT id,room_id,name,role,generation,last_seen_at FROM board_agents WHERE id=$id;",
+                ("$id", id));
+            BoardAgent agent;
+            using (var reader = query.ExecuteReader())
+            {
+                if (!reader.Read()) throw new InvalidOperationException("Agent not found after invitation redemption.");
+                agent = ReadAgent(reader);
             }
             tx.Commit();
             Signal(room.Id);
