@@ -680,40 +680,122 @@ public static partial class EditingTools
         yield return new ToolDefinition(
             Name: "rename_file",
             Category: "editing",
-            Description: "Moves a file within the workspace if the destination does not exist. Replacing an existing destination is blocked until reversible rename journaling is implemented.",
+            Description: "Moves a file without overwriting an existing target. Keeps an undo backup and a crash-recovery manifest for both paths.",
             IsReadOnly: false,
             IsIdempotent: false,
-            SideEffects: "Moves file within trusted workspace.",
+            SideEffects: "Atomically moves a file and journals reversible source and destination changes.",
             Parameters:
             [
                 new("sourcePath", "string", "Existing relative file path.", Required: true),
                 new("destinationPath", "string", "New relative file path inside workspace.", Required: true),
-                new("overwrite", "boolean", "Reserved for a future reversible overwrite; overwriting an existing destination is not yet supported.", Default: false)
+                new("overwrite", "boolean", "Overwriting an existing destination is not supported.", Default: false),
+                new("expectedSha256", "string", "Optional SHA-256 of source to reject stale moves.")
             ],
-            Handler: (args, _, _) =>
+            Handler: (args, ctx, _) =>
             {
                 var ws = guard.RequireActiveWorkspace();
                 var src = guard.ResolvePath(args.RequireString("sourcePath"), forDelete: true);
                 var dst = guard.ResolvePath(args.RequireString("destinationPath"), forWrite: true);
-                // Read the legacy flag so old callers receive a clear fail-closed result if the target exists.
-                _ = args.OptionalBool("overwrite", false);
-
-                if (!File.Exists(src))
-                    throw new FileNotFoundException($"Source file not found: {args.RequireString("sourcePath")}");
-                if (File.Exists(dst))
-                    return Task.FromResult(ToolResult.Fail("unsafe_overwrite_blocked",
-                        $"Destination '{args.RequireString("destinationPath")}' exists. RAMCA cannot safely undo an overwritten rename yet; choose an unused destination instead."));
-
-                Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                File.Move(src, dst);
-                onFileMutated?.Invoke(src);
-                onFileMutated?.Invoke(dst);
-
                 var srcRel = guard.GetRelativePathUnix(ws, src);
                 var dstRel = guard.GetRelativePathUnix(ws, dst);
+                var overwrite = args.OptionalBool("overwrite", false);
+                if (overwrite)
+                    return Task.FromResult(ToolResult.Fail("unsafe_overwrite_blocked",
+                        "RAMCA does not overwrite a file during rename. Choose a new destination."));
+                if (string.Equals(srcRel, dstRel,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                    return Task.FromResult(ToolResult.Fail("invalid_arguments", "Source and destination are the same."));
+                if (!File.Exists(src))
+                    throw new FileNotFoundException($"Source file not found: {srcRel}");
+                if (File.Exists(dst) || Directory.Exists(dst))
+                    return Task.FromResult(ToolResult.Fail("already_exists",
+                        $"Destination '{dstRel}' exists. Choose an unused path."));
+
+                var info = new FileInfo(src);
+                if (info.Length > MaxReversibleDeleteBytes)
+                    return Task.FromResult(ToolResult.Fail("backup_limit_exceeded",
+                        $"Refusing to move {info.Length} bytes without a reversible snapshot. Limit: {MaxReversibleDeleteBytes}."));
+
+                var beforeSha = ComputeFileSha256(src);
+                var expected = args.OptionalString("expectedSha256");
+                if (!string.IsNullOrWhiteSpace(expected) &&
+                    !string.Equals(beforeSha, expected, StringComparison.OrdinalIgnoreCase))
+                    return Task.FromResult(ToolResult.Fail("stale_file", "Source changed after the caller inspected it."));
+
+                var sourceEditId = NewEditId();
+                var destinationEditId = NewEditId();
+                var backup = SaveBackupBytes(paths, ctx.SessionId, sourceEditId, src);
+                var tx = new PatchTransaction
+                {
+                    Id = $"patch_{Guid.NewGuid():N}", Workspace = ws, SessionId = ctx.SessionId,
+                    Items =
+                    [
+                        new PatchTransactionItem
+                        {
+                            RelativePath = srcRel, EditId = sourceEditId,
+                            BackupPath = backup, BeforeHash = beforeSha, AfterHash = "deleted"
+                        },
+                        new PatchTransactionItem
+                        {
+                            RelativePath = dstRel, EditId = destinationEditId,
+                            BeforeHash = "none", AfterHash = beforeSha
+                        }
+                    ]
+                };
+                var manifest = GetTransactionPath(paths, tx.Id);
+                PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+                try
+                {
+                    if (!string.Equals(ComputeFileSha256(src), beforeSha, StringComparison.OrdinalIgnoreCase) ||
+                        File.Exists(dst) || Directory.Exists(dst))
+                        throw new IOException("A file changed before rename; original must be preserved.");
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                    File.Move(src, dst); // Both paths are inside one trusted workspace.
+                    if (File.Exists(src) ||
+                        !string.Equals(ComputeFileSha256(dst), beforeSha, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("Rename verification failed.");
+
+                    var now = DateTimeOffset.UtcNow;
+                    db.RecordEditBatch(
+                    [
+                        new EditJournalRecord(sourceEditId, ctx.SessionId, ws, srcRel,
+                            "rename_source", beforeSha, "deleted", true, backup, 0, 0, false, now),
+                        new EditJournalRecord(destinationEditId, ctx.SessionId, ws, dstRel,
+                            "rename_destination", "none", beforeSha, false, null, 0, 0, false, now)
+                    ]);
+
+                    tx.Committed = true;
+                    PortablePaths.AtomicWriteAllText(manifest, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
+                    try { File.Delete(manifest); } catch (IOException) { }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        RecoverTransaction(paths, guard, tx, db);
+                        File.Delete(manifest);
+                        return Task.FromResult(ToolResult.Fail("rename_rolled_back",
+                            $"Move aborted; original bytes recovered: {ex.Message}"));
+                    }
+                    catch (Exception recovery)
+                    {
+                        return Task.FromResult(ToolResult.Fail("rename_recovery_required",
+                            $"Move failed ({ex.Message}); recovery needs inspection ({recovery.Message}). Manifest: {manifest}"));
+                    }
+                }
+
+                onFileMutated?.Invoke(src);
+                onFileMutated?.Invoke(dst);
                 return Task.FromResult(ToolResult.Ok(
-                    $"Moved '{srcRel}' -> '{dstRel}'.",
-                    new { sourcePath = srcRel, destinationPath = dstRel, changedFiles = new[] { srcRel, dstRel } }));
+                    $"Moved '{srcRel}' to '{dstRel}' with reversible source and destination edits.",
+                    new
+                    {
+                        sourcePath = srcRel, destinationPath = dstRel,
+                        transactionId = tx.Id, sourceEditId, destinationEditId,
+                        undoOrder = "Use revert_edit with destinationEditId first, then sourceEditId.",
+                        changedFiles = new[] { srcRel, dstRel }
+                    }));
             });
 
         yield return new ToolDefinition(
