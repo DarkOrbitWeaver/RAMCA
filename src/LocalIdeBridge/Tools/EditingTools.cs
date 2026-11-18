@@ -1054,18 +1054,26 @@ public static partial class EditingTools
     {
         var dir = paths.GetSessionEditsDir(sessionId);
         var backup = Path.Combine(dir, $"{editId}.bak");
-        using (var source = new FileStream(sourceFile, FileMode.Open, FileAccess.Read, FileShare.Read))
-        using (var destination = new FileStream(backup, FileMode.CreateNew, FileAccess.Write, FileShare.None, 8192, FileOptions.WriteThrough))
+        try
         {
-            source.CopyTo(destination);
-            destination.Flush(flushToDisk: true);
+            using (var source = new FileStream(sourceFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var destination = new FileStream(backup, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 8192, FileOptions.WriteThrough))
+            {
+                source.CopyTo(destination);
+                destination.Flush(flushToDisk: true);
+            }
+            if (!string.Equals(ComputeFileSha256(sourceFile), ComputeFileSha256(backup),
+                    StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Backup SHA-256 verification failed; original file was not modified.");
+            return backup;
         }
-        if (!string.Equals(ComputeFileSha256(sourceFile), ComputeFileSha256(backup), StringComparison.OrdinalIgnoreCase))
+        catch
         {
-            File.Delete(backup);
-            throw new IOException("Backup snapshot failed SHA-256 verification; original file was not modified.");
+            // Never strand a half-written snapshot after a disk-full or read failure.
+            try { File.Delete(backup); } catch (IOException) { }
+            throw;
         }
-        return backup;
     }
 
     private static string NewEditId()
