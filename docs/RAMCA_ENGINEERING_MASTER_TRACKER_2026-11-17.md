@@ -96,3 +96,28 @@ Still required before relying on multi-chat unattended VESPER work:
 - [ ] Delete stale remote branch feature/one-click-chatgpt-tunnel (0 unique commits; GitHub connector lacks delete-ref).
 - [ ] Verify portable update after building to a temporary directory; never replace an executable while running.
 
+
+
+## Follow-up source changes on main (2026-11-18)
+
+This is a source-only checkpoint. The owner requested all source work on GitHub main with Windows builds and tests at the end. Do not treat these entries as tested or release-ready.
+
+- Multi-chat: one-use coordinator/worker invitations, generation-based replacement, durable inbox/acks, queued vs seen status, persistent tasks, pins, targeted steering, guarded tool execution, and paged chat/task/pin history.
+- Owner TUI: create rooms/tasks, edit pins, send room or agent steering, copy real single-use invitation prompts, and page older board content.
+- Workspace isolation: overlapping active claims cannot share file areas in one checkout, even across rooms; main-only Git path restrictions added to ordinary command validation.
+- File recovery: reversible rename, paired journaling and single-action undo; atomic multi-file journal insert; backup cleanup; bounded patch staging; binary/large diffs report checksums instead of attempting text decoding.
+- Output truth: search reports skipped oversized/unreadable content; syntax-only Roslyn results no longer claim semantic accuracy; build/test/Git staging are not advertised as idempotent side effects; modern MCP avoids a second giant text mirror when structured content is present.
+- Connection: bounded tunnel retry/backoff, immediate-exit detection, and port/process cleanup remain tied to the running RAMCA host.
+- Tests authored (not executed): board join/replace, role protections, retries, claims across rooms, acknowledgments, target privacy, file-version guards, board paging, binary rename and one-action undo.
+
+Still open before calling the code done:
+- [ ] Reconcile current source **line by line** with Audit A/B/C, 35 engineering findings and F-001..F-038. A source fix is not evidence of runtime correctness.
+- [ ] Resolve any Windows/.NET compiler errors and failed tests, including new board and rename regressions.
+- [ ] Verify two independent external ChatGPT clients can connect simultaneously and synchronize messages, mentions, room assignments and handoffs. An inactive webchat never runs itself.
+- [ ] Validate all main-only code-claim boundaries, stage-index ownership, human editor saves, shell limitations, reconnects, and crash recovery on disposable workspaces.
+- [ ] Verify 10,000-message paging, low RAM/idle CPU, SQLite churn, TUI resizing and lifecycle/disposal.
+- [ ] Confirm version negotiation, authentication and private tunnel reconnect with real connected client (GitHub source inspection cannot certify transport behavior).
+- [ ] Investigate GitHub Actions runs failing immediately without retrievable job logs (log downloads return BlobNotFound, no verified build/test outcome).
+- [ ] Remove remote feature/one-click-chatgpt-tunnel branch once a GitHub delete-ref action or the owner's later local Git command is available; zero unique commits were previously confirmed.
+- [ ] Final HUMANIFY source review, Windows release publish to temporary directory, and only then owner-approved portable executable update.
+
