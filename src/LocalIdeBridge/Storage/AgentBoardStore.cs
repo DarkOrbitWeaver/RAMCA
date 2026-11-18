@@ -55,7 +55,7 @@ public sealed class AgentBoardStore
         var connection = new SqliteConnection(_connectionString);
         connection.Open();
         using var setup = connection.CreateCommand();
-        setup.CommandText = "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;";
+        setup.CommandText = "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;";
         setup.ExecuteNonQuery();
         return connection;
     }
