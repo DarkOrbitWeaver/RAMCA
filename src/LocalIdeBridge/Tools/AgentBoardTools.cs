@@ -299,7 +299,7 @@ public static class AgentBoardTools
                 foreach (var task in tasks)
                     sb.AppendLine($"- {task.Id} [{task.Status}] ({task.OwnerId ?? "unassigned"}) {task.Title}; revision={task.Revision}; area={task.WorkArea ?? "unspecified"}; evidence={task.Evidence ?? "none"}");
                 if (taskPage.Count > 40) sb.AppendLine("More tasks exist. Call board_task list with offset=40 to continue.");
-                var checkpoints = database.ListGitCheckpoints(limit: 3);
+                var checkpoints = database.ListWorkspaceGitCheckpoints(room.Workspace, 3);
                 if (checkpoints.Count > 0)
                 {
                     sb.AppendLine("Last recorded Git checkpoints (verify HEAD yourself):");
