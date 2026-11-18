@@ -1048,10 +1048,14 @@ public sealed class SupervisorTui
         _scrollOffset = Math.Min(_scrollOffset, rooms.Count - 1);
         _lastListSlots = Math.Min(rooms.Count, 5);
         var selected = rooms[_scrollOffset];
-        lines.Add(new UiLine(Fit($"  Agent rooms ({rooms.Count})  ·  [Up/Down] select  ·  [B] change view  ·  [J] invite", width), UiTone.Accent));
-        foreach (var (room, index) in rooms.Select((v, i) => (v, i)).Take(5))
-            lines.Add(new UiLine(Fit($"  {(index == _scrollOffset ? '›' : ' ')} {room.Name}  {room.Id}", width),
+        lines.Add(new UiLine(Fit($"  Agent rooms ({rooms.Count})  |  [Up/Down] select  [B] views  [J] invite", width), UiTone.Accent));
+        var start = Math.Max(0, _scrollOffset - 4);
+        for (var index = start; index < Math.Min(rooms.Count, start + 5); index++)
+        {
+            var room = rooms[index];
+            lines.Add(new UiLine(Fit($"  {(index == _scrollOffset ? '>' : ' ')} {room.Name}  {room.Id}", width),
                 index == _scrollOffset ? UiTone.Accent : UiTone.Muted));
+        }
 
         var members = _host.Board.ListAgents(selected, 40);
         var tasks = _host.Board.ListTasks(selected, 30);
