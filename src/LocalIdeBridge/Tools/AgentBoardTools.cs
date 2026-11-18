@@ -128,6 +128,8 @@ public static class AgentBoardTools
                 IReadOnlyList<BoardPin> pinPage = includeSnapshot ? board.ListPins(room, 41) : [];
                 IReadOnlyList<BoardPin> pins = pinPage.Take(40).ToArray();
                 IReadOnlyList<BoardAgent> members = includeSnapshot ? board.ListAgents(room, 40) : [];
+                var acknowledgments = includeSnapshot ? board.ListAcknowledgments(room) :
+                    (IReadOnlyDictionary<string, long>)new Dictionary<string, long>();
                 var acknowledged = board.GetAcknowledged(room, agent.Id);
                 return Task.FromResult(ToolResult.Ok(
                     $"Room '{room.Name}': {events.Count} event(s), {tasks.Count} task(s), {pins.Count} pin(s).",
@@ -136,7 +138,7 @@ public static class AgentBoardTools
                         room, agent, events, nextCursor = next, hasMore,
                         acknowledgedCursor = acknowledged,
                         tasks, taskOffset = Math.Max(0, args.OptionalInt("taskOffset", 0)),
-                        pins, agents = members, snapshotIncluded = includeSnapshot,
+                        pins, agents = members, acknowledgments, snapshotIncluded = includeSnapshot,
                         taskHasMore = taskPage.Count > 40, pinHasMore = pinPage.Count > 40,
                         note = "Events arrive through active tool calls only. Call board_ack after processing a page."
                     }));
