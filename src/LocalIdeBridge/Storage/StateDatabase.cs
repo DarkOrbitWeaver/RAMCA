@@ -73,6 +73,10 @@ public sealed record OperationLedgerRecord(
     string? ResultJson,
     DateTimeOffset UpdatedAtUtc);
 
+public sealed record WorkspaceExecutionSummary(
+    string Id, string Kind, string Name, string Status, DateTimeOffset UpdatedAt,
+    string? LogExecId);
+
 public sealed record GitCheckpointRecord(
     string Id,
     string SessionId,
@@ -1235,6 +1239,35 @@ public sealed class StateDatabase : IDisposable
                 r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetString(5), DateTimeOffset.Parse(r.GetString(6))));
         }
         return list;
+    }
+
+    public IReadOnlyList<WorkspaceExecutionSummary> ListWorkspaceExecutionSummaries(string workspace, int limit = 15)
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, kind, name, status, updated_at, log_exec_id FROM
+            (
+                SELECT id, 'job' AS kind, tool_name AS name, status,
+                       COALESCE(completed_at,started_at,created_at) AS updated_at,
+                       log_exec_id
+                FROM jobs WHERE workspace=$ws
+                UNION ALL
+                SELECT id, 'workflow' AS kind, name, status, updated_at,
+                       NULL AS log_exec_id FROM workflow_runs WHERE workspace=$ws
+            )
+            ORDER BY updated_at DESC LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$ws", workspace);
+        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 50));
+        using var reader = cmd.ExecuteReader();
+        var result = new List<WorkspaceExecutionSummary>();
+        while (reader.Read())
+            result.Add(new WorkspaceExecutionSummary(
+                reader.GetString(0), reader.GetString(1), reader.GetString(2),
+                reader.GetString(3), DateTimeOffset.Parse(reader.GetString(4)),
+                reader.IsDBNull(5) ? null : reader.GetString(5)));
+        return result;
     }
 
     public IReadOnlyList<GitCheckpointRecord> ListWorkspaceGitCheckpoints(string workspace, int limit = 10)
