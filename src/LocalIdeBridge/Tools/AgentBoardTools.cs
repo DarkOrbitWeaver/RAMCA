@@ -389,7 +389,7 @@ public static class AgentBoardTools
                 // should never be smuggled through a task claim.
                 var allowed = toolName is
                     "create_file" or "replace_range" or "apply_patch" or "rename_file" or
-                    "delete_file" or "revert_edit" or "dotnet_build" or "dotnet_test" or
+                    "delete_file" or "revert_edit" or "revert_rename" or "dotnet_build" or "dotnet_test" or
                     "msbuild_run" or "run_command" or "git_commit";
                 if (!allowed || registry.Find(toolName) is null)
                     return ToolResult.Fail("board_tool_denied",
@@ -444,7 +444,7 @@ public static class AgentBoardTools
                                     $"Commit path '{path}' is outside the task's work area.");
                         }
                     }
-                    if (toolName is "apply_patch" or "revert_edit" or "run_command")
+                    if (toolName is "apply_patch" or "revert_edit" or "revert_rename" or "run_command")
                         return ToolResult.Fail("unscoped_tool",
                             "This operation cannot be confined to a task work area. Use narrowly scoped edits or a task without a restricted work area.");
                 }
