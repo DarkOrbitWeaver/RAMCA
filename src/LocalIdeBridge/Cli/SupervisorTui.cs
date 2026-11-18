@@ -993,7 +993,7 @@ public sealed class SupervisorTui
     private void PromptBoardPin()
     {
         var workspace = _host.Guard.ActiveWorkspace;
-        var rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
+        IReadOnlyList<BoardRoom> rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
         if (rooms.Count == 0)
         {
             _statusBanner = "Create or select a board room first.";
@@ -1037,7 +1037,7 @@ public sealed class SupervisorTui
     private void PromptDeleteBoardPin()
     {
         var workspace = _host.Guard.ActiveWorkspace;
-        var rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
+        IReadOnlyList<BoardRoom> rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
         if (rooms.Count == 0)
         {
             _statusBanner = "No board room selected.";
