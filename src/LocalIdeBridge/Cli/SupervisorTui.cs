@@ -239,6 +239,9 @@ public sealed class SupervisorTui
             case ConsoleKey.J:
                 if (_activeTab == ViewTab.Board) CopyBoardInvite();
                 break;
+            case ConsoleKey.M:
+                if (_activeTab == ViewTab.Board) PromptBoardSteering();
+                break;
             case ConsoleKey.UpArrow: MoveSelection(-1); break;
             case ConsoleKey.DownArrow: MoveSelection(1); break;
             case ConsoleKey.PageUp: MoveSelection(-Math.Max(1, _lastListSlots - 1)); break;
@@ -635,7 +638,7 @@ public sealed class SupervisorTui
         Line(Style("[Up/Down] Select  [PgUp/PgDn] Page  [Enter] Details  [Esc] Back", UiTone.Muted));
         Line("[C] ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate");
         Line(_activeTab == ViewTab.Board
-            ? "[B] Chat/Tasks/Pins  [J] Copy room invite  [W] Workspace  [Q] Quit"
+            ? "[B] Chat/Tasks/Pins  [J] Invite  [M] Steer agent  [W] Workspace  [Q] Quit"
             : "[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
         sb.Append(ClipAnsi(Style(Fit(_statusBanner, w - 1), UiTone.Muted), w - 1)).Append("\x1b[0m\x1b[K");
         Console.Write(sb.ToString());
@@ -945,6 +948,54 @@ public sealed class SupervisorTui
         foreach (var (session, index) in sessions.Select((v, i) => (v, i)))
             lines.Add(new UiLine(Fit(
                 $"    {(_scrollOffset + index == _scrollOffset ? '›' : ' ')} {session.Status,-7} {session.Id}  calls {session.ToolCallCount}  err {session.ErrorCount}", width)));
+    }
+
+    private void PromptBoardSteering()
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        if (workspace is null)
+        {
+            _statusBanner = "Select a trusted workspace first.";
+            return;
+        }
+        var rooms = _host.Board.ListRooms(workspace);
+        if (rooms.Count == 0)
+        {
+            _statusBanner = "Create a room using board_join first.";
+            return;
+        }
+
+        var room = rooms[Math.Min(_scrollOffset, rooms.Count - 1)];
+        Console.Write("\x1b[?25h\x1b[H\x1b[2J");
+        try
+        {
+            Console.WriteLine($"RAMCA — Send steering to '{room.Name}'");
+            Console.WriteLine("Messages are saved locally. Agents read them on their next board_sync call.");
+            Console.WriteLine("Recipient (blank = everyone):");
+            var agents = _host.Board.ListAgents(room);
+            foreach (var agent in agents.Take(20))
+                Console.WriteLine($"  {agent.Name} [{agent.Id}] ({agent.Role})");
+            Console.Write("Agent ID (or blank for room): ");
+            var target = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(target)) target = null;
+            Console.Write("Message (blank = cancel): ");
+            var message = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                _statusBanner = "No steering message sent.";
+                return;
+            }
+            var posted = _host.Board.PostSupervisor(room, message, target);
+            _statusBanner = $"Steering saved as event #{posted.Sequence}; agents receive it when they sync.";
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException)
+        {
+            _statusBanner = "Steering not saved: " + ex.Message;
+        }
+        finally
+        {
+            Console.Write("\x1b[?25l");
+        }
     }
 
     private void CopyBoardInvite()
