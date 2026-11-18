@@ -21,6 +21,7 @@ public sealed class SupervisorTui
     private enum ViewTab { Overview = 1, Edits = 2, Jobs = 3, GitAndSessions = 4, Errors = 5, Board = 6 }
     private enum BoardMode { Chat, Tasks, Pins }
     private BoardMode _boardMode = BoardMode.Chat;
+    private int _boardPage;
 
     private readonly WorkbenchHost _host;
     private readonly SemaphoreSlim _wakeSignal = new(1, 1);
@@ -233,6 +234,7 @@ public sealed class SupervisorTui
                         BoardMode.Tasks => BoardMode.Pins,
                         _ => BoardMode.Chat
                     };
+                    _boardPage = 0;
                     _statusBanner = $"Board view: {_boardMode}. Press B to switch Chat/Tasks/Pins.";
                 }
                 break;
@@ -251,10 +253,22 @@ public sealed class SupervisorTui
             case ConsoleKey.X:
                 if (_activeTab == ViewTab.Board) PromptDeleteBoardPin();
                 break;
-            case ConsoleKey.UpArrow: MoveSelection(-1); break;
-            case ConsoleKey.DownArrow: MoveSelection(1); break;
-            case ConsoleKey.PageUp: MoveSelection(-Math.Max(1, _lastListSlots - 1)); break;
-            case ConsoleKey.PageDown: MoveSelection(Math.Max(1, _lastListSlots - 1)); break;
+            case ConsoleKey.UpArrow:
+                if (_activeTab == ViewTab.Board) _boardPage = 0;
+                MoveSelection(-1);
+                break;
+            case ConsoleKey.DownArrow:
+                if (_activeTab == ViewTab.Board) _boardPage = 0;
+                MoveSelection(1);
+                break;
+            case ConsoleKey.PageUp:
+                if (_activeTab == ViewTab.Board) _boardPage = Math.Max(0, _boardPage - 1);
+                else MoveSelection(-Math.Max(1, _lastListSlots - 1));
+                break;
+            case ConsoleKey.PageDown:
+                if (_activeTab == ViewTab.Board) _boardPage = Math.Min(100_000, _boardPage + 1);
+                else MoveSelection(Math.Max(1, _lastListSlots - 1));
+                break;
             case ConsoleKey.Enter:
                 _focusDetails = !_focusDetails;
                 _detailPage = 0;
@@ -1269,13 +1283,15 @@ public sealed class SupervisorTui
         }
 
         var members = _host.Board.ListAgents(selected, 40);
-        var tasks = _host.Board.ListTasks(selected, 30);
-        var pins = _host.Board.ListPins(selected, 30);
-        var events = _host.Board.ReadLatestEvents(selected, 30);
+        var offset = Math.Min(1_000_000, _boardPage * 30);
+        var tasks = _boardMode == BoardMode.Tasks ? _host.Board.ListTasks(selected, 30, offset) :
+            _host.Board.ListTasks(selected, 30);
+        var pins = _host.Board.ListPins(selected, 30, _boardMode == BoardMode.Pins ? offset : 0);
+        var events = _host.Board.ReadLatestEvents(selected, 30, _boardMode == BoardMode.Chat ? offset : 0);
         var acks = _host.Board.ListAcknowledgments(selected);
         var inProgress = tasks.Count(t => t.Status == "in_progress");
         var blocked = tasks.Count(t => t.Status == "blocked");
-        lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents {members.Count}  |  active {inProgress}  |  blocked {blocked}  |  {_boardMode}", width), UiTone.Accent));
+        lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents {members.Count}  |  active {inProgress}  |  blocked {blocked}  |  {_boardMode} page {_boardPage + 1} (PgUp/PgDn)", width), UiTone.Accent));
         if (_boardMode == BoardMode.Chat)
         {
             if (events.Count == 0) lines.Add(new UiLine("  No messages. Connected agents can use board_post.", UiTone.Muted));
