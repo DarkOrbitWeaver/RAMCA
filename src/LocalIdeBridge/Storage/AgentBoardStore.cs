@@ -118,6 +118,11 @@ public sealed class AgentBoardStore
                     work_area TEXT, evidence TEXT, updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_board_tasks_room ON board_tasks(room_id, status, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS board_task_requests (
+                    room_id TEXT NOT NULL, author_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES board_tasks(id), content_hash TEXT NOT NULL,
+                    PRIMARY KEY(room_id,author_id,request_id)
+                );
                 CREATE TABLE IF NOT EXISTS board_pins (
                     id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES board_rooms(id),
                     pin_key TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
@@ -470,6 +475,13 @@ public sealed class AgentBoardStore
             using var conn = Open();
             using var tx = conn.BeginTransaction();
             ValidateAgent(conn, tx, room.Id, agentId, credential);
+            using var currentPin = Cmd(conn, tx,
+                "SELECT revision FROM board_pins WHERE room_id=$room AND pin_key=$key;",
+                ("$room", room.Id), ("$key", key));
+            var oldRevision = currentPin.ExecuteScalar();
+            if ((oldRevision is null) != (expectedRevision is null) ||
+                (oldRevision is not null && Convert.ToInt64(oldRevision) != expectedRevision))
+                throw new InvalidOperationException("Pin revision conflict; sync before updating.");
             using var command = Cmd(conn, tx, """
                 INSERT INTO board_pins(id,room_id,pin_key,title,body,revision,updated_at)
                 VALUES($id,$room,$key,$title,$body,1,$now)
@@ -521,16 +533,35 @@ public sealed class AgentBoardStore
     }
 
     public BoardTask CreateTask(BoardRoom room, string agentId, string credential,
-        string title, string details, string? workArea)
+        string title, string details, string? workArea, string requestId)
     {
         title = Required(title, "Task title", 180);
         details = _secrets.Redact(Required(details, "Task details", 4000));
         workArea = string.IsNullOrWhiteSpace(workArea) ? null : Required(workArea, "Work area", 240);
+        requestId = Required(requestId, "Task request ID", 128);
+        var inputHash = Convert.ToHexStringLower(Hash(title + "\0" + details + "\0" + workArea));
         lock (_writes)
         {
             using var conn = Open();
             using var tx = conn.BeginTransaction();
             ValidateAgent(conn, tx, room.Id, agentId, credential);
+            using (var prior = Cmd(conn, tx, """
+                SELECT task_id,content_hash FROM board_task_requests
+                WHERE room_id=$room AND author_id=$author AND request_id=$key;
+                """, ("$room", room.Id), ("$author", agentId), ("$key", requestId)))
+            using (var existing = prior.ExecuteReader())
+            {
+                if (existing.Read())
+                {
+                    var oldTaskId = existing.GetString(0);
+                    if (existing.GetString(1) != inputHash)
+                        throw new InvalidOperationException("Task requestId already used with different content.");
+                    existing.Close();
+                    var oldTask = ReadTaskById(conn, tx, room.Id, oldTaskId);
+                    tx.Commit();
+                    return oldTask;
+                }
+            }
             var id = NewId("task");
             using (var insert = Cmd(conn, tx, """
                 INSERT INTO board_tasks(id,room_id,title,details,status,revision,work_area,updated_at)
@@ -538,6 +569,12 @@ public sealed class AgentBoardStore
                 """, ("$id", id), ("$room", room.Id), ("$title", title),
                 ("$details", details), ("$area", workArea), ("$now", Utc())))
                 insert.ExecuteNonQuery();
+            using (var receipt = Cmd(conn, tx, """
+                INSERT INTO board_task_requests(room_id,author_id,request_id,task_id,content_hash)
+                VALUES($room,$author,$key,$task,$hash);
+                """, ("$room", room.Id), ("$author", agentId), ("$key", requestId),
+                ("$task", id), ("$hash", inputHash)))
+                receipt.ExecuteNonQuery();
             using (var eventCommand = Cmd(conn, tx, """
                 INSERT INTO board_events(room_id,author_id,kind,body,created_at)
                 VALUES($room,$author,'status',$body,$now);
