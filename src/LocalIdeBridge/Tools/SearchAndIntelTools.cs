@@ -113,6 +113,7 @@ public sealed class SearchAndIntelTools
                     return Task.FromResult(ToolResult.Fail("invalid_regex", $"Invalid regular expression: {ex.Message}"));
                 }
 
+                var regexTimedOut = false;
                 var (matches, filesScanned, truncated) = ScanLines(ws, filePattern, maxResults, line =>
                 {
                     try
@@ -122,9 +123,11 @@ public sealed class SearchAndIntelTools
                     }
                     catch (RegexMatchTimeoutException)
                     {
+                        regexTimedOut = true;
                         return -1;
                     }
                 }, ct);
+                truncated |= regexTimedOut;
 
                 return Task.FromResult(ToolResult.Ok(
                     $"Found {matches.Count} regex match(es) across {filesScanned} file(s){(truncated ? " (truncated)" : "")}.",
@@ -825,7 +828,12 @@ public sealed class SearchAndIntelTools
 
             FileInfo fi;
             try { fi = new FileInfo(file); } catch { continue; }
-            if (fi.Length == 0 || fi.Length > MaxSearchFileBytes) continue;
+            if (fi.Length == 0) continue;
+            if (fi.Length > MaxSearchFileBytes)
+            {
+                truncated = true;
+                continue;
+            }
             if (IsProbablyBinary(file)) continue;
 
             filesScanned++;
@@ -839,7 +847,11 @@ public sealed class SearchAndIntelTools
                 {
                     ct.ThrowIfCancellationRequested();
                     lineNo++;
-                    if (line.Length > 4000) continue; // Skip minified single-line bundles.
+                    if (line.Length > 4000)
+                    {
+                        truncated = true; // Large single-line files were not fully searched.
+                        continue;
+                    }
                     var col = matcher(line);
                     if (col < 1) continue;
 
@@ -854,7 +866,9 @@ public sealed class SearchAndIntelTools
                 }
             }
             catch (OperationCanceledException) { throw; }
-            catch { }
+            catch (IOException) { truncated = true; }
+            catch (UnauthorizedAccessException) { truncated = true; }
+            catch (System.Text.DecoderFallbackException) { truncated = true; }
         }
 
         return (matches, filesScanned, truncated);
