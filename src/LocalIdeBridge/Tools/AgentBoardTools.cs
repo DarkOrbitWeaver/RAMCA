@@ -280,15 +280,22 @@ public static class AgentBoardTools
                 new("key", "string", "Stable pin key for save."),
                 new("title", "string", "Pin title for save."),
                 new("body", "string", "Pin content for save."),
-                new("expectedRevision", "integer", "Existing revision when replacing a pin.")
+                new("expectedRevision", "integer", "Existing revision when replacing a pin."),
+                new("offset", "integer", "List offset for older pins.", Default: 0),
+                new("limit", "integer", "List page size, 1..100.", Default: 25)
             ],
             Handler: (args, _, _) =>
             {
                 var room = Room(args);
                 Agent(args, room);
                 if (args.RequireString("action") == "list")
+                {
+                    var offset = Math.Max(0, args.OptionalInt("offset", 0));
+                    var limit = Math.Clamp(args.OptionalInt("limit", 25), 1, 99);
+                    var page = board.ListPins(room, limit + 1, offset);
                     return Task.FromResult(ToolResult.Ok("Room pins.",
-                        new { pins = board.ListPins(room) }));
+                        new { pins = page.Take(limit).ToArray(), offset, hasMore = page.Count > limit }));
+                }
                 if (args.RequireString("action") == "delete")
                 {
                     board.DeletePin(room, args.RequireString("agentId"), args.RequireString("credential"),
