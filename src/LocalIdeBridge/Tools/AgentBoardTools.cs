@@ -420,10 +420,11 @@ public static class AgentBoardTools
                 if (needsFileVersion && string.IsNullOrWhiteSpace(inner.OptionalString("expectedSha256")))
                     return ToolResult.Fail("expected_version_required",
                         "Board-controlled edits require expectedSha256 from a recent read. Refusing to overwrite changes made by another agent or editor.");
-                if (toolName == "apply_patch" && string.IsNullOrWhiteSpace(inner.OptionalString("expectedSha256")) &&
-                    inner["expectedSha256Map"] is not JsonObject)
+                if (toolName == "apply_patch" &&
+                    string.IsNullOrWhiteSpace(inner.OptionalString("expectedSha256")) &&
+                    (inner["expectedSha256Map"] is not JsonObject map || map.Count == 0))
                     return ToolResult.Fail("expected_version_required",
-                        "Board-controlled patches require expectedSha256 or expectedSha256Map for every target file.");
+                        "Board-controlled patches require expectedSha256 or non-empty expectedSha256Map. Use create_file for a new file.");
 
                 // Claim transitions take this same workspace lock. A task cannot be
                 // reassigned while one of its board_work operations is in progress.
