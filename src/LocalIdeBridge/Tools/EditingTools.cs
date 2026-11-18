@@ -460,7 +460,7 @@ public static partial class EditingTools
                 // will fail closed on an external edit rather than overwrite unexpected bytes.
                 var tx = new PatchTransaction { Id = $"patch_{Guid.NewGuid():N}", Workspace = ws, SessionId = ctx.SessionId };
                 var fileResults = new List<object>();
-                var recordedEdits = new List<string>();
+                var journalEntries = new List<EditJournalRecord>();
                 var totalAdded = 0;
                 var totalRemoved = 0;
                 foreach (var item in staged)
@@ -501,11 +501,10 @@ public static partial class EditingTools
                     {
                         var item = staged[i];
                         var t = tx.Items[i];
-                        db.RecordEdit(new EditJournalRecord(
+                        journalEntries.Add(new EditJournalRecord(
                             t.EditId, ctx.SessionId, ws, item.RelPath, item.Op,
                             t.BeforeHash, t.AfterHash, item.Before is not null, t.BackupPath,
                             item.Added, item.Removed, false, DateTimeOffset.UtcNow));
-                        recordedEdits.Add(t.EditId);
                         fileResults.Add(new
                         {
                             editId = t.EditId, path = item.RelPath, operation = item.Op,
@@ -513,6 +512,7 @@ public static partial class EditingTools
                             linesAdded = item.Added, linesRemoved = item.Removed
                         });
                     }
+                    db.RecordEditBatch(journalEntries);
                     tx.Committed = true;
                     PortablePaths.AtomicWriteAllText(txPath, JsonSerializer.Serialize(tx, AppConfig.JsonOptions));
                     // Garbage collection is best-effort AFTER durable commit. Failure to
