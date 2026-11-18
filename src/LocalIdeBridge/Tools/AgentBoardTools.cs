@@ -108,12 +108,13 @@ public static class AgentBoardTools
             Handler: async (args, _, ct) =>
             {
                 var room = Room(args);
-                Agent(args, room);
+                var agent = Agent(args, room);
                 var after = Math.Max(0, args.OptionalLong("after", 0));
                 var waitMs = Math.Clamp(args.OptionalInt("waitMs", 15000), 1, 20_000);
-                var changed = await board.WaitForEventsAsync(room, after, waitMs, ct).ConfigureAwait(false);
+                var visibleTo = agent.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase) ? null : agent.Id;
+                var changed = await board.WaitForEventsAsync(room, after, waitMs, visibleTo, ct).ConfigureAwait(false);
                 return ToolResult.Ok(changed ? "New board events are available." : "No new board events.",
-                    new { changed, latestCursor = board.LatestSequence(room),
+                    new { changed, latestCursor = board.LatestSequence(room, visibleTo),
                         next = changed ? "Call board_sync with your last event cursor." : "No action required." });
             });
 
