@@ -245,6 +245,9 @@ public sealed class SupervisorTui
             case ConsoleKey.L:
                 if (_activeTab == ViewTab.Board) PromptBoardPin();
                 break;
+            case ConsoleKey.T:
+                if (_activeTab == ViewTab.Board) PromptBoardTask();
+                break;
             case ConsoleKey.X:
                 if (_activeTab == ViewTab.Board) PromptDeleteBoardPin();
                 break;
@@ -649,7 +652,7 @@ public sealed class SupervisorTui
         Line(Style("[Up/Down] Select  [PgUp/PgDn] Page  [Enter] Details  [Esc] Back", UiTone.Muted));
         Line("[C] ChatGPT  [E] Endpoint  [K] Key  [I] Instructions  [R] Rotate");
         Line(_activeTab == ViewTab.Board
-            ? "[B] Views  [C] New room  [J] Invite  [M] Steer  [L] Pin  [X] Unpin  [Q] Quit"
+            ? "[B] Views [C] Room [J] Invite [T] Task [M] Steer [L] Pin [X] Unpin [Q] Quit"
             : "[W] Workspace  [S] Session  [P] Pause/Resume  [N] Note  [Q] Quit");
         sb.Append(ClipAnsi(Style(Fit(_statusBanner, w - 1), UiTone.Muted), w - 1)).Append("\x1b[0m\x1b[K");
         Console.Write(sb.ToString());
@@ -986,6 +989,40 @@ public sealed class SupervisorTui
         catch (Exception ex) when (ex is ArgumentException or IOException or InvalidOperationException)
         {
             _statusBanner = $"Could not create room: {ex.Message}";
+        }
+        finally { Console.Write("\x1b[?25l"); }
+    }
+
+    private void PromptBoardTask()
+    {
+        var workspace = _host.Guard.ActiveWorkspace;
+        IReadOnlyList<BoardRoom> rooms = workspace is null ? [] : _host.Board.ListRooms(workspace);
+        if (rooms.Count == 0)
+        {
+            _statusBanner = "Create a room first.";
+            return;
+        }
+
+        var room = rooms[Math.Min(_scrollOffset, rooms.Count - 1)];
+        Console.Write("\x1b[?25h\x1b[2J\x1b[H");
+        try
+        {
+            Console.WriteLine($"New task in '{room.Name}'");
+            Console.Write("Task title (blank = cancel): ");
+            var title = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(title)) return;
+            Console.Write("Acceptance criteria: ");
+            var details = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(details)) return;
+            Console.Write("Work area relative to workspace (blank = entire workspace): ");
+            var area = Console.ReadLine()?.Trim();
+            var task = _host.Board.CreateSupervisorTask(room, title, details, area);
+            _statusBanner = $"Created task {task.Id}. Agents can claim it on their next sync.";
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
+                                      or UnauthorizedAccessException or IOException)
+        {
+            _statusBanner = $"Task not created: {ex.Message}";
         }
         finally { Console.Write("\x1b[?25l"); }
     }
