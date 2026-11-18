@@ -528,6 +528,31 @@ public sealed class AgentBoardStore
         new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3),
             r.GetString(4), r.GetInt64(5), Time(r.GetString(6)));
 
+    public void DeletePin(BoardRoom room, string agentId, string credential,
+        string key, long expectedRevision)
+    {
+        key = Required(key, "Pin key", 64);
+        lock (_writes)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            ValidateAgent(conn, tx, room.Id, agentId, credential);
+            using (var command = Cmd(conn, tx, """
+                DELETE FROM board_pins WHERE room_id=$room AND pin_key=$key AND revision=$revision;
+                """, ("$room", room.Id), ("$key", key), ("$revision", expectedRevision)))
+                if (command.ExecuteNonQuery() != 1)
+                    throw new InvalidOperationException("Pin revision changed or pin not found; sync first.");
+            using (var eventCommand = Cmd(conn, tx, """
+                INSERT INTO board_events(room_id,author_id,kind,body,created_at)
+                VALUES($room,$author,'decision',$body,$now);
+                """, ("$room", room.Id), ("$author", agentId),
+                ("$body", $"Removed pin {key}"), ("$now", Utc())))
+                eventCommand.ExecuteNonQuery();
+            tx.Commit();
+            Signal(room.Id);
+        }
+    }
+
     public IReadOnlyList<BoardPin> ListPins(BoardRoom room, int limit = 50)
     {
         using var conn = Open();
@@ -644,10 +669,11 @@ public sealed class AgentBoardStore
 
     public BoardTask ChangeTask(BoardRoom room, string agentId, string credential,
         string taskId, string action, long expectedRevision, string? evidence = null,
-        string? assigneeId = null, int leaseMinutes = 15)
+        string? assigneeId = null, int leaseMinutes = 15,
+        string? title = null, string? details = null)
     {
         if (expectedRevision < 1) throw new ArgumentException("expectedRevision must be positive.");
-        if (action is not ("claim" or "renew" or "release" or "complete" or "block" or "reopen" or "assign" or "adopt"))
+        if (action is not ("claim" or "renew" or "release" or "complete" or "block" or "reopen" or "assign" or "adopt" or "revise"))
             throw new ArgumentException("Unknown task action.");
         if (evidence is not null) evidence = _secrets.Redact(Required(evidence, "Evidence", 2000));
         lock (_writes)
@@ -661,6 +687,8 @@ public sealed class AgentBoardStore
             var coordinator = agent.Role.Equals("coordinator", StringComparison.OrdinalIgnoreCase);
             var owned = current.OwnerId == agentId && current.OwnerGeneration == agent.Generation;
             var status = current.Status;
+            var nextTitle = current.Title;
+            var nextDetails = current.Details;
             var owner = current.OwnerId;
             var generation = current.OwnerGeneration;
             DateTimeOffset? lease = current.LeaseUntil;
@@ -671,6 +699,16 @@ public sealed class AgentBoardStore
                         throw new InvalidOperationException("Task already claimed or not open; do not steal an expired lease.");
                     status = "in_progress"; owner = agentId; generation = agent.Generation;
                     lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
+                    break;
+                case "revise":
+                    if (!owned && !coordinator)
+                        throw new UnauthorizedAccessException("Only the owner or coordinator can revise this task.");
+                    if (owned && lease <= DateTimeOffset.UtcNow)
+                        throw new InvalidOperationException("Task lease expired; reconcile before revising.");
+                    if (title is null && details is null)
+                        throw new ArgumentException("Provide a new title or details to revise the task.");
+                    if (title is not null) nextTitle = Required(title, "Task title", 180);
+                    if (details is not null) nextDetails = _secrets.Redact(Required(details, "Task details", 4000));
                     break;
                 case "adopt":
                     if (current.OwnerId != agentId || current.OwnerGeneration >= agent.Generation ||
@@ -716,11 +754,13 @@ public sealed class AgentBoardStore
                     break;
             }
             using (var update = Cmd(conn, tx, """
-                UPDATE board_tasks SET status=$status,owner_id=$owner,owner_generation=$generation,
+                UPDATE board_tasks SET title=$title,details=$details,status=$status,
+                    owner_id=$owner,owner_generation=$generation,
                     lease_until=$lease,evidence=COALESCE($evidence,evidence),revision=revision+1,
                     updated_at=$now
                 WHERE id=$id AND room_id=$room AND revision=$revision;
-                """, ("$status", status), ("$owner", owner), ("$generation", generation),
+                """, ("$title", nextTitle), ("$details", nextDetails),
+                ("$status", status), ("$owner", owner), ("$generation", generation),
                 ("$lease", lease?.ToString("O")), ("$evidence", evidence), ("$now", Utc()),
                 ("$id", taskId), ("$room", room.Id), ("$revision", expectedRevision)))
             {
