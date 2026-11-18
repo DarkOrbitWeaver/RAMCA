@@ -638,6 +638,19 @@ public sealed class AgentBoardStore
         }
     }
 
+    public IReadOnlyDictionary<string, long> ListAcknowledgments(BoardRoom room)
+    {
+        using var conn = Open();
+        using var query = Cmd(conn, null, """
+            SELECT id,acknowledged_sequence FROM board_agents WHERE room_id=$room
+            ORDER BY last_seen_at DESC LIMIT 100;
+            """, ("$room", room.Id));
+        var result = new Dictionary<string, long>(StringComparer.Ordinal);
+        using var reader = query.ExecuteReader();
+        while (reader.Read()) result[reader.GetString(0)] = reader.GetInt64(1);
+        return result;
+    }
+
     public long GetAcknowledged(BoardRoom room, string agentId)
     {
         using var conn = Open();
