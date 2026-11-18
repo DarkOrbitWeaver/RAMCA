@@ -200,6 +200,44 @@ public sealed class EditingAndGitTests
     }
 
     [Fact]
+    public async Task RevertRenameRestoresBothPathsInOneRecordedAction()
+    {
+        await using var sb = await TestSandbox.CreateAsync();
+        var oldPath = Path.Combine(sb.WorkspaceDir, "before.txt");
+        var newPath = Path.Combine(sb.WorkspaceDir, "after.txt");
+        await File.WriteAllTextAsync(oldPath, "preserve the exact file");
+
+        var moved = await sb.Host.Registry.InvokeAsync("rename_file", new JsonObject
+        {
+            ["sourcePath"] = "before.txt",
+            ["destinationPath"] = "after.txt"
+        });
+        Assert.True(moved.Success, moved.Summary);
+        var ids = JsonSerializer.SerializeToElement(moved.Data);
+        var sourceEditId = ids.GetProperty("sourceEditId").GetString()!;
+        var destinationEditId = ids.GetProperty("destinationEditId").GetString()!;
+
+        var undone = await sb.Host.Registry.InvokeAsync("revert_rename", new JsonObject
+        {
+            ["sourceEditId"] = sourceEditId,
+            ["destinationEditId"] = destinationEditId
+        });
+        Assert.True(undone.Success, undone.Summary);
+        Assert.Equal("preserve the exact file", await File.ReadAllTextAsync(oldPath));
+        Assert.False(File.Exists(newPath));
+        Assert.True(sb.Host.Database.GetEdit(sourceEditId)!.Reverted);
+        Assert.True(sb.Host.Database.GetEdit(destinationEditId)!.Reverted);
+
+        var repeat = await sb.Host.Registry.InvokeAsync("revert_rename", new JsonObject
+        {
+            ["sourceEditId"] = sourceEditId,
+            ["destinationEditId"] = destinationEditId
+        });
+        Assert.False(repeat.Success);
+        Assert.Equal("invalid_rename_pair", repeat.ErrorCode);
+    }
+
+    [Fact]
     public async Task RenameNeverOverwritesAnExistingDestination()
     {
         await using var sb = await TestSandbox.CreateAsync();
