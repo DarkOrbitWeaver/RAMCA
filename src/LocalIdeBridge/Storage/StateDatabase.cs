@@ -946,6 +946,72 @@ public sealed class StateDatabase : IDisposable
         }
     }
 
+    public void RecordRenameReversal(
+        EditJournalRecord sourceRestored, EditJournalRecord destinationDeleted,
+        string originalSourceId, string originalDestinationId)
+    {
+        if (originalSourceId == originalDestinationId ||
+            sourceRestored.EditId == destinationDeleted.EditId)
+            throw new ArgumentException("A rename requires two distinct edit identities.");
+
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var tx = conn.BeginTransaction();
+            foreach (var entry in new[] { sourceRestored, destinationDeleted })
+            {
+                using var insert = conn.CreateCommand();
+                insert.Transaction = tx;
+                insert.CommandText = """
+                    INSERT INTO edit_journal(edit_id,session_id,workspace,relative_path,operation,
+                        before_sha256,after_sha256,existed_before,backup_file_path,lines_added,
+                        lines_removed,reverted,created_at)
+                    VALUES($id,$sid,$ws,$path,$op,$before,$after,$existed,$backup,$added,$removed,0,$now);
+                    """;
+                insert.Parameters.AddWithValue("$id", entry.EditId);
+                insert.Parameters.AddWithValue("$sid", entry.SessionId);
+                insert.Parameters.AddWithValue("$ws", entry.Workspace);
+                insert.Parameters.AddWithValue("$path", entry.RelativePath);
+                insert.Parameters.AddWithValue("$op", entry.Operation);
+                insert.Parameters.AddWithValue("$before", entry.BeforeSha256);
+                insert.Parameters.AddWithValue("$after", entry.AfterSha256);
+                insert.Parameters.AddWithValue("$existed", entry.ExistedBefore ? 1 : 0);
+                insert.Parameters.AddWithValue("$backup", entry.BackupFilePath is null ?
+                    DBNull.Value : entry.BackupFilePath);
+                insert.Parameters.AddWithValue("$added", entry.LinesAdded);
+                insert.Parameters.AddWithValue("$removed", entry.LinesRemoved);
+                insert.Parameters.AddWithValue("$now", entry.CreatedAtUtc.ToString("O"));
+                insert.ExecuteNonQuery();
+            }
+            foreach (var pair in new[]
+            {
+                (Original: originalSourceId, Inverse: sourceRestored.EditId),
+                (Original: originalDestinationId, Inverse: destinationDeleted.EditId)
+            })
+            {
+                using (var mark = conn.CreateCommand())
+                {
+                    mark.Transaction = tx;
+                    mark.CommandText = "UPDATE edit_journal SET reverted=1 WHERE edit_id=$original AND reverted=0;";
+                    mark.Parameters.AddWithValue("$original", pair.Original);
+                    if (mark.ExecuteNonQuery() != 1)
+                        throw new InvalidOperationException(
+                            $"Rename edit {pair.Original} was already reverted or cannot be found.");
+                }
+                using var link = conn.CreateCommand();
+                link.Transaction = tx;
+                link.CommandText = """
+                    INSERT INTO edit_reversal_links(original_edit_id,inverse_edit_id)
+                    VALUES($original,$inverse);
+                    """;
+                link.Parameters.AddWithValue("$original", pair.Original);
+                link.Parameters.AddWithValue("$inverse", pair.Inverse);
+                link.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
     public void RecordEditAndRevert(EditJournalRecord inverse, string originalEditId)
     {
         lock (_writeLock)
