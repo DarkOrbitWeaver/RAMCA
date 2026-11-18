@@ -381,6 +381,20 @@ public sealed partial class ProcessRunner
 
         var repoPolicy = _guard.LoadRepoPolicy(wsRoot);
         var baseName = Path.GetFileNameWithoutExtension(executable);
+        if (!_config.Autonomy.AllowGitBranchChanges)
+        {
+            var gitCommand = baseName.Equals("git", StringComparison.OrdinalIgnoreCase)
+                ? arguments.ToArray() : [];
+            if (gitCommand.Length > 0 && ChangesBranch(gitCommand))
+                throw new WorkspaceViolationException(
+                    "Branch changes are disabled. RAMCA works on main unless the owner explicitly enables branch changes.");
+            // Shell command patterns are a guard against ordinary mistakes, not
+            // a sandbox for arbitrary scripts executed as the Windows user.
+            if (Regex.IsMatch(joinedCommand,
+                @"(?i)\bgit(?:\.exe)?\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+)*(?:switch\s+(?!main(?:\s|$))|checkout\s+(?!--\s)|worktree\s+(?:add|move|remove|prune)|branch\s+(?!--list\b|--show-current\b|-a\b|-r\b|-v\b|--contains\b)|update-ref\b|symbolic-ref\s+HEAD\b)"))
+                throw new WorkspaceViolationException(
+                    "Shell command appears to change Git branches/worktrees. The owner uses main only.");
+        }
         var pushDenied = !_config.Autonomy.GitPushPolicy.Equals("allow", StringComparison.OrdinalIgnoreCase) ||
                          repoPolicy?.AllowGitPush == false;
         // Catch direct Git invocations, including git -C/-c ... push, and the
@@ -470,6 +484,38 @@ public sealed partial class ProcessRunner
         }
 
         return executable;
+    }
+
+    private static bool ChangesBranch(IReadOnlyList<string> args)
+    {
+        var commandIndex = 0;
+        while (commandIndex < args.Count &&
+               args[commandIndex] is "-C" or "-c" or "--git-dir" or "--work-tree")
+            commandIndex += 2;
+        if (commandIndex >= args.Count) return false;
+
+        var verb = args[commandIndex].ToLowerInvariant();
+        var rest = args.Skip(commandIndex + 1).ToArray();
+        switch (verb)
+        {
+            case "switch":
+                return rest.Any(x => x is "-c" or "-C" or "--create" or "--force-create") ||
+                       rest.LastOrDefault(x => !x.StartsWith('-')) != "main";
+            case "checkout":
+                return !rest.Contains("--", StringComparer.Ordinal);
+            case "worktree":
+                return rest.FirstOrDefault() is not ("list" or null);
+            case "branch":
+                return rest.Length > 0 && rest.Any(x =>
+                    x is "-d" or "-D" or "-m" or "-M" or "-c" or "-C" or "-f" or "--delete" or "--move" or "--copy" or "--force") ||
+                    rest.Any(x => !x.StartsWith('-') && !x.Equals("main", StringComparison.Ordinal));
+            case "symbolic-ref":
+                return rest.FirstOrDefault() == "HEAD" && rest.Length > 1;
+            case "update-ref":
+                return true;
+            default:
+                return false;
+        }
     }
 
     private bool IsAllowedToolName(string baseName, RepoPolicy? repoPolicy)
