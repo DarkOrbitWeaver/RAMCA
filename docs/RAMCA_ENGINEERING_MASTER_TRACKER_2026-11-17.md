@@ -72,3 +72,27 @@
 
 ## Work log
 - 2026-11-17: Baseline verified `74/74`, 0 build warnings/errors. Source review ongoing; do not infer all listed findings resolved.
+
+
+## Multi-chat coordination implementation (2026-11-18, source only)
+
+Code on main:
+- AgentBoardStore: persistent workspace rooms, scoped agent credentials, inbox cursors, messages, pins, task leases, revision checks, idempotent message/task creation and event-driven waiting.
+- AgentBoardTools: join/rejoin, sync, wait, post, acknowledge, task, pin, handoff, guarded task execution.
+- SupervisorTui: Board tab with Chat/Tasks/Pins, copy invitation and local steering.
+- WorkbenchHost / ToolRegistry: register board tools and lock task claim changes against task-owned edits.
+- AgentBoardTests: added regression coverage for persistence, retries, private messages, claims, reattachment, pins, acknowledgments and task scoping.
+
+This is **not build-verified or runtime-tested**. No local PC, VESPER project or portable binary was changed. Agent collaboration is a cooperative tool workflow: ordinary direct editing tools are still exposed to authorized RAMCA clients; board_work cannot make arbitrary shell code a sandbox. New webchats must independently connect their RAMCA tools; an inactive chat cannot process messages.
+
+Still required before relying on multi-chat unattended VESPER work:
+- [ ] Clean Windows .NET 10 restore/build/full tests; fix all errors.
+- [ ] Run and strengthen concurrency/recovery fault injection with two real independent connected clients.
+- [ ] Verify Git index isolation and scoped commits with simultaneous agents on main.
+- [ ] Verify leader-to-worker and worker-to-worker message polling, acknowledgment and quota-exhaustion handoff.
+- [ ] Validate source vs all original Audit A/B/C findings and F-001..F-038. Do not infer a check is resolved from a commit message.
+- [ ] Verify idle CPU, memory and event pagination after 10,000 messages.
+- [ ] Complete source-level HUMANIFY pass against the owner's actual skill and runtime behavior.
+- [ ] Delete stale remote branch feature/one-click-chatgpt-tunnel (0 unique commits; GitHub connector lacks delete-ref).
+- [ ] Verify portable update after building to a temporary directory; never replace an executable while running.
+
