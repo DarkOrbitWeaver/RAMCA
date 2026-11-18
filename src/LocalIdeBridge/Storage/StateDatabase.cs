@@ -909,6 +909,43 @@ public sealed class StateDatabase : IDisposable
     /// Inverse record + original reverted flag are one SQLite transaction.
     /// Filesystem recovery still relies on the durable edit manifest.
     /// </summary>
+    public void RecordEditBatch(IReadOnlyList<EditJournalRecord> edits)
+    {
+        if (edits.Count == 0 || edits.Count > 100)
+            throw new ArgumentException("Provide 1 to 100 edit entries in a batch.");
+        lock (_writeLock)
+        {
+            using var conn = OpenConnection();
+            using var tx = conn.BeginTransaction();
+            foreach (var edit in edits)
+            {
+                using var command = conn.CreateCommand();
+                command.Transaction = tx;
+                command.CommandText = """
+                    INSERT INTO edit_journal(edit_id,session_id,workspace,relative_path,operation,
+                        before_sha256,after_sha256,existed_before,backup_file_path,lines_added,
+                        lines_removed,reverted,created_at)
+                    VALUES($id,$sid,$ws,$path,$op,$before,$after,$existed,$backup,$added,$removed,0,$now);
+                    """;
+                command.Parameters.AddWithValue("$id", edit.EditId);
+                command.Parameters.AddWithValue("$sid", edit.SessionId);
+                command.Parameters.AddWithValue("$ws", edit.Workspace);
+                command.Parameters.AddWithValue("$path", edit.RelativePath);
+                command.Parameters.AddWithValue("$op", edit.Operation);
+                command.Parameters.AddWithValue("$before", edit.BeforeSha256);
+                command.Parameters.AddWithValue("$after", edit.AfterSha256);
+                command.Parameters.AddWithValue("$existed", edit.ExistedBefore ? 1 : 0);
+                command.Parameters.AddWithValue("$backup", edit.BackupFilePath is null ?
+                    DBNull.Value : edit.BackupFilePath);
+                command.Parameters.AddWithValue("$added", edit.LinesAdded);
+                command.Parameters.AddWithValue("$removed", edit.LinesRemoved);
+                command.Parameters.AddWithValue("$now", edit.CreatedAtUtc.ToString("O"));
+                command.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
     public void RecordEditAndRevert(EditJournalRecord inverse, string originalEditId)
     {
         lock (_writeLock)
