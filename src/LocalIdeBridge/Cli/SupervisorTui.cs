@@ -1272,6 +1272,7 @@ public sealed class SupervisorTui
         var tasks = _host.Board.ListTasks(selected, 30);
         var pins = _host.Board.ListPins(selected, 30);
         var events = _host.Board.ReadLatestEvents(selected, 30);
+        var acks = _host.Board.ListAcknowledgments(selected);
         var inProgress = tasks.Count(t => t.Status == "in_progress");
         var blocked = tasks.Count(t => t.Status == "blocked");
         lines.Add(new UiLine(Fit($"  {selected.Name}  |  agents {members.Count}  |  active {inProgress}  |  blocked {blocked}  |  {_boardMode}", width), UiTone.Accent));
@@ -1284,7 +1285,9 @@ public sealed class SupervisorTui
                 var author = members.FirstOrDefault(a => a.Id == item.Author)?.Name ?? item.Author;
                 var target = item.Target is null ? "" : " -> " +
                     (members.FirstOrDefault(a => a.Id == item.Target)?.Name ?? item.Target);
-                lines.Add(new UiLine(Fit($"  #{item.Sequence} {item.CreatedAt.ToLocalTime():HH:mm}  {author}{target} [{item.Kind}] {item.Body}", width),
+                var delivered = item.Target is null ? "" :
+                    acks.TryGetValue(item.Target, out var cursor) && cursor >= item.Sequence ? " [seen]" : " [queued]";
+                lines.Add(new UiLine(Fit($"  #{item.Sequence} {item.CreatedAt.ToLocalTime():HH:mm}  {author}{target}{delivered} [{item.Kind}] {item.Body}", width),
                     item.Kind is "blocker" or "steering" ? UiTone.Warning : UiTone.Normal));
             }
         }
