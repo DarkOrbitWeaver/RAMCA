@@ -956,8 +956,11 @@ public sealed class AgentBoardStore
                     lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
                     break;
                 case "renew":
-                    if (!owned || status != "in_progress" || lease <= DateTimeOffset.UtcNow)
-                        throw new InvalidOperationException("Task lease expired or belongs to another attachment; reconcile first.");
+                    if (!owned || status != "in_progress")
+                        throw new UnauthorizedAccessException("Only the current task owner can renew the lease.");
+                    if (lease <= DateTimeOffset.UtcNow && string.IsNullOrWhiteSpace(evidence))
+                        throw new InvalidOperationException(
+                            "Lease expired; inspect Git, files and in-flight operations, then renew with reconciliation evidence.");
                     lease = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(leaseMinutes, 1, 60));
                     break;
                 case "release":
