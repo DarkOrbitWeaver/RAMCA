@@ -344,7 +344,7 @@ public sealed class AgentBoardStore
             SELECT sequence,room_id,author_id,target_id,kind,body,created_at
             FROM board_events
             WHERE room_id=$room AND sequence>$after
-              AND ($target IS NULL OR target_id IS NULL OR target_id=$target)
+              AND ($target IS NULL OR target_id IS NULL OR target_id=$target OR author_id=$target)
             ORDER BY sequence ASC LIMIT $limit;
             """, ("$room", room.Id), ("$after", Math.Max(0, after)),
             ("$target", target), ("$limit", limit + 1));
@@ -356,20 +356,23 @@ public sealed class AgentBoardStore
         return (result, hasMore);
     }
 
-    public long LatestSequence(BoardRoom room)
+    public long LatestSequence(BoardRoom room, string? agentId = null)
     {
         using var conn = Open();
-        using var cmd = Cmd(conn, null,
-            "SELECT COALESCE(MAX(sequence),0) FROM board_events WHERE room_id=$room;",
-            ("$room", room.Id));
+        using var cmd = Cmd(conn, null, """
+            SELECT COALESCE(MAX(sequence),0) FROM board_events
+            WHERE room_id=$room AND ($agent IS NULL OR target_id IS NULL OR
+                target_id=$agent OR author_id=$agent);
+            """, ("$room", room.Id), ("$agent", agentId));
         return Convert.ToInt64(cmd.ExecuteScalar());
     }
 
     /// <summary>No polling loop; each waiter either sees a new event or times out.</summary>
-    public async Task<bool> WaitForEventsAsync(BoardRoom room, long after, int waitMs, CancellationToken ct)
+    public async Task<bool> WaitForEventsAsync(BoardRoom room, long after, int waitMs,
+        string? agentId, CancellationToken ct)
     {
         var signal = _signals.GetOrAdd(room.Id, _ => NewSignal());
-        if (LatestSequence(room) > after) return true;
+        if (LatestSequence(room, agentId) > after) return true;
         if (waitMs < 1) return false;
         try
         {
@@ -377,7 +380,7 @@ public sealed class AgentBoardStore
                 .ConfigureAwait(false);
         }
         catch (TimeoutException) { }
-        return LatestSequence(room) > after;
+        return LatestSequence(room, agentId) > after;
     }
 
     public IReadOnlyList<BoardEvent> ReadLatestEvents(BoardRoom room, int limit = 25)
