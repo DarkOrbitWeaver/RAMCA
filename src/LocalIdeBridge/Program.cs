@@ -426,7 +426,7 @@ public static class Program
               LocalIdeBridge cli <command> [options]  Discover tools, invoke operations, inspect jobs/logs (see 'cli --help')
 
             Verification:
-              LocalIdeBridge benchmark [--output f]   Run 100 / 1,000 / 10,000 op resource & latency benchmarks
+              LocalIdeBridge benchmark [--quick] [--output f]   Quick MCP read comparison or full resource benchmark
               LocalIdeBridge gendocs [--output f]     Generate authoritative TOOLS.md from ToolRegistry contracts
 
             Global option: --home <dir>               Override portable directory (defaults to executable folder)

@@ -60,3 +60,7 @@ Native AOT (`PublishAot=true`) was evaluated and deliberately **not** enabled be
 ```
 
 This creates an isolated disposable project in `%TEMP%`, runs all measurements including the 100 / 1,000 / 10,000 operation sweep, prints the JSON report, and removes all temporary files automatically.
+
+## Quick agent-efficiency verification
+
+Run `LocalIdeBridge.exe benchmark --quick --output benchmark-agent.json` (or `dotnet run --project src/LocalIdeBridge -c Release --no-build -- benchmark --quick --output benchmark-agent.json`). It creates a disposable local workspace, warms both paths, compares 15 samples of three separate legacy range requests against one batched single-copy request with equivalent source, verifies conditional unchanged reads, and reports response bytes, median/p95 loopback latency, handler/audit timing and idle resources. It does not use a real project or measure ChatGPT latency, token billing, or the previous binary. The full historical stress benchmark remains available without `--quick`.

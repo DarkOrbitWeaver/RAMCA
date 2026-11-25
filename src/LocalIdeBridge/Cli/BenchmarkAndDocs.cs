@@ -56,7 +56,7 @@ public static class BenchmarkRunner
 
             // 1. Measure cold in-process host initialization + Kestrel listener startup -> HTTP /health 200 OK.
             var coldSw = Stopwatch.StartNew();
-            var host = new WorkbenchHost(paths, cfg);
+            await using var host = new WorkbenchHost(paths, cfg);
             await host.StartNetworkListenerAsync(ct);
             using (var http = new HttpClient())
             {
@@ -65,6 +65,18 @@ public static class BenchmarkRunner
             }
             coldSw.Stop();
             var coldStartMs = coldSw.Elapsed.TotalMilliseconds;
+            if (args.Contains("--quick", StringComparer.OrdinalIgnoreCase))
+            {
+                var quick = await MeasureAgentReadLoopAsync(host, wsRoot, coldStartMs, ct);
+                var quickJson = JsonSerializer.Serialize(quick, AppConfig.JsonOptions);
+                if (!string.IsNullOrWhiteSpace(outputPath))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
+                    File.WriteAllText(outputPath, quickJson + Environment.NewLine);
+                }
+                Console.WriteLine(quickJson);
+                return 0;
+            }
 
             // Also measure full external OS subprocess cold start if current executable/dll is available.
             var subprocessColdStartMs = await MeasureSubprocessColdStartAsync(benchRoot, ct);
@@ -273,6 +285,155 @@ public static class BenchmarkRunner
         {
             try { Directory.Delete(benchRoot, recursive: true); } catch { }
         }
+    }
+
+    // Compare equal source coverage using actual loopback MCP responses. This is
+    // a workflow A/B on the current binary, not a measurement of an old release,
+    // internet latency, tokenizer counts, or ChatGPT inference speed.
+    private static async Task<object> MeasureAgentReadLoopAsync(
+        WorkbenchHost host, string workspace, double startupMs, CancellationToken ct)
+    {
+        using var client = new HttpClient { BaseAddress = new Uri(host.BoundLocalUrl + "/") };
+        client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+            "Bearer", host.Credentials.GetSecretForExplicitCopy());
+        var id = 0;
+        async Task<(JsonNode Data, int Bytes)> Call(string tool, JsonObject arguments)
+        {
+            var request = new JsonObject
+            {
+                ["jsonrpc"] = "2.0", ["id"] = ++id, ["method"] = "tools/call",
+                ["params"] = new JsonObject { ["name"] = tool, ["arguments"] = arguments }
+            };
+            using var body = new StringContent(request.ToJsonString(), Encoding.UTF8, "application/json");
+            using var response = await client.PostAsync("mcp", body, ct);
+            response.EnsureSuccessStatusCode();
+            var raw = await response.Content.ReadAsByteArrayAsync(ct);
+            var envelope = JsonNode.Parse(raw)?["result"]
+                ?? throw new InvalidOperationException("MCP returned no result.");
+            if (envelope["isError"]?.GetValue<bool>() == true)
+                throw new InvalidOperationException($"Benchmark {tool} failed: {envelope["content"]}");
+            var result = envelope["structuredContent"] ??
+                JsonNode.Parse(envelope["content"]![0]!["text"]!.GetValue<string>());
+            return (result?["data"] ?? throw new InvalidOperationException("MCP returned no tool data."), raw.Length);
+        }
+
+        (int Start, int End)[] ranges = [(1, 20), (41, 60), (81, 100)];
+        var expected = File.ReadAllLines(Path.Combine(workspace, "notes.txt"));
+        string? knownSha = null;
+        async Task<int> Separate()
+        {
+            host.Config.Integrations.McpResultMode = "auto";
+            var bytes = 0;
+            foreach (var (start, end) in ranges)
+            {
+                var (data, size) = await Call("read_range", new JsonObject
+                {
+                    ["path"] = "notes.txt", ["startLine"] = start, ["endLine"] = end, ["format"] = "both"
+                });
+                var source = data["lines"]!.AsArray().Select(line => line!["text"]!.GetValue<string>());
+                if (!source.SequenceEqual(expected[(start - 1)..end]))
+                    throw new InvalidOperationException("Separate read returned unexpected source.");
+                bytes += size;
+            }
+            return bytes;
+        }
+
+        async Task<int> Batched(bool unchanged)
+        {
+            host.Config.Integrations.McpResultMode = "text";
+            var item = new JsonObject
+            {
+                ["path"] = "notes.txt",
+                ["ranges"] = new JsonArray(ranges.Select(r => (JsonNode)new JsonArray(r.Start, r.End)).ToArray())
+            };
+            if (unchanged) item["ifSha256"] = knownSha ?? throw new InvalidOperationException("Missing baseline version.");
+            var (data, bytes) = await Call("read_context", new JsonObject { ["items"] = new JsonArray(item) });
+            var file = data["files"]![0]!;
+            if (unchanged)
+            {
+                if (file["status"]?.GetValue<string>() != "unchanged" || file["ranges"] is not null)
+                    throw new InvalidOperationException("Conditional read resent source or changed unexpectedly.");
+            }
+            else
+            {
+                if (data["complete"]?.GetValue<bool>() != true)
+                    throw new InvalidOperationException("Batch source was incomplete.");
+                var returned = file["ranges"]!.AsArray();
+                if (returned.Count != ranges.Length)
+                    throw new InvalidOperationException("Batch range count differs.");
+                for (var i = 0; i < ranges.Length; i++)
+                    if (returned[i]!["content"]!.GetValue<string>() !=
+                        string.Join("\n", expected[(ranges[i].Start - 1)..ranges[i].End]))
+                        throw new InvalidOperationException("Batch read returned unexpected source.");
+                knownSha = file["sha256"]!.GetValue<string>();
+            }
+            return bytes;
+        }
+
+        // Warm both paths before timed samples. Alternate ordering to reduce
+        // cache/order bias, and verify source equivalence on every iteration.
+        await Separate();
+        await Batched(false);
+        await Batched(true);
+        const int samples = 15;
+        var separateMs = new List<double>(samples);
+        var batchMs = new List<double>(samples);
+        var unchangedMs = new List<double>(samples);
+        var separateBytes = new List<int>(samples);
+        var batchBytes = new List<int>(samples);
+        var unchangedBytes = new List<int>(samples);
+        async Task Sample(Func<Task<int>> operation, List<double> timings, List<int> sizes)
+        {
+            var sw = Stopwatch.StartNew();
+            sizes.Add(await operation());
+            timings.Add(sw.Elapsed.TotalMilliseconds);
+        }
+        for (var i = 0; i < samples; i++)
+        {
+            if (i % 2 == 0)
+            {
+                await Sample(Separate, separateMs, separateBytes);
+                await Sample(() => Batched(false), batchMs, batchBytes);
+            }
+            else
+            {
+                await Sample(() => Batched(false), batchMs, batchBytes);
+                await Sample(Separate, separateMs, separateBytes);
+            }
+            await Sample(() => Batched(true), unchangedMs, unchangedBytes);
+        }
+
+        static object Stats(int calls, List<double> timings, List<int> sizes)
+        {
+            timings.Sort();
+            return new { calls, samples = timings.Count,
+                medianMs = Math.Round(timings[timings.Count / 2], 3),
+                p95Ms = Math.Round(timings[(int)Math.Ceiling(timings.Count * 0.95) - 1], 3),
+                meanResponseBytes = Math.Round(sizes.Average(), 1) };
+        }
+
+        // Quiet window after all requests; no forced GC or synthetic operation spam.
+        using var process = Process.GetCurrentProcess();
+        process.Refresh();
+        var cpuBefore = process.TotalProcessorTime;
+        var idleWatch = Stopwatch.StartNew();
+        await Task.Delay(3000, ct);
+        process.Refresh();
+        return new
+        {
+            measuredAtUtc = DateTimeOffset.UtcNow,
+            environment = new { os = RuntimeInformation.OSDescription, dotnetVersion = Environment.Version.ToString() },
+            scope = "Current binary, equivalent loopback MCP reads; excludes remote transport and model context.",
+            startupMs = Math.Round(startupMs, 2),
+            separateLegacyReads = Stats(3, separateMs, separateBytes),
+            batchedSingleCopyRead = Stats(1, batchMs, batchBytes),
+            unchangedConditionalRead = Stats(1, unchangedMs, unchangedBytes),
+            idle = new { sampleWindowMs = idleWatch.ElapsedMilliseconds,
+                workingSetMb = Math.Round(process.WorkingSet64 / (1024.0 * 1024.0), 2),
+                cpuPercent = Math.Round((process.TotalProcessorTime - cpuBefore).TotalMilliseconds /
+                    (idleWatch.Elapsed.TotalMilliseconds * Environment.ProcessorCount) * 100, 3) },
+            toolTimings = host.Registry.GetTimings("read_range").Concat(host.Registry.GetTimings("read_context"))
+        };
     }
 
     private static async Task<double?> MeasureSubprocessColdStartAsync(string benchRoot, CancellationToken ct)
