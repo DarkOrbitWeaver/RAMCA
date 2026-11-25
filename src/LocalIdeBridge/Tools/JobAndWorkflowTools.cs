@@ -328,7 +328,7 @@ public static class JobAndWorkflowTools
             Parameters:
             [
                 new("name", "string", "Human-readable workflow name.", Default: "workflow"),
-                new("steps", "array", "Ordered list of workflow step objects: { id, tool, arguments?, dependsOn?, runIf?, timeoutSeconds?, retries?, continueOnError?, checkpointAfter? }.",
+                new("steps", "array", "Ordered list of workflow step objects: { id, tool, arguments?, dependsOn?, runIf?, timeoutSeconds?, retries?, continueOnError?, checkpointAfter?, returnPointers?, returnMaxBytes? }.",
                     Required: true, ItemsSchema: new JsonObject { ["type"] = "object" }),
                 new("maxParallelism", "integer", "Optional max concurrency for independent read-only steps."),
                 new("async", "boolean", "If true, launches the workflow as a background job and returns jobId immediately.", Default: false)

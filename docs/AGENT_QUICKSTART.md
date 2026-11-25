@@ -71,3 +71,7 @@ Use `tool_performance` (via `tool_read` in compact mode) to inspect real per-too
 To avoid model polling, use `job_events` with `afterEventId`, `waitMs:25000`, `waitForTerminal:true`, and `includeResult:true` when waiting for completion. For status-only checks use `job_status` with `includeResult:false`. Event waits are bounded and release completed-job signals.
 
 For C# declarations use `symbol_search` with `filePattern` and `kind`; it returns precise source spans and includes constructors and fields. Declaration search streams matching files instead of first assembling the bounded workspace compilation. Syntax cache entries are verified against source hashes, including external same-size edits. These results are syntax-level, not proof of project-aware semantic resolution.
+
+### Get selected results from an existing workflow
+
+Each step may specify `returnPointers` (up to eight JSON pointers into its tool result, such as `/data/content` or `/data/sha256`) and `returnMaxBytes` (512–16384, default 8192). The final synchronous workflow response includes `outputs` keyed by step ID; asynchronous workflows expose the same final result through job retrieval. Total requested projection budget is limited to 64 KiB. Projection errors are explicit and never replay completed mutations. Intermediate workflow checkpoints remain summary-only. Use projections for small independent reads and targeted verification, rather than repeating each tool call after workflow completion.

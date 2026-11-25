@@ -45,6 +45,31 @@ public sealed class WorkflowBindingRegressionTests
     }
 
     [Fact]
+    public async Task SelectedResultsReturnWithoutRepeatingReadsOrChangingMutationOutcome()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "a.txt"), "source");
+        var result = await sb.Host.Workflows.ExecuteAsync(new WorkflowDefinition
+        {
+            Steps =
+            [
+                new WorkflowStepSpec { Id = "read", Tool = "read_file",
+                    Arguments = new JsonObject { ["path"] = "a.txt" },
+                    ReturnPointers = ["/data/content", "/data/sha256"] },
+                new WorkflowStepSpec { Id = "write", Tool = "create_file", DependsOn = ["read"],
+                    Arguments = new JsonObject { ["path"] = "b.txt", ["content"] = "written" },
+                    ReturnPointers = ["/data/notThere"] }
+            ]
+        });
+        Assert.Equal("succeeded", result.Status);
+        Assert.NotNull(result.Outputs);
+        Assert.Equal("source", result.Outputs!["read"]["values"]!["/data/content"]!.GetValue<string>());
+        Assert.Equal(64, result.Outputs["read"]["values"]!["/data/sha256"]!.GetValue<string>().Length);
+        Assert.Equal("pointer_not_found", result.Outputs["write"]["errors"]![0]!["code"]!.GetValue<string>());
+        Assert.True(File.Exists(Path.Combine(sb.WorkspaceDir, "b.txt")));
+    }
+
+    [Fact]
     public async Task UndeclaredDependencyReferenceFailsBeforeMutation()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);

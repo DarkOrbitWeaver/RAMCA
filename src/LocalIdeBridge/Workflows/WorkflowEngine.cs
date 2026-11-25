@@ -22,6 +22,8 @@ public sealed class WorkflowStepSpec
     public int RetryDelayMs { get; set; } = 300;
     public bool ContinueOnError { get; set; }
     public bool CheckpointAfter { get; set; }
+    public List<string> ReturnPointers { get; set; } = [];
+    public int ReturnMaxBytes { get; set; } = 8192;
 }
 
 public sealed class WorkflowDefinition
@@ -56,6 +58,7 @@ public sealed class WorkflowRunResult
     public int FailedSteps { get; set; }
     public int SkippedSteps { get; set; }
     public List<WorkflowStepState> Steps { get; set; } = [];
+    public Dictionary<string, JsonObject>? Outputs { get; set; }
 }
 
 /// <summary>
@@ -124,6 +127,17 @@ public sealed class WorkflowEngine
         var bindingPointers = CollectBindingPointers(definition);
         var boundValues = new Dictionary<string, Dictionary<string, JsonNode?>>(StringComparer.OrdinalIgnoreCase);
         var totalBoundBytes = 0;
+        // Returned projections are transient; do not copy source into every checkpoint.
+        var returnedOutputs = new ConcurrentDictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+
+        WorkflowRunResult Finish(string status)
+        {
+            var result = BuildResult(wfId, sid, definition.Name, status, sw.ElapsedMilliseconds, definition.Steps, stepStates);
+            if (!returnedOutputs.IsEmpty)
+                result.Outputs = definition.Steps.Where(s => returnedOutputs.ContainsKey(s.Id))
+                    .ToDictionary(s => s.Id, s => returnedOutputs[s.Id], StringComparer.OrdinalIgnoreCase);
+            return result;
+        }
 
         void PersistCheckpoint(string status)
         {
@@ -217,7 +231,7 @@ public sealed class WorkflowEngine
                         {
                             await RunSingleStepAsync(step, stepStates[step.Id], sid, stateLock, onProgress,
                                 () => PersistCheckpoint("running"), bindingPointers, boundValues, () => totalBoundBytes,
-                                size => totalBoundBytes += size, wfCts.Token).ConfigureAwait(false);
+                                size => totalBoundBytes += size, returnedOutputs, wfCts.Token).ConfigureAwait(false);
                         }
                         finally
                         {
@@ -238,7 +252,7 @@ public sealed class WorkflowEngine
                     {
                         await RunSingleStepAsync(wsStep, stepStates[wsStep.Id], sid, stateLock, onProgress,
                             () => PersistCheckpoint("running"), bindingPointers, boundValues, () => totalBoundBytes,
-                            size => totalBoundBytes += size, wfCts.Token).ConfigureAwait(false);
+                            size => totalBoundBytes += size, returnedOutputs, wfCts.Token).ConfigureAwait(false);
                     }
                     finally
                     {
@@ -255,7 +269,7 @@ public sealed class WorkflowEngine
             var finalStatus = anyUnhandledFailure ? "failed" : "succeeded";
             PersistCheckpoint(finalStatus);
             _logger.Info("workflow", $"Workflow '{wfId}' completed with status '{finalStatus}'.", null, sw.ElapsedMilliseconds);
-            return BuildResult(wfId, sid, definition.Name, finalStatus, sw.ElapsedMilliseconds, definition.Steps, stepStates);
+            return Finish(finalStatus);
         }
         catch (OperationCanceledException)
         {
@@ -266,7 +280,7 @@ public sealed class WorkflowEngine
                     st.Status = "cancelled";
             }
             PersistCheckpoint("cancelled");
-            return BuildResult(wfId, sid, definition.Name, "cancelled", sw.ElapsedMilliseconds, definition.Steps, stepStates);
+            return Finish("cancelled");
         }
         catch (Exception ex)
         {
@@ -282,7 +296,7 @@ public sealed class WorkflowEngine
             }
             PersistCheckpoint("failed");
             _logger.Error("workflow", $"Workflow '{wfId}' failed: {ex.GetType().Name}: {ex.Message}");
-            return BuildResult(wfId, sid, definition.Name, "failed", sw.ElapsedMilliseconds, definition.Steps, stepStates);
+            return Finish("failed");
         }
         finally
         {
@@ -311,6 +325,7 @@ public sealed class WorkflowEngine
         Dictionary<string, Dictionary<string, JsonNode?>> boundValues,
         Func<int> currentBoundBytes,
         Action<int> addBoundBytes,
+        ConcurrentDictionary<string, JsonObject> returnedOutputs,
         CancellationToken wfCt)
     {
         var tool = _registry.Find(spec.Tool)!;
@@ -407,6 +422,10 @@ public sealed class WorkflowEngine
             }
         }
 
+        // Projection errors do not change the outcome of an already executed tool.
+        if (spec.ReturnPointers.Count > 0 && lastResult is not null)
+            returnedOutputs[spec.Id] = ProjectResult(lastResult, spec.ReturnPointers, spec.ReturnMaxBytes);
+
         stepSw.Stop();
         lock (stateLock)
         {
@@ -494,6 +513,7 @@ public sealed class WorkflowEngine
             throw new ArgumentException("Workflow exceeds maximum of 64 steps.");
 
         var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var outputBudget = 0;
         foreach (var s in def.Steps)
         {
             if (string.IsNullOrWhiteSpace(s.Id))
@@ -502,8 +522,19 @@ public sealed class WorkflowEngine
                 throw new ArgumentException($"Duplicate workflow step id '{s.Id}'.");
             if (string.IsNullOrWhiteSpace(s.Tool) || _registry.Find(s.Tool) is null)
                 throw new ArgumentException($"Step '{s.Id}' references unknown tool '{s.Tool}'.");
-            if (s.Tool is "workflow_run" or "job_start" or "execute_once")
-                throw new ArgumentException("Nested orchestrators are not permitted inside workflow steps; use declared DAG dependencies.");
+            if (_registry.Find(s.Tool)?.Name is "workflow_run" or "job_start" or "execute_once" or "workspace_select" or "session_switch")
+                throw new ArgumentException("Nested orchestrators and workspace/session changes are not permitted inside workflow steps.");
+            if (s.ReturnPointers is null || s.ReturnPointers.Count > 8 ||
+                s.ReturnPointers.Any(p => p is null || p.Length is 0 or > 256 || p[0] != '/' || p.Contains('\0')))
+                throw new ArgumentException("returnPointers must contain at most eight valid JSON pointers.");
+            if (s.ReturnPointers.Count > 0)
+            {
+                if (s.ReturnMaxBytes is < 512 or > 16384)
+                    throw new ArgumentException("returnMaxBytes must be 512..16384.");
+                outputBudget += s.ReturnMaxBytes;
+                if (outputBudget > 65536)
+                    throw new ArgumentException("Workflow return budgets exceed 64 KiB aggregate limit.");
+            }
             var cond = (s.RunIf ?? "on_success").Trim();
             if (!(cond.Equals("on_success", StringComparison.OrdinalIgnoreCase) ||
                   cond.Equals("on_failure", StringComparison.OrdinalIgnoreCase) ||
@@ -631,6 +662,40 @@ public sealed class WorkflowEngine
         if (node is JsonArray arr)
             return new JsonArray(arr.Select(n => ReplaceBindings(n, values)).ToArray());
         return node?.DeepClone();
+    }
+
+    private static JsonObject ProjectResult(ToolResult result, IReadOnlyList<string> pointers, int budget)
+    {
+        var values = new JsonObject();
+        var errors = new JsonArray();
+        var projection = new JsonObject { ["values"] = values, ["errors"] = errors };
+        try
+        {
+            var root = JsonSerializer.SerializeToNode(result, AppConfig.JsonOptions)
+                ?? throw new ArgumentException("Result cannot be serialized.");
+            foreach (var pointer in pointers.Distinct(StringComparer.Ordinal))
+            {
+                try
+                {
+                    values[pointer] = ResolvePointer(root, pointer)?.DeepClone();
+                    if (JsonSerializer.SerializeToUtf8Bytes(projection, AppConfig.JsonOptions).Length <= budget)
+                        continue;
+                    values.Remove(pointer);
+                    errors.Add(new JsonObject { ["pointer"] = pointer, ["code"] = "output_budget_exceeded" });
+                }
+                catch (ArgumentException)
+                {
+                    errors.Add(new JsonObject { ["pointer"] = pointer, ["code"] = "pointer_not_found" });
+                }
+                if (JsonSerializer.SerializeToUtf8Bytes(projection, AppConfig.JsonOptions).Length > budget)
+                    return new JsonObject { ["error"] = "output_budget_exceeded" };
+            }
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or JsonException or NotSupportedException)
+        {
+            return new JsonObject { ["error"] = "output_projection_failed" };
+        }
+        return projection;
     }
 
     private static JsonNode? ResolvePointer(JsonNode root, string pointer)
