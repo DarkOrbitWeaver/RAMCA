@@ -124,6 +124,30 @@ public sealed class CodeIntelAndExecutionTests
     }
 
     [Fact]
+    public async Task SymbolSearchFiltersFilesAndRefreshesSameLengthExternalEdits()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var file = Path.Combine(sb.WorkspaceDir, "Target.cs");
+        await File.WriteAllTextAsync(file, "class Alpha { int One; }");
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "Other.cs"), "class Alpha {}");
+        var args = new JsonObject { ["query"] = "*", ["filePattern"] = "Target.cs" };
+        var first = await sb.Host.Registry.InvokeAsync("symbol_search", args);
+        Assert.True(first.Success, first.ErrorMessage);
+        Assert.Contains("One", JsonSerializer.Serialize(first.Data));
+        Assert.DoesNotContain("Other.cs", JsonSerializer.Serialize(first.Data));
+        var stamp = File.GetLastWriteTimeUtc(file);
+        await File.WriteAllTextAsync(file, "class Bravo { int Two; }");
+        File.SetLastWriteTimeUtc(file, stamp);
+        var second = await sb.Host.Registry.InvokeAsync("symbol_search", args);
+        Assert.True(second.Success, second.ErrorMessage);
+        var json = JsonSerializer.Serialize(second.Data);
+        Assert.Contains("Bravo", json);
+        Assert.Contains("Two", json);
+        Assert.DoesNotContain("Alpha", json);
+        Assert.Contains("startLine", json);
+    }
+
+    [Fact]
     public async Task MultiLiteralSearchScansOnceAndCentersMatchesOnLongLines()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);

@@ -22,7 +22,7 @@ public sealed class SearchAndIntelTools
     private const long MaxSearchFileBytes = 4 * 1024 * 1024;
     private const int MaxRoslynFiles = 400;
 
-    private sealed record CachedSyntaxTree(DateTime LastWriteUtc, long Length, SyntaxTree Tree);
+    private sealed record CachedSyntaxTree(string Sha256, SyntaxTree Tree);
 
     private readonly AppConfig _config;
     private readonly WorkspaceGuard _guard;
@@ -254,9 +254,10 @@ public sealed class SearchAndIntelTools
             SideEffects: "None.",
             Parameters:
             [
-                new("query", "string", "Symbol name or substring to match (empty string lists top symbols).", Required: true),
-                new("kind", "string", "Optional filter: any | type | method | property | enum | interface.", EnumValues: ["any", "type", "method", "property", "enum", "interface"], Default: "any"),
-                new("maxResults", "integer", "Maximum symbols returned (1-200).", Default: 80)
+                new("query", "string", "Name or substring; '*' lists declarations.", Required: true),
+                new("kind", "string", "Declaration kind.", EnumValues: ["any", "type", "method", "property", "enum", "interface", "field", "constructor"], Default: "any"),
+                new("maxResults", "integer", "Maximum symbols returned (1-200).", Default: 80),
+                new("filePattern", "string", "Optional wildcard path/filename filter.")
             ],
             Handler: (args, _, ct) =>
             {
@@ -268,10 +269,15 @@ public sealed class SearchAndIntelTools
                 var results = new List<object>();
                 var usedRoslyn = false;
                 var usedFallback = false;
+                var pattern = args.OptionalString("filePattern");
+                var glob = string.IsNullOrWhiteSpace(pattern) ? null : WorkspaceTools.PatternToMatcher(pattern);
+                bool MatchesFile(string path) => glob is null || glob.IsMatch(path) || glob.IsMatch(Path.GetFileName(path));
 
                 if (_config.Integrations.EnableRoslynSemantic)
                 {
-                    foreach (var (rel, tree) in LoadWorkspaceSyntaxTrees(ws, ct))
+                    // Declaration search needs no workspace compilation and should
+                    // not parse hundreds of unrelated files before yielding a hit.
+                    foreach (var (rel, tree) in EnumerateSyntaxTrees(ws, ct, MatchesFile))
                     {
                         usedRoslyn = true;
                         var root = tree.GetRoot(ct);
@@ -293,6 +299,8 @@ public sealed class SearchAndIntelTools
                                 file = rel,
                                 line = span.StartLinePosition.Line + 1,
                                 column = span.StartLinePosition.Character + 1,
+                                startLine = decl.GetLocation().GetLineSpan().StartLinePosition.Line + 1,
+                                endLine = decl.GetLocation().GetLineSpan().EndLinePosition.Line + 1,
                                 engine = "roslyn-syntax",
                                 isSemantic = false
                             });
@@ -317,6 +325,7 @@ public sealed class SearchAndIntelTools
                         if (new FileInfo(file).Length > MaxSearchFileBytes) continue;
 
                         var rel = _guard.GetRelativePathUnix(ws, file);
+                        if (!MatchesFile(rel)) continue;
                         var lineNo = 0;
                         foreach (var line in File.ReadLines(file))
                         {
@@ -348,7 +357,7 @@ public sealed class SearchAndIntelTools
                 var primaryEngine = usedRoslyn && usedFallback ? "roslyn-syntax+text-fallback" : (usedRoslyn ? "roslyn-syntax" : "text-fallback");
                 return Task.FromResult(ToolResult.Ok(
                     $"Found {results.Count} symbol(s) matching '{query}' (engine={primaryEngine}).",
-                    new { engine = primaryEngine, query, count = results.Count, symbols = results }));
+                    new { engine = primaryEngine, query, count = results.Count, truncated = results.Count >= maxResults, symbols = results }));
             });
 
         yield return new ToolDefinition(
@@ -376,7 +385,7 @@ public sealed class SearchAndIntelTools
                 if (!_config.Integrations.EnableRoslynSemantic)
                     return Task.FromResult(ToolResult.Fail("semantic_disabled",
                         "Roslyn semantic analysis is disabled by integrations.enableRoslynSemantic; no semantic compilation was constructed."));
-                var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct);
+                var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct, file);
                 if (treeMap.Count > 0)
                 {
                     var symbols = ResolveTargetSymbols(compilation, treeMap, ws, file, args.OptionalInt("line", 1), args.OptionalInt("column", 1), symbolName, ct);
@@ -468,7 +477,7 @@ public sealed class SearchAndIntelTools
                 if (!_config.Integrations.EnableRoslynSemantic)
                     return Task.FromResult(ToolResult.Fail("semantic_disabled",
                         "Roslyn semantic analysis is disabled by integrations.enableRoslynSemantic; no semantic compilation was constructed."));
-                var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct);
+                var (compilation, treeMap) = BuildWorkspaceCompilation(ws, ct, file);
                 if (treeMap.Count > 0)
                 {
                     var targets = ResolveTargetSymbols(compilation, treeMap, ws, file, args.OptionalInt("line", 1), args.OptionalInt("column", 1), symbolName, ct)
@@ -627,7 +636,7 @@ public sealed class SearchAndIntelTools
                             if (SymbolEqualityComparer.Default.Equals(candidateType, tm.ContainingType)) continue;
                             ISymbol? implMember = tm.ContainingType.TypeKind == TypeKind.Interface
                                 ? candidateType.FindImplementationForInterfaceMember(tm)
-                                : candidateType.GetMembers(tm.Name).FirstOrDefault(m => m.IsOverride);
+                                : candidateType.GetMembers(tm.Name).FirstOrDefault(m => OverridesMember(m, tm));
 
                             if (implMember is null || !SymbolEqualityComparer.Default.Equals(implMember.ContainingType, candidateType))
                                 continue;
@@ -919,39 +928,83 @@ public sealed class SearchAndIntelTools
         return (matches, filesScanned, truncated);
     }
 
-    private List<(string RelPath, SyntaxTree Tree)> LoadWorkspaceSyntaxTrees(string ws, CancellationToken ct)
+    private IEnumerable<(string RelPath, SyntaxTree Tree)> EnumerateSyntaxTrees(
+        string ws, CancellationToken ct, Func<string, bool>? filter = null)
     {
-        var trees = new List<(string, SyntaxTree)>();
         foreach (var file in WorkspaceTools.EnumerateWorkspaceFiles(ws, _guard, includeIgnored: false, ct))
         {
             if (!file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) continue;
-            FileInfo fi;
-            try { fi = new FileInfo(file); } catch { continue; }
-            if (fi.Length > 1024 * 1024) continue;
-
             var rel = _guard.GetRelativePathUnix(ws, file);
-            if (_syntaxCache.TryGet(file, out var cached) &&
-                cached.LastWriteUtc == fi.LastWriteTimeUtc &&
-                cached.Length == fi.Length)
-            {
-                trees.Add((rel, cached.Tree));
-            }
-            else
-            {
-                var source = File.ReadAllText(file);
-                var tree = CSharpSyntaxTree.ParseText(source, CSharpParseOptions.Default, path: file, cancellationToken: ct);
-                _syntaxCache.Set(file, new CachedSyntaxTree(fi.LastWriteTimeUtc, fi.Length, tree), Math.Max(1024, fi.Length * 2));
-                trees.Add((rel, tree));
-            }
+            if (filter is not null && !filter(rel)) continue;
+            var tree = ReadSyntaxTree(file, ct);
+            if (tree is not null) yield return (rel, tree);
+        }
+    }
 
+    private SyntaxTree? ReadSyntaxTree(string file, CancellationToken ct)
+    {
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            // The hash, decoder, and parser consume the same bounded snapshot.
+            // Timestamp/length alone can miss external edits that preserve both.
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length > 1024 * 1024) return null;
+            using var buffer = new MemoryStream((int)stream.Length);
+            var chunk = new byte[8192];
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                var count = stream.Read(chunk, 0, Math.Min(chunk.Length, 1024 * 1024 + 1 - (int)buffer.Length));
+                if (count == 0) break;
+                buffer.Write(chunk, 0, count);
+                if (buffer.Length > 1024 * 1024) return null;
+            }
+            var bytes = buffer.ToArray();
+            var hash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
+            if (_syntaxCache.TryGet(file, out var cached) && cached.Sha256 == hash)
+                return cached.Tree;
+            using var reader = new StreamReader(new MemoryStream(bytes, writable: false),
+                new UTF8Encoding(false, true), detectEncodingFromByteOrderMarks: true);
+            var source = reader.ReadToEnd();
+            var tree = CSharpSyntaxTree.ParseText(source, CSharpParseOptions.Default, path: file, cancellationToken: ct);
+            // Conservative accounting for source and syntax-node overhead.
+            _syntaxCache.Set(file, new CachedSyntaxTree(hash, tree), Math.Max(4096, bytes.Length * 8L));
+            return tree;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DecoderFallbackException)
+        {
+            return null;
+        }
+    }
+
+    private List<(string RelPath, SyntaxTree Tree)> LoadWorkspaceSyntaxTrees(string ws, CancellationToken ct, string? preferredFile = null)
+    {
+        var trees = new List<(string RelPath, SyntaxTree Tree)>();
+        string? preferred = null;
+        if (!string.IsNullOrWhiteSpace(preferredFile))
+        {
+            preferred = _guard.ResolvePath(preferredFile);
+            if (preferred.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && File.Exists(preferred))
+            {
+                var first = ReadSyntaxTree(preferred, ct);
+                if (first is not null)
+                    trees.Add((_guard.GetRelativePathUnix(ws, preferred), first));
+            }
+        }
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var entry in EnumerateSyntaxTrees(ws, ct))
+        {
+            if (preferred is not null && string.Equals(entry.Tree.FilePath, preferred, comparison)) continue;
+            trees.Add(entry);
             if (trees.Count >= MaxRoslynFiles) break;
         }
         return trees;
     }
 
-    private (CSharpCompilation Compilation, List<(string RelPath, SyntaxTree Tree)> Trees) BuildWorkspaceCompilation(string ws, CancellationToken ct)
+    private (CSharpCompilation Compilation, List<(string RelPath, SyntaxTree Tree)> Trees) BuildWorkspaceCompilation(string ws, CancellationToken ct, string? preferredFile = null)
     {
-        var trees = LoadWorkspaceSyntaxTrees(ws, ct);
+        var trees = LoadWorkspaceSyntaxTrees(ws, ct, preferredFile);
         // Synthesize standard .NET implicit global usings so modern C# files resolve cleanly.
         var implicitUsings = CSharpSyntaxTree.ParseText("""
             global using System;
@@ -1053,6 +1106,20 @@ public sealed class SearchAndIntelTools
         }
     }
 
+    private static bool OverridesMember(ISymbol candidate, ISymbol target)
+    {
+        static ISymbol? Parent(ISymbol symbol) => symbol switch
+        {
+            IMethodSymbol method => method.OverriddenMethod,
+            IPropertySymbol property => property.OverriddenProperty,
+            _ => null
+        };
+        for (var current = Parent(candidate); current is not null; current = Parent(current))
+            if (SymbolEqualityComparer.Default.Equals(current.OriginalDefinition, target.OriginalDefinition))
+                return true;
+        return false;
+    }
+
     private static bool InheritsFrom(INamedTypeSymbol type, INamedTypeSymbol targetBase)
     {
         var cur = type.BaseType;
@@ -1087,6 +1154,10 @@ public sealed class SearchAndIntelTools
             EnumDeclarationSyntax e => (e.Identifier.ValueText, "enum", ContainerOf(e), $"enum {e.Identifier.ValueText}", e.Identifier),
             MethodDeclarationSyntax m => (m.Identifier.ValueText, "method", ContainerOf(m), $"{m.ReturnType} {m.Identifier.ValueText}{m.TypeParameterList}{m.ParameterList}", m.Identifier),
             PropertyDeclarationSyntax p => (p.Identifier.ValueText, "property", ContainerOf(p), $"{p.Type} {p.Identifier.ValueText}", p.Identifier),
+            ConstructorDeclarationSyntax c => (c.Identifier.ValueText, "constructor", ContainerOf(c), $"{c.Identifier.ValueText}{c.ParameterList}", c.Identifier),
+            VariableDeclaratorSyntax v when v.Parent?.Parent is FieldDeclarationSyntax f =>
+                (v.Identifier.ValueText, "field", ContainerOf(v), $"{f.Declaration.Type} {v.Identifier.ValueText}", v.Identifier),
+            EnumMemberDeclarationSyntax e => (e.Identifier.ValueText, "field", ContainerOf(e), e.Identifier.ValueText, e.Identifier),
             _ => null
         };
     }
@@ -1099,6 +1170,8 @@ public sealed class SearchAndIntelTools
         "enum" => symbolKind == "enum",
         "method" => symbolKind == "method",
         "property" => symbolKind == "property",
+        "field" => symbolKind == "field",
+        "constructor" => symbolKind == "constructor",
         _ => true
     };
 

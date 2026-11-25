@@ -69,3 +69,5 @@ For frequent `git_status`, pass `recentCommits:0`; use `maxFiles` and `offset` f
 Use `tool_performance` (via `tool_read` in compact mode) to inspect real per-tool handler and SQLite audit costs. The host keeps only fixed-size counters and latency buckets, not a growing timing history. Audit insertion and session counters commit together in one durable transaction; synchronous durability remains FULL.
 
 To avoid model polling, use `job_events` with `afterEventId`, `waitMs:25000`, `waitForTerminal:true`, and `includeResult:true` when waiting for completion. For status-only checks use `job_status` with `includeResult:false`. Event waits are bounded and release completed-job signals.
+
+For C# declarations use `symbol_search` with `filePattern` and `kind`; it returns precise source spans and includes constructors and fields. Declaration search streams matching files instead of first assembling the bounded workspace compilation. Syntax cache entries are verified against source hashes, including external same-size edits. These results are syntax-level, not proof of project-aware semantic resolution.
