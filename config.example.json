@@ -93,6 +93,6 @@
     "enableMcpSseStream": true,
     "mcpResultMode": "auto",
     "advertiseAgentBoardTools": false,
-    "mcpToolProfile": "compact"
+    "mcpToolProfile": "standard"
   }
 }

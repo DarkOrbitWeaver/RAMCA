@@ -3,7 +3,7 @@
 > **Safety notice (2026-11-18):** RAMCA's current `main` contains source-only recovery fixes and a new multi-chat board. **They have not been rebuilt or verified on Windows, and this is not a validated release.** See [Audit Repair Tracker](docs/AUDIT_REPAIR_TRACKER_2026-11-17.md) and the engineering ledger before unattended use on valuable workspaces.
 
 
-**Release status:** This repository contains source code and earlier test/benchmark artifacts. Security and recovery fixes made on November 15, 2026 have **not** been rebuilt or tested on Windows. Run the validation commands below before enabling remote access. See [Fixes and validation](FIXES_AND_VALIDATION.md) and [Outstanding work](OUTSTANDING_WORK.md).
+**Release status:** This repository contains source code and earlier test/benchmark artifacts. The November 25, 2026 efficiency changes have **not** been rebuilt or tested on Windows in the current review. Run the validation commands below before enabling remote access. See [Fixes and validation](FIXES_AND_VALIDATION.md) and [Outstanding work](OUTSTANDING_WORK.md).
 
 **LocalIdeBridge** is a portable Windows 11 development-tool server written in C# and .NET 10. You choose a workspace and connect a compatible AI client through MCP, HTTP, or the command-line client. The same tools handle code navigation, editing, builds, tests, Git, and long-running jobs; a small terminal interface shows their progress.
 
@@ -32,7 +32,13 @@ dotnet build LocalIdeBridge.sln -c Release --no-restore
 dotnet test LocalIdeBridge.sln -c Release --no-build
 ```
 
-Do not treat historical reports in `artifacts/` as proof that the current source passes. Remote ChatGPT/Claude web connections, OAuth and crash behavior need live client/Windows validation.
+Do not treat historical reports in `artifacts/` as proof that the current source passes. Remote ChatGPT/Claude connections and crash behavior need live client/Windows validation. For a quick comparison of equivalent MCP read workflows after the build, run:
+
+```powershell
+dotnet run --project src/LocalIdeBridge -c Release --no-build -- benchmark --quick --output benchmark-agent.json
+```
+
+Keep standard MCP discovery and compatible result mode until the active client has been tested. Refresh its catalog after updating RAMCA; see [Agent Quickstart](docs/AGENT_QUICKSTART.md).
 
 ## System Requirements
 

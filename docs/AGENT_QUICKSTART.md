@@ -1,77 +1,35 @@
-# LocalIdeBridge — Agent Quickstart
+# RAMCA — Agent quickstart
 
-Copy this document (or press **`I`** in LocalIdeBridge / run `LocalIdeBridge.exe instructions --copy` for a version pre-filled with your live endpoint) into any compatible MCP, HTTP, or CLI coding agent. **Never paste your secret key into public files; configure it as a Bearer credential.**
+Use the live MCP/HTTP/CLI connection, not a pasted tool list. The user chooses a trusted workspace. Authentication is a Bearer credential; never print the key. The listener runs only while RAMCA is open.
 
-## What You Are Connected To
+## Operating loop
 
-`LocalIdeBridge` exposes 71 software-engineering tools confined to a user-trusted workspace folder on a Windows PC.
+1. **Orient once.** Use `project_context` for workspace, Git status, project manifests, and the shallow tree. Use `workspace_status` alone for a quick branch check. Stay on `main` unless the owner authorizes otherwise.
+2. **Read efficiently.** Use `text_search` with `queries` (up to 16 literals in one scan), focused `symbol_search` for C# declarations, and `read_context` for related source files/ranges. For one small range use `read_range` with `format: "formatted"`; its default legacy representation includes both formats. Do not repeatedly read unchanged files.
+3. **Implement and verify.** Use `apply_patch` or version-guarded edits. Run only verification relevant to the risk and scope of the change; do not mechanically run full suites on every commit. Use `workflow_run` for known independent reads and dependent operations, not for steps that require new model reasoning.
+4. **Wait efficiently.** Use a synchronous call for fast work. For long builds/tests, `job_start`, then `job_events` with `afterEventId`, `waitMs:25000`, `waitForTerminal:true`, `includeResult:true`. Use `job_status` with `includeResult:false` if only status is needed. Use `read_log` for relevant excerpts, not entire logs.
+5. **Review and commit.** Use `git_status` with `recentCommits:0` for frequent checks, and focused `git_diff` before coherent commits. Never create extra branches/worktrees or push externally unless authorized.
 
-- **MCP Streamable HTTP:** `<BASE_URL>/mcp` (`POST` JSON-RPC 2.0, `GET` SSE, `DELETE` session)
-- **HTTP/HTTPS JSON API:** `<BASE_URL>/api/v1` (OpenAPI 3.1 schema at `<BASE_URL>/openapi.json`)
-- **CLI Client:** `LocalIdeBridge cli --endpoint <BASE_URL> <command> --json`
-- **Authentication:** `Authorization: Bearer <LOCALIDEBRIDGE_KEY>` (or `X-LocalIdeBridge-Key: <LOCALIDEBRIDGE_KEY>`)
+## Compact reads and workflows
 
-## Recommended Operating Flow
+- `read_context`: up to 32 files / 64 ranges, with a 24,000-byte default data budget. Each item takes `path`, optional `ranges:[[startLine,endLine,startColumn?],...]`, `ifSha256` (only if the requested source is already known), and `expectedSha256` (required version for safe continuation). Omitted ranges cover the whole file within budget. Follow `nextRange` on truncation, and stop/re-read if the version changes. Overlapping ranges are combined.
+- `read_range`: a bounded legacy line read (32,000 source characters by default); narrow the range or use `read_context` when the requested lines exceed the limit.
+- `workflow_run`: use `dependsOn` and result bindings (`$from` with a dependency step and JSON pointer) for known dependencies. Each step may also specify up to eight `returnPointers` into the result (e.g. `/data/content`), plus `returnMaxBytes` (512–16384, default 8192; 64 KiB aggregate). Final response returns selected `outputs`, not every intermediate result. Projection errors do not replay a completed mutation; durable checkpoints contain summaries only.
+- `git_status`: `maxFiles`, `offset`, and `ifVersion` bound repeated status reads. The status version is not a content or commit version. `git_diff` returns a default 16,000-character page; continue with `nextOffset` and `expectedVersion` or scope to a file.
+- `symbol_search` can filter by file pattern and declaration kind; source spans are syntax-level, not full project-aware semantic analysis.
 
-1. **Discover & orient:**
-   - Call `workspace_status` (check active workspace, Git branch, dirty count, and `supervisorSteeringNote`).
-   - Prefer `project_context` for one-call orientation. Use `dependency_inspect` only when dependencies matter.
-2. **Navigate code accurately:**
-   - For C#, prefer semantic Roslyn tools: `symbol_search`, `go_to_definition`, `find_references`, `find_implementations`, `inspect_type`, `compiler_diagnostics`.
-   - For literal/pattern lookups or other languages: `filename_search`, `text_search`, `regex_search`. Prefer `read_context` for related files/ranges; for a single range use `read_range` with `format: "formatted"` to avoid duplicate source.
-3. **Edit safely:**
-   - Read target files first and pass `expectedSha256` into `apply_patch`, `replace_range`, or `create_file` (`overwrite: true`) to prevent clobbering concurrent changes.
-   - Use `preview_edit` for dry-runs and `revert_edit` (with returned `editId`) if a change must be rolled back.
-4. **Build, test, and inspect logs:**
-   - Run only relevant verification for the change: `dotnet_build`, `msbuild_run`, `dotnet_test` (returns exact `total`, `passed`, `failed`, `skipped`, and `failures`), or `run_command`.
-   - Command responses include concise excerpts and `executionId`; paginate full output with `read_log` (`execId`, `startLine`, `maxLines`, `contains`).
-5. **Use async jobs and DAG workflows for long operations:**
-   - Call `job_start` (`{ "tool": "dotnet_test", "arguments": {} }`), poll `job_status` / `job_events` (`afterEventId`), cancel via `job_cancel`.
-   - Chain multi-step tasks with `workflow_run` (supports `dependsOn`, `runIf`, `retries`, `timeoutSeconds`, and `checkpointAfter`).
-6. **Commit locally:**
-   - Review `git_diff` and `git_status`, stay on `main`, and commit with `git_commit`. Do not create branches, worktrees, or pull requests unless the owner explicitly authorizes an exception and changes the local policy.
+## Connection and compatibility
 
-## Boundaries & Limitations
+- MCP: `<BASE_URL>/mcp`; HTTP: `<BASE_URL>/api/v1`; CLI: `LocalIdeBridge cli --endpoint <BASE_URL> <command> --json`. Send `Authorization: Bearer <KEY>` or `X-LocalIdeBridge-Key: <KEY>`.
+- Keep `integrations.mcpToolProfile: "standard"` for direct access to routine tools. The optional `compact` profile advertises 18 tools and uses `tool_discover` / `tool_read` / `execute_once` for specialists. A smaller catalog can cost extra discovery calls; choose based on measured client behavior.
+- `integrations.advertiseAgentBoardTools: false` (default) hides board schemas; functionality remains registered. Restart and refresh the client's tool catalog after profile changes.
+- `integrations.mcpResultMode: "auto"` preserves existing clients. Try `text` only with a client verified to consume the complete text result; use `structured` only with a verified structured-content client. Confirm a small read works before trusting a single-copy mode.
+- Legacy MCP sessions and stdio pin their selected workspace. Stateless callers can pass `ramca/workspace` and `ramca/operationId` in MCP `params._meta`, or HTTP headers `X-RAMCA-Workspace` and `X-RAMCA-Operation-Id`. Local durable session-history selection remains shared.
 
-- Only clients supporting MCP, authenticated HTTP, or shell execution with network reachability can invoke tools.
-- Paths escaping the trusted workspace (including junctions/symlinks) and edits to `.git/hooks` or `.localidebridge.json` are rejected.
-- `git_push` is blocked by default unless explicitly authorized by the local user.
-- The server stays online only while `LocalIdeBridge` is open; local async jobs pause/stop if the user exits the application, and crashed non-idempotent jobs are marked `interrupted_restart` rather than replayed blindly.
+## Recovery and boundaries
 
+For disconnect-safe side effects use `execute_once` with a stable operation ID. After uncertainty, query `operation_status` or retry with the SAME ID and arguments. An unknown outcome requires reconciliation, not blind replay. Never use a recycled JSON-RPC ID as a logical operation ID. See [Execution continuity](EXECUTION_CONTINUITY.md).
 
-## Reconnecting safely after an uncertain tool result
+Use `tool_performance` for per-tool handler and durable-audit latency. See [Performance](PERFORMANCE.md) for the quick equivalent-work benchmark. Network/model latency and actual token usage must be measured separately.
 
-For non-idempotent actions prefer the `execute_once` tool with a stable `operationId`.
-When connection drops, call `operation_status` or retry `execute_once` using the SAME operationId and arguments; RAMCA will not repeat a previously reserved side effect.
-If status is `interrupted_unknown`, inspect workspace and logs manually before creating a new action.
-See [Execution Continuity](EXECUTION_CONTINUITY.md).
-
-## Compact transport
-
-Set `integrations.mcpResultMode` in `config.json` to `text` for clients that consume text or `structured` for clients verified to consume structuredContent. `auto` retains existing protocol behavior. No capability is removed. Use a single result representation when supported; do not assume the model sees both wire copies.
-
-For repeated reads, supply `ifSha256` for each file only when you already have the requested content at that version. An unchanged file returns metadata without source. Duplicate paths and overlapping ranges are combined. Use the returned version to guard edits.
-
-Single-agent MCP discovery is the default: the ten `board_*` schemas are omitted without removing their registry implementations. To use the multi-chat board, set `integrations.advertiseAgentBoardTools` to `true`, restart RAMCA, and refresh the client's tools. HTTP/CLI discovery remains complete. This is a context optimization, not a security boundary.
-
-## Compact MCP discovery
-
-Set `integrations.mcpToolProfile` to `compact` and restart RAMCA to advertise only 18 routine tools (plus the board if enabled). Use `tool_discover` with an exact name to obtain its schema; `tool_read` invokes discovered read-only operations; `execute_once` or `job_start` runs specialist mutations. No tools are removed from the registry. The existing `standard` profile preserves direct discovery and remains the default for existing configurations. Refresh the client catalog after changing profiles.
-
-For transport-level replay protection, MCP callers can put `ramca/workspace` (trusted alias or absolute path) and `ramca/operationId` (stable ID for the logical action) into `params._meta` of `tools/call`. HTTP generic invocation accepts `X-RAMCA-Workspace` and `X-RAMCA-Operation-Id` headers. The workspace is pinned without changing the supervisor selection; operation IDs route through the durable ledger. Never derive the operation ID from a reusable JSON-RPC request ID. Clients unable to send metadata should use `execute_once` directly. This does not yet isolate implicit workspace selection between all clients.
-
-For truncated `read_context` ranges, pass the returned `nextRange` as the next range and `expectedSha256` as the original version. This resumes at an exact 1-based line and UTF-16 column, even in a long minified line, and refuses to splice content from a changed file. Omitted ranges now cover the whole file under the byte budget, rather than silently stopping at line 2000.
-
-Use `text_search` with `queries: ["first", "second", ...]` to search several literal needles in one pass (up to 16). Match snippets are centered on the hit, including long JavaScript lines; regex search stops on its first timeout and marks the result partial.
-
-For frequent `git_status`, pass `recentCommits:0`; use `maxFiles` and `offset` for changed-file pages, and `ifVersion` to suppress unchanged status entries. The status version describes Git's status output, not file contents or the current commit SHA. `git_diff` defaults to a 16,000-character page; use `nextOffset` and `expectedVersion` to continue safely, or scope to a file. Do not treat a truncated diff as complete.
-
-Use `tool_performance` (via `tool_read` in compact mode) to inspect real per-tool handler and SQLite audit costs. The host keeps only fixed-size counters and latency buckets, not a growing timing history. Audit insertion and session counters commit together in one durable transaction; synchronous durability remains FULL.
-
-To avoid model polling, use `job_events` with `afterEventId`, `waitMs:25000`, `waitForTerminal:true`, and `includeResult:true` when waiting for completion. For status-only checks use `job_status` with `includeResult:false`. Event waits are bounded and release completed-job signals.
-
-For C# declarations use `symbol_search` with `filePattern` and `kind`; it returns precise source spans and includes constructors and fields. Declaration search streams matching files instead of first assembling the bounded workspace compilation. Syntax cache entries are verified against source hashes, including external same-size edits. These results are syntax-level, not proof of project-aware semantic resolution.
-
-### Get selected results from an existing workflow
-
-Each step may specify `returnPointers` (up to eight JSON pointers into its tool result, such as `/data/content` or `/data/sha256`) and `returnMaxBytes` (512–16384, default 8192). The final synchronous workflow response includes `outputs` keyed by step ID; asynchronous workflows expose the same final result through job retrieval. Total requested projection budget is limited to 64 KiB. Projection errors are explicit and never replay completed mutations. Intermediate workflow checkpoints remain summary-only. Use projections for small independent reads and targeted verification, rather than repeating each tool call after workflow completion.
+Workspace-confined file operations do not constitute an OS sandbox for arbitrary approved executables. The local owner controls trust and external Git push. Jobs cannot survive host shutdown; interrupted mutations must be reconciled.

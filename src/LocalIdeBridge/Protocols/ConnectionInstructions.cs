@@ -43,10 +43,7 @@ public sealed class ConnectionInstructions
         var baseUrl = GetEffectiveBaseUrl();
         var mcpUrl = $"{baseUrl}/mcp";
         var ws = _guard.ActiveWorkspace ?? "(select via workspace_select)";
-        var categories = _registry.All
-            .GroupBy(t => t.Category)
-            .Select(g => $"- **{g.Key}** ({g.Count()}): {string.Join(", ", g.Select(t => $"`{t.Name}`"))}");
-
+ 
         var sb = new StringBuilder();
         sb.AppendLine("# LocalIdeBridge — AI Agent Connection Instructions");
         sb.AppendLine();
@@ -74,9 +71,8 @@ public sealed class ConnectionInstructions
         sb.AppendLine("- Wait with `job_events` (`afterEventId`, `waitMs:25000`, `waitForTerminal:true`, `includeResult:true`); avoid repeated status polls. Cancel with `job_cancel`.");
         sb.AppendLine("- Command outputs return concise excerpts plus `executionId`; call `read_log` with `{ \"execId\": \"...\", \"startLine\": 1, \"maxLines\": 150 }` for full paginated output.");
         sb.AppendLine();
-        sb.AppendLine($"## Available Tools ({_registry.All.Count})");
-        foreach (var line in categories)
-            sb.AppendLine(line);
+        sb.AppendLine($"## Catalog ({_registry.All.Count} registered tools)");
+        sb.AppendLine("Use the live catalog; do not paste schemas or repeat discovery unnecessarily.");
         sb.AppendLine();
         sb.AppendLine("## Important Limitations");
         sb.AppendLine("- Pasting these instructions alone does **not** grant tool access to a chat website; your AI client must natively support custom MCP servers, authenticated HTTP calls, or shell access with a network route to the endpoint.");
