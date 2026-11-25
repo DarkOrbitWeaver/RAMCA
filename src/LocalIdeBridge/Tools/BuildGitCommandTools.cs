@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 using LocalIdeBridge.Core;
 using LocalIdeBridge.Execution;
@@ -310,12 +312,15 @@ public static class BuildGitCommandTools
             SideEffects: "None.",
             Parameters:
             [
-                new("recentCommits", "integer", "Number of recent commits to include (0-25).", Default: 5)
+                new("recentCommits", "integer", "Recent commits (0-25); use 0 for status only.", Default: 5),
+                new("offset", "integer", "Changed-file page offset.", Default: 0),
+                new("maxFiles", "integer", "Changed files per page (1-500).", Default: 100),
+                new("ifVersion", "string", "Known statusVersion; omit unchanged file entries.")
             ],
             Handler: async (args, _, ct) =>
             {
                 var ws = guard.RequireActiveWorkspace();
-                var statusRes = await runner.RunAsync("git", "git", ["status", "--porcelain=v1", "-b", "-z"], ws, timeoutSeconds: 20, ct: ct, stdoutCaptureLimit: 2_000_000);
+                var statusRes = await runner.RunAsync("git", "git", ["--no-optional-locks", "status", "--porcelain=v1", "-b", "-z"], ws, timeoutSeconds: 20, ct: ct, stdoutCaptureLimit: 2_000_000);
                 if (statusRes.ExitCode != 0)
                     return FormatCommandResult(statusRes);
 
@@ -324,9 +329,14 @@ public static class BuildGitCommandTools
                 var fields = statusRes.StdoutCapture.Split('\0', StringSplitOptions.RemoveEmptyEntries);
                 var branchLine = "unknown";
                 var files = new List<object>();
+                var offset = Math.Max(0, args.OptionalInt("offset", 0));
+                var maxFiles = Math.Clamp(args.OptionalInt("maxFiles", 100), 1, 500);
+                var version = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(statusRes.StdoutCapture)));
+                var unchanged = string.Equals(version, args.OptionalString("ifVersion"), StringComparison.OrdinalIgnoreCase);
+                var changedCount = 0;
                 for (var i = 0; i < fields.Length; i++)
                 {
-                    var entry = fields[i].TrimEnd('\r', '\n');
+                    var entry = fields[i];
                     if (entry.StartsWith("## ", StringComparison.Ordinal))
                     {
                         branchLine = entry[3..];
@@ -338,6 +348,8 @@ public static class BuildGitCommandTools
                     string? originalPath = null;
                     if ((xy[0] is 'R' or 'C' || xy[1] is 'R' or 'C') && i + 1 < fields.Length)
                         originalPath = fields[++i]; // -z rename outputs new path, then old.
+                    var index = changedCount++;
+                    if (unchanged || index < offset || files.Count >= maxFiles) continue;
                     files.Add(new
                     {
                         status = xy.Trim(),
@@ -367,8 +379,11 @@ public static class BuildGitCommandTools
                 }
 
                 return ToolResult.Ok(
-                    $"Git branch '{branchLine}', {files.Count} changed/untracked file(s).",
-                    new { branch = branchLine, changedCount = files.Count, files, recentCommits = commits },
+                    $"Git branch '{branchLine}', {changedCount} changed/untracked file(s)" +
+                    (unchanged ? " (status unchanged)." : "."),
+                    new { branch = branchLine, changedCount, statusVersion = version, unchanged, offset,
+                        nextOffset = !unchanged && (long)offset + files.Count < changedCount ? (int?)(offset + files.Count) : null,
+                        files, recentCommits = commits },
                     statusRes.ExecutionId);
             });
 
@@ -383,12 +398,15 @@ public static class BuildGitCommandTools
             [
                 new("staged", "boolean", "Inspect staged (--cached) diff instead of unstaged changes.", Default: false),
                 new("revision", "string", "Optional commit/branch ref to compare against (e.g. 'HEAD~1')."),
-                new("path", "string", "Optional relative file path inside workspace.")
+                new("path", "string", "Optional relative file path inside workspace."),
+                new("maxChars", "integer", "Diff characters per page (1024..65536).", Default: 16000),
+                new("offset", "integer", "Zero-based character offset.", Default: 0),
+                new("expectedVersion", "string", "Original diffVersion when requesting a continuation.")
             ],
             Handler: async (args, _, ct) =>
             {
                 var ws = guard.RequireActiveWorkspace();
-                var gitArgs = new List<string> { "diff", "--no-color" };
+                var gitArgs = new List<string> { "diff", "--no-color", "--no-ext-diff", "--no-textconv" };
                 if (args.OptionalBool("staged", false)) gitArgs.Add("--cached");
                 var rev = args.OptionalString("revision");
                 if (!string.IsNullOrWhiteSpace(rev) && !rev.StartsWith('-')) gitArgs.Add(rev);
@@ -405,12 +423,29 @@ public static class BuildGitCommandTools
 
                 if (res.StdoutCaptureTruncated || res.StdoutCapture is null)
                     return ToolResult.Fail("diff_incomplete",
-                        "Git diff exceeded the bounded capture or was interrupted. Read the complete paginated execution log rather than trusting a truncated diff.",
-                        new { partialDiff = res.StdoutCapture, truncated = true, executionId = res.ExecutionId, totalLogLines = res.TotalLogLines }, res.ExecutionId);
+                        "Git diff exceeded the bounded capture or was interrupted. Narrow the diff to a path or inspect its paginated execution log.",
+                        new { truncated = true, executionId = res.ExecutionId, totalLogLines = res.TotalLogLines }, res.ExecutionId);
 
+                var diff = res.StdoutCapture;
+                var version = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(diff)));
+                var expected = args.OptionalString("expectedVersion");
+                var offset = Math.Clamp(args.OptionalInt("offset", 0), 0, diff.Length);
+                if (offset > 0 && expected is null)
+                    return ToolResult.Fail("version_required", "Pass expectedVersion from the first diff page when continuing.");
+                if (expected is not null && !string.Equals(expected, version, StringComparison.OrdinalIgnoreCase))
+                    return ToolResult.Fail("stale_diff", "Git diff changed since the previous page. Restart at offset 0.", new { diffVersion = version });
+                if (offset > 0 && offset < diff.Length && char.IsLowSurrogate(diff[offset]) &&
+                    char.IsHighSurrogate(diff[offset - 1]))
+                    return ToolResult.Fail("invalid_arguments", "Diff offset splits a Unicode character.");
+                var maxChars = Math.Clamp(args.OptionalInt("maxChars", 16_000), 1024, 65_536);
+                var end = Math.Min(diff.Length, offset + maxChars);
+                if (end < diff.Length && char.IsHighSurrogate(diff[end - 1])) end--;
+                var hasMore = end < diff.Length;
                 return ToolResult.Ok(
-                    $"Retrieved complete Git diff ({res.TotalLogLines} log line(s)).",
-                    new { diff = res.StdoutCapture, truncated = false, executionId = res.ExecutionId, totalLogLines = res.TotalLogLines },
+                    $"Retrieved Git diff characters {offset}..{end} of {diff.Length}" + (hasMore ? " (partial)." : "."),
+                    new { diff = diff[offset..end], diffVersion = version, offset, totalChars = diff.Length,
+                        nextOffset = hasMore ? (int?)end : null, truncated = hasMore,
+                        executionId = res.ExecutionId, totalLogLines = res.TotalLogLines },
                     res.ExecutionId);
             });
 

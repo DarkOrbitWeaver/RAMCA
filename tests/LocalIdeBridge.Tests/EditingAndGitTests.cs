@@ -8,6 +8,31 @@ namespace LocalIdeBridge.Tests;
 public sealed class EditingAndGitTests
 {
     [Fact]
+    public async Task GitStatusPagesChangesAndSkipsKnownStatus()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        Assert.True((await sb.Host.Registry.InvokeAsync("git_branch", new JsonObject
+        { ["action"] = "init", ["name"] = "main" })).Success);
+        for (var i = 0; i < 5; i++)
+            await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, $"file{i}.txt"), "new");
+        var first = await sb.Host.Registry.InvokeAsync("git_status", new JsonObject
+        { ["recentCommits"] = 0, ["maxFiles"] = 2 });
+        Assert.True(first.Success, first.ErrorMessage);
+        var data = System.Text.Json.JsonSerializer.SerializeToElement(first.Data);
+        Assert.Equal(5, data.GetProperty("changedCount").GetInt32());
+        Assert.Equal(2, data.GetProperty("files").GetArrayLength());
+        var next = await sb.Host.Registry.InvokeAsync("git_status", new JsonObject
+        { ["recentCommits"] = 0, ["offset"] = 2, ["maxFiles"] = 2 });
+        Assert.True(next.Success, next.ErrorMessage);
+        Assert.Equal(2, System.Text.Json.JsonSerializer.SerializeToElement(next.Data).GetProperty("files").GetArrayLength());
+        var unchanged = await sb.Host.Registry.InvokeAsync("git_status", new JsonObject
+        { ["recentCommits"] = 0, ["ifVersion"] = data.GetProperty("statusVersion").GetString() });
+        var same = System.Text.Json.JsonSerializer.SerializeToElement(unchanged.Data);
+        Assert.True(same.GetProperty("unchanged").GetBoolean());
+        Assert.Equal(0, same.GetProperty("files").GetArrayLength());
+    }
+
+    [Fact]
     public async Task Editing_PreservesCrlfAndUtf8Bom_DetectsConcurrentEdits_AndSafelyReverts()
     {
         await using var sb = await TestSandbox.CreateAsync();

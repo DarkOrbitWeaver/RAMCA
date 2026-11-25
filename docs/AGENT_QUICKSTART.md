@@ -63,3 +63,5 @@ For transport-level replay protection, MCP callers can put `ramca/workspace` (tr
 For truncated `read_context` ranges, pass the returned `nextRange` as the next range and `expectedSha256` as the original version. This resumes at an exact 1-based line and UTF-16 column, even in a long minified line, and refuses to splice content from a changed file. Omitted ranges now cover the whole file under the byte budget, rather than silently stopping at line 2000.
 
 Use `text_search` with `queries: ["first", "second", ...]` to search several literal needles in one pass (up to 16). Match snippets are centered on the hit, including long JavaScript lines; regex search stops on its first timeout and marks the result partial.
+
+For frequent `git_status`, pass `recentCommits:0`; use `maxFiles` and `offset` for changed-file pages, and `ifVersion` to suppress unchanged status entries. The status version describes Git's status output, not file contents or the current commit SHA. `git_diff` defaults to a 16,000-character page; use `nextOffset` and `expectedVersion` to continue safely, or scope to a file. Do not treat a truncated diff as complete.
