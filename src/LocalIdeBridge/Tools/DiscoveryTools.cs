@@ -34,7 +34,7 @@ public static class DiscoveryTools
                 var offset = Math.Clamp(args.OptionalInt("offset", 0), 0, registry.All.Count);
                 var limit = Math.Clamp(args.OptionalInt("limit", 8), 1, 20);
                 var exact = query.Length == 0 ? null : registry.Find(query);
-                var matches = exact is not null ? new[] { exact } : registry.All.Where(t =>
+                var matches = exact is not null ? new ToolDefinition[] { exact } : registry.All.Where(t =>
                     query.Length == 0 || t.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
                     t.Category.Contains(query, StringComparison.OrdinalIgnoreCase) ||
                     t.Description.Contains(query, StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -65,6 +65,20 @@ public static class DiscoveryTools
                     items.RemoveAt(items.Count - 1);
                 }
                 return Task.FromResult(ToolResult.Ok($"Found {matches.Length} tool(s).", data));
+            });
+
+        yield return new ToolDefinition(
+            Name: "tool_performance", Category: "discovery",
+            Description: "Bounded current-host tool timing metrics: handler and durable audit latency, counts and approximate p95 buckets.",
+            IsReadOnly: true, IsIdempotent: true, SideEffects: "None.",
+            Parameters: [new("tool", "string", "Optional exact tool name; omit for all registered tools.")],
+            Handler: (args, _, _) =>
+            {
+                var name = args.OptionalString("tool");
+                if (name is not null && registry.Find(name) is null)
+                    return Task.FromResult(ToolResult.Fail("unknown_tool", $"Unknown tool '{name}'."));
+                return Task.FromResult(ToolResult.Ok("Current-host tool timings (excludes network and model latency).",
+                    new { timings = registry.GetTimings(name), totalInvocations = registry.TotalInvocations }));
             });
 
         yield return new ToolDefinition(

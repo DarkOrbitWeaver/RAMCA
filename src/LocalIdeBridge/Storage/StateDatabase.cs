@@ -519,7 +519,9 @@ public sealed class StateDatabase : IDisposable
         {
             var sid = sessionId ?? _activeSessionId;
             using var conn = OpenConnection();
+            using var transaction = conn.BeginTransaction();
             using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
             cmd.CommandText = """
                 INSERT INTO tool_calls(session_id, tool_name, category, workspace, success, duration_ms, summary, error_code, created_at)
                 VALUES ($sid, $tool, $cat, $ws, $ok, $dur, $sum, $err, $now);
@@ -542,8 +544,11 @@ public sealed class StateDatabase : IDisposable
             cmd.Parameters.AddWithValue("$now", now);
             cmd.ExecuteNonQuery();
             using var identity = conn.CreateCommand();
+            identity.Transaction = transaction;
             identity.CommandText = "SELECT last_insert_rowid();";
-            return Convert.ToInt64(identity.ExecuteScalar());
+            var callId = Convert.ToInt64(identity.ExecuteScalar());
+            transaction.Commit();
+            return callId;
         }
     }
 

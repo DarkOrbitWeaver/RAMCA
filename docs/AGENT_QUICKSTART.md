@@ -4,7 +4,7 @@ Copy this document (or press **`I`** in LocalIdeBridge / run `LocalIdeBridge.exe
 
 ## What You Are Connected To
 
-`LocalIdeBridge` exposes 70 software-engineering tools confined to a user-trusted workspace folder on a Windows PC.
+`LocalIdeBridge` exposes 71 software-engineering tools confined to a user-trusted workspace folder on a Windows PC.
 
 - **MCP Streamable HTTP:** `<BASE_URL>/mcp` (`POST` JSON-RPC 2.0, `GET` SSE, `DELETE` session)
 - **HTTP/HTTPS JSON API:** `<BASE_URL>/api/v1` (OpenAPI 3.1 schema at `<BASE_URL>/openapi.json`)
@@ -65,3 +65,5 @@ For truncated `read_context` ranges, pass the returned `nextRange` as the next r
 Use `text_search` with `queries: ["first", "second", ...]` to search several literal needles in one pass (up to 16). Match snippets are centered on the hit, including long JavaScript lines; regex search stops on its first timeout and marks the result partial.
 
 For frequent `git_status`, pass `recentCommits:0`; use `maxFiles` and `offset` for changed-file pages, and `ifVersion` to suppress unchanged status entries. The status version describes Git's status output, not file contents or the current commit SHA. `git_diff` defaults to a 16,000-character page; use `nextOffset` and `expectedVersion` to continue safely, or scope to a file. Do not treat a truncated diff as complete.
+
+Use `tool_performance` (via `tool_read` in compact mode) to inspect real per-tool handler and SQLite audit costs. The host keeps only fixed-size counters and latency buckets, not a growing timing history. Audit insertion and session counters commit together in one durable transaction; synchronous durability remains FULL.

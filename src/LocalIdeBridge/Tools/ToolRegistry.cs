@@ -25,6 +25,61 @@ public sealed class ToolRegistry
     private volatile bool _isPaused;
     private long _totalInvocations;
     private long _totalErrors;
+    // One fixed-size counter per registered tool. No history or raw arguments
+    // retained in memory; metrics survive only for the current host lifetime.
+    private readonly Dictionary<string, ToolTiming> _timings = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class ToolTiming
+    {
+        private readonly object _sync = new();
+        private long _count, _errors;
+        private double _handlerMs, _auditMs, _maxHandlerMs, _maxAuditMs;
+        private readonly long[] _totalBuckets = new long[12];
+        private static readonly double[] Bounds = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
+
+        public void Add(double handler, double audit, bool success)
+        {
+            lock (_sync)
+            {
+                _count++;
+                if (!success) _errors++;
+                _handlerMs += handler;
+                _auditMs += audit;
+                _maxHandlerMs = Math.Max(_maxHandlerMs, handler);
+                _maxAuditMs = Math.Max(_maxAuditMs, audit);
+                var index = 0;
+                while (index < Bounds.Length && handler + audit > Bounds[index]) index++;
+                _totalBuckets[index]++;
+            }
+        }
+
+        public object Snapshot(string name)
+        {
+            lock (_sync)
+            {
+                var threshold = (long)Math.Ceiling(_count * 0.95);
+                long seen = 0;
+                double? p95UpperMs = null;
+                if (_count > 0)
+                    for (var i = 0; i < _totalBuckets.Length; i++)
+                    {
+                        seen += _totalBuckets[i];
+                        if (seen < threshold) continue;
+                        p95UpperMs = i < Bounds.Length ? Bounds[i] : null;
+                        break;
+                    }
+                return new { tool = name, calls = _count, errors = _errors,
+                    meanHandlerMs = _count == 0 ? 0 : Math.Round(_handlerMs / _count, 3),
+                    meanAuditMs = _count == 0 ? 0 : Math.Round(_auditMs / _count, 3),
+                    maxHandlerMs = Math.Round(_maxHandlerMs, 3), maxAuditMs = Math.Round(_maxAuditMs, 3),
+                    p95HandlerAndAuditUpperMs = p95UpperMs };
+            }
+        }
+    }
+
+    public IReadOnlyList<object> GetTimings(string? toolName = null) =>
+        _timings.Where(kv => toolName is null || kv.Key.Equals(toolName, StringComparison.OrdinalIgnoreCase))
+            .Select(kv => kv.Value.Snapshot(kv.Key)).ToArray();
 
     public bool IsPaused
     {
@@ -57,6 +112,7 @@ public sealed class ToolRegistry
             throw new InvalidOperationException($"Duplicate tool registration: {tool.Name}");
         _tools[tool.Name] = tool;
         _ordered.Add(tool);
+        _timings.Add(tool.Name, new ToolTiming());
     }
 
     public void RegisterRange(IEnumerable<ToolDefinition> tools)
@@ -198,12 +254,14 @@ public sealed class ToolRegistry
 
         var ws = workspace ?? "";
         long recordedCallId;
+        var auditStart = Stopwatch.GetTimestamp();
         try
         {
             recordedCallId = _db.RecordToolCall(tool.Name, tool.Category, ws, result.Success, sw.ElapsedMilliseconds, result.Summary, result.ErrorCode, ctx.SessionId);
         }
         catch (Exception ex)
         {
+            _timings[tool.Name].Add(sw.Elapsed.TotalMilliseconds, Stopwatch.GetElapsedTime(auditStart).TotalMilliseconds, false);
             // The handler has already run. Do not hide that result behind an
             // exception and invite blind replay of a potentially committed edit.
             var message = _credentials.Redact(ex.Message);
@@ -213,6 +271,7 @@ public sealed class ToolRegistry
                 new { executedResult = result }, result.ExecutionId);
         }
 
+        _timings[tool.Name].Add(sw.Elapsed.TotalMilliseconds, Stopwatch.GetElapsedTime(auditStart).TotalMilliseconds, result.Success);
         if (result.Success)
             _logger.Info(tool.Category, $"{tool.Name}: {result.Summary}", null, sw.ElapsedMilliseconds);
         else
