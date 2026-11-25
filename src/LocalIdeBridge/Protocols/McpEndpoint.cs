@@ -676,6 +676,13 @@ public sealed class McpServer
                 if (_registry.Find(toolName) is null)
                     return (MakeError(idNode, -32602, $"Unknown tool '{toolName}'."), null, DefaultProtocolVersion);
 
+                var meta = paramsObj["_meta"] as JsonObject;
+                var workspaceNode = meta?["ramca/workspace"];
+                var operationNode = meta?["ramca/operationId"];
+                if ((workspaceNode is not null && workspaceNode.GetValueKind() != JsonValueKind.String) ||
+                    (operationNode is not null && operationNode.GetValueKind() != JsonValueKind.String))
+                    return (MakeError(idNode, -32602, "RAMCA workspace and operationId metadata must be strings."), null, DefaultProtocolVersion);
+
                 var requestKey = RequestKey(transportSession, idNode!);
                 using var invocationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 if (!_pendingToolCalls.TryAdd(requestKey, invocationCts))
@@ -683,7 +690,9 @@ public sealed class McpServer
                 ToolResult res;
                 try
                 {
-                    res = await _registry.InvokeAsync(toolName, toolArgs, null, invocationCts.Token).ConfigureAwait(false);
+                    res = await _registry.InvokeClientAsync(toolName, toolArgs,
+                        workspaceNode?.GetValue<string>(), operationNode?.GetValue<string>(),
+                        invocationCts.Token).ConfigureAwait(false);
                 }
                 finally
                 {

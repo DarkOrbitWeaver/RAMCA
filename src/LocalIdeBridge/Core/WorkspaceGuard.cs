@@ -81,6 +81,14 @@ public sealed class WorkspaceGuard : IDisposable
 
     public string SelectWorkspace(string workspacePathOrName)
     {
+        var full = ResolveTrustedWorkspace(workspacePathOrName);
+        lock (_activeLock) _activeWorkspace = full;
+        return full;
+    }
+
+    // Resolve a connection's workspace without changing the supervisor's selection.
+    public string ResolveTrustedWorkspace(string workspacePathOrName)
+    {
         if (string.IsNullOrWhiteSpace(workspacePathOrName))
             throw new WorkspaceViolationException("Workspace path or name is required.");
 
@@ -96,10 +104,6 @@ public sealed class WorkspaceGuard : IDisposable
         if (!Directory.Exists(full))
             throw new WorkspaceViolationException($"Trusted workspace directory not found on disk: {full}");
 
-        lock (_activeLock)
-        {
-            _activeWorkspace = full;
-        }
         return full;
     }
 

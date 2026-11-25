@@ -67,6 +67,40 @@ public sealed class ToolRegistry
     public ToolDefinition? Find(string name)
         => _tools.TryGetValue(name, out var def) ? def : null;
 
+    // Shared remote-call entry point. An operation ID belongs to the logical
+    // action, not the JSON-RPC request ID (which clients may reuse).
+    public Task<ToolResult> InvokeClientAsync(
+        string toolName, JsonObject? arguments, string? workspace, string? operationId,
+        CancellationToken ct = default)
+    {
+        string? root;
+        try
+        {
+            root = workspace is null ? _guard.ActiveWorkspace : _guard.ResolveTrustedWorkspace(workspace);
+        }
+        catch (WorkspaceViolationException ex)
+        {
+            return Task.FromResult(ToolResult.Fail("workspace_violation", _credentials.Redact(ex.Message)));
+        }
+        var context = new ToolExecutionContext(_db.ActiveSessionId, WorkspaceRoot: root);
+        var definition = Find(toolName);
+        if (definition is null)
+            return Task.FromResult(ToolResult.Fail("unknown_tool", $"Unknown tool '{toolName}'."));
+        if (operationId is null)
+            return InvokeAsync(definition.Name, arguments, context, ct);
+        if (root is null)
+            return Task.FromResult(ToolResult.Fail("workspace_violation", "Select a trusted workspace before using an operation ID."));
+        if (definition.Name is "execute_once" or "workspace_select" or "session_switch")
+            return Task.FromResult(ToolResult.Fail("invalid_arguments", "Operation IDs cannot wrap workspace/session selection or execute_once."));
+        var envelope = new JsonObject
+        {
+            ["operationId"] = operationId,
+            ["tool"] = definition.Name,
+            ["arguments"] = arguments?.DeepClone() ?? new JsonObject()
+        };
+        return InvokeAsync("execute_once", envelope, context, ct);
+    }
+
     public async Task<ToolResult> InvokeAsync(
         string toolName,
         JsonObject? arguments,

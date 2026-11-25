@@ -55,6 +55,8 @@ public static class OperationLedgerTools
                 var definition = registry.Find(name);
                 if (definition is null)
                     return ToolResult.Fail("unknown_tool", $"Unknown tool '{name}'.");
+                // Registry names are case-insensitive; store the canonical spelling
+                // for newly reserved operations.
                 var inner = args["arguments"] as JsonObject ?? new JsonObject();
                 if (args.TryGetPropertyValue("arguments", out var supplied) && supplied is not null && supplied is not JsonObject)
                     return ToolResult.Fail("invalid_arguments", "arguments must be a JSON object.");
@@ -64,8 +66,8 @@ public static class OperationLedgerTools
                 // Existing durable reservations used insertion-order JSON hashing.
                 // Accept an EXACT legacy payload retry; do not silently reissue it.
                 var legacyHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(inner.ToJsonString())));
-                var (operation, created) = db.TryReserveOperation(opId, ctx.SessionId, workspace, name, inputHash);
-                if (!string.Equals(operation.ToolName, name, StringComparison.Ordinal) ||
+                var (operation, created) = db.TryReserveOperation(opId, ctx.SessionId, workspace, definition.Name, inputHash);
+                if (!string.Equals(operation.ToolName, name, StringComparison.OrdinalIgnoreCase) ||
                     (!string.Equals(operation.ArgumentsSha256, inputHash, StringComparison.Ordinal) &&
                      !string.Equals(operation.ArgumentsSha256, legacyHash, StringComparison.Ordinal)) ||
                     !string.Equals(operation.Workspace, workspace, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))

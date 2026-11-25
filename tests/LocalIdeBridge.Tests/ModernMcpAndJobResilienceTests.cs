@@ -169,6 +169,44 @@ public sealed class ModernMcpAndJobResilienceTests
     }
 
     [Fact]
+    public async Task RemoteOperationMetadataPinsWorkspaceAndReplaysWithoutRepeatingWrite()
+    {
+        await using var sb = await TestSandbox.CreateAsync();
+        var second = Path.Combine(sb.BaseDir, "OtherProject");
+        Directory.CreateDirectory(second);
+        sb.Config.AddTrustedWorkspace(second, "other");
+        sb.Host.Guard.SelectWorkspace("other");
+        using var client = sb.CreateClient();
+
+        async Task<JsonNode> Write(string workspace, string content)
+        {
+            var body = Request("tools/call", new JsonObject
+            {
+                ["name"] = "create_file",
+                ["arguments"] = new JsonObject { ["path"] = "one.txt", ["content"] = content }
+            });
+            var meta = body["params"]!["_meta"]!.AsObject();
+            meta["ramca/workspace"] = workspace;
+            meta["ramca/operationId"] = "remote-write-001";
+            using var req = Post(body, routeName: "create_file");
+            using var response = await client.SendAsync(req);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            return JsonNode.Parse(await response.Content.ReadAsStringAsync())!["result"]!;
+        }
+
+        var first = await Write("disposable", "original");
+        Assert.False(first["isError"]!.GetValue<bool>());
+        Assert.Equal("original", await File.ReadAllTextAsync(Path.Combine(sb.WorkspaceDir, "one.txt")));
+        Assert.False(File.Exists(Path.Combine(second, "one.txt")));
+        var replay = await Write("disposable", "original");
+        Assert.False(replay["isError"]!.GetValue<bool>());
+        var conflict = await Write("other", "original");
+        Assert.True(conflict["isError"]!.GetValue<bool>());
+        Assert.Equal("operation_id_conflict", conflict["structuredContent"]!["errorCode"]!.GetValue<string>());
+        Assert.False(File.Exists(Path.Combine(second, "one.txt")));
+    }
+
+    [Fact]
     public async Task ModernRequestRejectsMissingCapabilityMetadataWithoutExecutingTools()
     {
         await using var sb = await TestSandbox.CreateAsync();

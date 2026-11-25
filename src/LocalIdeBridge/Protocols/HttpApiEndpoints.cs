@@ -114,8 +114,21 @@ public static class HttpApiEndpoints
                 argsObj = nestedObj;
             }
 
+            var workspace = ctx.Request.Headers["X-RAMCA-Workspace"].FirstOrDefault();
+            var operationId = ctx.Request.Headers["X-RAMCA-Operation-Id"].FirstOrDefault();
             if (string.Equals(ctx.Request.Query["async"], "true", StringComparison.OrdinalIgnoreCase))
             {
+                // Use the normal job_start tool for scoped/replay-safe asynchronous
+                // operations so authorization and durable reservation stay centralized.
+                if (workspace is not null || operationId is not null)
+                {
+                    var start = await registry.InvokeClientAsync("job_start", new JsonObject
+                    {
+                        ["tool"] = toolName, ["arguments"] = argsObj.DeepClone()
+                    }, workspace, operationId, ct);
+                    return Results.Json(start, AppConfig.JsonOptions,
+                        statusCode: start.Success ? 202 : MapErrorStatusCode(start.ErrorCode));
+                }
                 var job = jobs.StartToolJob(toolName, argsObj);
                 return Results.Accepted($"/api/v1/jobs/{job.Id}", new
                 {
@@ -127,7 +140,7 @@ public static class HttpApiEndpoints
                 });
             }
 
-            var result = await registry.InvokeAsync(toolName, argsObj, null, ct);
+            var result = await registry.InvokeClientAsync(toolName, argsObj, workspace, operationId, ct);
             var status = result.Success ? StatusCodes.Status200OK : MapErrorStatusCode(result.ErrorCode);
             return Results.Json(result, AppConfig.JsonOptions, statusCode: status);
         });
