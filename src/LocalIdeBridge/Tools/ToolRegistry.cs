@@ -127,21 +127,26 @@ public sealed class ToolRegistry
     // action, not the JSON-RPC request ID (which clients may reuse).
     public Task<ToolResult> InvokeClientAsync(
         string toolName, JsonObject? arguments, string? workspace, string? operationId,
-        CancellationToken ct = default)
+        CancellationToken ct = default, Action<string>? workspaceSelection = null)
     {
         string? root;
         try
         {
-            root = workspace is null ? _guard.ActiveWorkspace : _guard.ResolveTrustedWorkspace(workspace);
+            root = workspace is null
+                ? (workspaceSelection is null ? _guard.ActiveWorkspace : null)
+                : _guard.ResolveTrustedWorkspace(workspace);
         }
         catch (WorkspaceViolationException ex)
         {
             return Task.FromResult(ToolResult.Fail("workspace_violation", _credentials.Redact(ex.Message)));
         }
-        var context = new ToolExecutionContext(_db.ActiveSessionId, WorkspaceRoot: root);
+        var context = new ToolExecutionContext(_db.ActiveSessionId, WorkspaceRoot: root, WorkspaceSelection: workspaceSelection);
         var definition = Find(toolName);
         if (definition is null)
             return Task.FromResult(ToolResult.Fail("unknown_tool", $"Unknown tool '{toolName}'."));
+        if (workspaceSelection is not null && root is null &&
+            definition.Name is not ("workspace_select" or "workspace_list" or "tool_discover" or "tool_performance" or "tool_doctor"))
+            return Task.FromResult(ToolResult.Fail("workspace_required", "This connection has no selected workspace. Call workspace_select."));
         if (operationId is null)
             return InvokeAsync(definition.Name, arguments, context, ct);
         if (root is null)
@@ -188,7 +193,8 @@ public sealed class ToolRegistry
 
         var ctx = context ?? new ToolExecutionContext(_db.ActiveSessionId);
         using var sessionScope = _db.UseInvocationSession(ctx.SessionId);
-        var workspace = ctx.WorkspaceRoot ?? _guard.ActiveWorkspace;
+        var workspace = ctx.WorkspaceRoot ?? (ctx.WorkspaceSelection is null ? _guard.ActiveWorkspace : null);
+        ctx = ctx with { WorkspaceRoot = workspace };
         ToolResult result;
 
         try

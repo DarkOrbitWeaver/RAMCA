@@ -70,7 +70,8 @@ public sealed record ToolExecutionContext(
     string? JobId = null,
     Action<string>? ReportProgress = null,
     bool SkipWriteLock = false,
-    string? WorkspaceRoot = null);
+    string? WorkspaceRoot = null,
+    Action<string>? WorkspaceSelection = null);
 
 public sealed record ToolResult(
     bool Success,

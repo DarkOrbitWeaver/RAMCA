@@ -29,9 +29,9 @@ public static class WorkspaceTools
             IsIdempotent: true,
             SideEffects: "None.",
             Parameters: [],
-            Handler: (_, _, _) =>
+            Handler: (_, ctx, _) =>
             {
-                var active = guard.ActiveWorkspace;
+                var active = ctx.WorkspaceSelection is null ? guard.ActiveWorkspace : ctx.WorkspaceRoot;
                 var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
                 var items = config.TrustedWorkspaces.Select(w =>
                 {
@@ -54,21 +54,23 @@ public static class WorkspaceTools
         yield return new ToolDefinition(
             Name: "workspace_select",
             Category: "workspace",
-            Description: "Switches the active workspace to one of the trusted workspaces configured by the local user.",
+            Description: "Selects a trusted workspace for this MCP connection, or the local default for unscoped clients.",
             IsReadOnly: false,
             IsIdempotent: true,
-            SideEffects: "Changes the active workspace for subsequent tool calls in this host.",
+            SideEffects: "Changes the selected workspace for subsequent calls in the connection (or unscoped host).",
             Parameters:
             [
                 new("workspace", "string", "Path or configured alias of a trusted workspace.", Required: true)
             ],
-            Handler: (args, _, _) =>
+            Handler: (args, ctx, _) =>
             {
                 var target = args.RequireString("workspace");
-                var selected = guard.SelectWorkspace(target);
+                var selected = ctx.WorkspaceSelection is null
+                    ? guard.SelectWorkspace(target) : guard.ResolveTrustedWorkspace(target);
+                ctx.WorkspaceSelection?.Invoke(selected);
                 return Task.FromResult(ToolResult.Ok(
                     $"Selected workspace '{selected}'.",
-                    new { activeWorkspace = selected, sessionId = db.ActiveSessionId }));
+                    new { activeWorkspace = selected, sessionId = ctx.SessionId }));
             });
 
         yield return new ToolDefinition(

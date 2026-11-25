@@ -26,7 +26,15 @@ public sealed class McpServer
         "2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"
     };
 
-    private sealed record McpSessionInfo(string Id, string ProtocolVersion, DateTimeOffset CreatedAtUtc);
+    private sealed class McpSessionInfo(string id, string protocolVersion, DateTimeOffset createdAtUtc, string? workspace)
+    {
+        public string Id { get; } = id;
+        public string ProtocolVersion { get; } = protocolVersion;
+        public DateTimeOffset CreatedAtUtc { get; } = createdAtUtc;
+        private string? _workspace = workspace;
+        public string? Workspace => Volatile.Read(ref _workspace);
+        public void SelectWorkspace(string root) => Volatile.Write(ref _workspace, root);
+    }
 
     private readonly AppConfig _config;
     private readonly WorkspaceGuard _guard;
@@ -461,6 +469,7 @@ public sealed class McpServer
 
         using var writeGate = new SemaphoreSlim(1, 1);
         var activeCalls = new List<Task>();
+        var stdioBinding = new McpSessionInfo("stdio", DefaultProtocolVersion, DateTimeOffset.UtcNow, _guard.ActiveWorkspace);
 
         async Task EmitAsync(JsonObject? response)
         {
@@ -475,7 +484,7 @@ public sealed class McpServer
             try
             {
                 var modern = IsModernStdioRequest(obj);
-                var (response, _, _) = await DispatchMessageAsync(obj, modern, ct, "stdio").ConfigureAwait(false);
+                var (response, _, _) = await DispatchMessageAsync(obj, modern, ct, "stdio", stdioBinding).ConfigureAwait(false);
                 if (modern && response is not null) AddModernResultMetadata(response);
                 await EmitAsync(response).ConfigureAwait(false);
             }
@@ -558,7 +567,8 @@ public sealed class McpServer
         JsonObject msg,
         bool isStateless2026,
         CancellationToken ct,
-        string transportSession = "stdio")
+        string transportSession = "stdio",
+        McpSessionInfo? connectionBinding = null)
     {
         var jsonrpc = msg["jsonrpc"]?.GetValueKind() == JsonValueKind.String ? msg["jsonrpc"]!.GetValue<string>() : null;
         var hasId = msg.TryGetPropertyValue("id", out var idNode);
@@ -587,6 +597,13 @@ public sealed class McpServer
                 try { running.Cancel(); } catch (ObjectDisposedException) { }
             }
             return (null, null, DefaultProtocolVersion);
+        }
+
+        if (!isStateless2026 && connectionBinding is null && transportSession.StartsWith("mcp_", StringComparison.Ordinal))
+        {
+            if (!_mcpSessions.TryGet(transportSession, out var bound))
+                return (MakeError(idNode, -32001, "MCP session expired; reconnect and select a workspace."), null, DefaultProtocolVersion);
+            connectionBinding = bound;
         }
 
         switch (method)
@@ -620,7 +637,7 @@ public sealed class McpServer
                 if (!isStateless2026 && negotiated != "2026-07-28")
                 {
                     sid = GenerateSessionId();
-                    _mcpSessions.Set(sid, new McpSessionInfo(sid, negotiated, DateTimeOffset.UtcNow), 256);
+                    _mcpSessions.Set(sid, new McpSessionInfo(sid, negotiated, DateTimeOffset.UtcNow, _guard.ActiveWorkspace), 2048);
                 }
 
                 var result = new JsonObject
@@ -691,8 +708,9 @@ public sealed class McpServer
                 try
                 {
                     res = await _registry.InvokeClientAsync(toolName, toolArgs,
-                        workspaceNode?.GetValue<string>(), operationNode?.GetValue<string>(),
-                        invocationCts.Token).ConfigureAwait(false);
+                        workspaceNode?.GetValue<string>() ?? connectionBinding?.Workspace,
+                        operationNode?.GetValue<string>(), invocationCts.Token,
+                        connectionBinding is null ? null : connectionBinding.SelectWorkspace).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -774,7 +792,8 @@ public sealed class McpServer
                 string text;
                 if (uri == "bridge://workspace/status")
                 {
-                    var st = await _registry.InvokeAsync("workspace_status", null, null, ct);
+                    var st = await _registry.InvokeClientAsync("workspace_status", null, connectionBinding?.Workspace, null, ct,
+                        connectionBinding is null ? null : connectionBinding.SelectWorkspace);
                     text = JsonSerializer.Serialize(st, AppConfig.JsonOptions);
                 }
                 else if (uri == "bridge://session/active")
