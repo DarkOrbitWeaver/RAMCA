@@ -49,13 +49,14 @@ public sealed class SearchAndIntelTools
         yield return new ToolDefinition(
             Name: "text_search",
             Category: "code_intel",
-            Description: "Performs fast, streaming literal text search across workspace files. Explicitly reports engine='text-literal'.",
+            Description: "Search one or several literal queries in a single workspace scan. Returns focused match snippets and line/column locations.",
             IsReadOnly: true,
             IsIdempotent: true,
             SideEffects: "None.",
             Parameters:
             [
-                new("query", "string", "Literal text substring to search for.", Required: true),
+                new("query", "string", "One literal substring."),
+                new("queries", "array", "Alternative: 1..16 literal substrings, searched together.", ItemsSchema: new JsonObject { ["type"] = "string" }),
                 new("filePattern", "string", "Optional wildcard filename filter such as '*.cs' or '*.json'."),
                 new("caseSensitive", "boolean", "Match case strictly.", Default: false),
                 new("maxResults", "integer", "Maximum matches returned (1-300).", Default: 100)
@@ -63,21 +64,33 @@ public sealed class SearchAndIntelTools
             Handler: (args, _, ct) =>
             {
                 var ws = _guard.RequireActiveWorkspace();
-                var query = args.RequireString("query");
                 var filePattern = args.OptionalString("filePattern");
                 var caseSensitive = args.OptionalBool("caseSensitive", false);
                 var maxResults = Math.Clamp(args.OptionalInt("maxResults", 100), 1, 300);
                 var cmp = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+                var query = args.OptionalString("query");
+                var requested = args.OptionalStringList("queries");
+                if ((query is not null && requested.Count != 0) ||
+                    (query is null && requested.Count == 0))
+                    throw new ArgumentException("Supply query or queries, not both.");
+                IReadOnlyList<string> input = query is not null ? [query] : requested;
+                if (input.Count > 16 || input.Any(q => string.IsNullOrWhiteSpace(q) || q.Length > 512))
+                    throw new ArgumentException("Supply 1..16 nonempty literal queries, each at most 512 characters.");
+                var queries = input.Distinct(caseSensitive ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase).ToArray();
+                var matchers = queries.Select(q =>
+                    (Label: queries.Length == 1 ? null : q, Match: (Func<string, int>)(line =>
+                    {
+                        var idx = line.IndexOf(q, cmp);
+                        return idx >= 0 ? idx + 1 : -1;
+                    }))).ToArray();
 
-                var (matches, filesScanned, truncated) = ScanLines(ws, filePattern, maxResults, line =>
-                {
-                    var idx = line.IndexOf(query, cmp);
-                    return idx >= 0 ? idx + 1 : -1;
-                }, ct);
+                var (matches, filesScanned, truncated) = ScanLines(ws, filePattern, maxResults, matchers,
+                    allowLongLines: true, ct);
 
                 return Task.FromResult(ToolResult.Ok(
                     $"Found {matches.Count} literal match(es) across {filesScanned} file(s){(truncated ? " (truncated)" : "")}.",
-                    new { engine = "text-literal", isSemantic = false, query, filesScanned, count = matches.Count, truncated, matches }));
+                    new { engine = "text-literal", isSemantic = false, query, queries = query is null ? queries : null,
+                        filesScanned, count = matches.Count, truncated, matches }));
             });
 
         yield return new ToolDefinition(
@@ -114,7 +127,7 @@ public sealed class SearchAndIntelTools
                 }
 
                 var regexTimedOut = false;
-                var (matches, filesScanned, truncated) = ScanLines(ws, filePattern, maxResults, line =>
+                Func<string, int> matchRegex = line =>
                 {
                     try
                     {
@@ -126,7 +139,9 @@ public sealed class SearchAndIntelTools
                         regexTimedOut = true;
                         return -1;
                     }
-                }, ct);
+                };
+                var (matches, filesScanned, truncated) = ScanLines(ws, filePattern, maxResults,
+                    [(null, matchRegex)], allowLongLines: false, ct, () => regexTimedOut);
                 truncated |= regexTimedOut;
 
                 return Task.FromResult(ToolResult.Ok(
@@ -808,8 +823,10 @@ public sealed class SearchAndIntelTools
         string workspaceRoot,
         string? filePattern,
         int maxResults,
-        Func<string, int> matcher,
-        CancellationToken ct)
+        IReadOnlyList<(string? Label, Func<string, int> Match)> matchers,
+        bool allowLongLines,
+        CancellationToken ct,
+        Func<bool>? shouldStop = null)
     {
         var glob = string.IsNullOrWhiteSpace(filePattern) ? null : WorkspaceTools.PatternToMatcher(filePattern);
         var matches = new List<object>();
@@ -840,29 +857,40 @@ public sealed class SearchAndIntelTools
             var lineNo = 0;
             try
             {
-                using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096);
+                // On Windows, prevent concurrent writers while scanning this bounded file.
+                using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 4096);
+                if (fs.Length > MaxSearchFileBytes) { truncated = true; continue; }
                 using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
                 string? line;
                 while ((line = sr.ReadLine()) is not null)
                 {
                     ct.ThrowIfCancellationRequested();
                     lineNo++;
-                    if (line.Length > 4000)
+                    if (!allowLongLines && line.Length > 4000)
                     {
-                        truncated = true; // Large single-line files were not fully searched.
+                        truncated = true; // Regex evaluation is intentionally bounded.
                         continue;
                     }
-                    var col = matcher(line);
-                    if (col < 1) continue;
-
-                    if (matches.Count >= maxResults)
+                    foreach (var matcher in matchers)
                     {
-                        truncated = true;
-                        return (matches, filesScanned, truncated);
-                    }
+                        var col = matcher.Match(line);
+                        if (shouldStop?.Invoke() == true)
+                            return (matches, filesScanned, true);
+                        if (col < 1) continue;
+                        if (matches.Count >= maxResults)
+                            return (matches, filesScanned, true);
 
-                    var snippet = line.Length > 240 ? line[..240] + "..." : line;
-                    matches.Add(new { file = rel, line = lineNo, column = col, text = snippet.TrimEnd() });
+                        const int snippetLength = 240;
+                        var start = line.Length <= snippetLength ? 0 : Math.Clamp(col - 1 - 80, 0, line.Length - snippetLength);
+                        if (start > 0 && char.IsLowSurrogate(line[start])) start--;
+                        var end = Math.Min(line.Length, start + snippetLength);
+                        if (end < line.Length && char.IsHighSurrogate(line[end - 1])) end--;
+                        var snippet = (start > 0 ? "..." : "") + line[start..end] + (end < line.Length ? "..." : "");
+                        if (matcher.Label is null)
+                            matches.Add(new { file = rel, line = lineNo, column = col, text = snippet.TrimEnd() });
+                        else
+                            matches.Add(new { file = rel, line = lineNo, column = col, query = matcher.Label, text = snippet.TrimEnd() });
+                    }
                 }
             }
             catch (OperationCanceledException) { throw; }

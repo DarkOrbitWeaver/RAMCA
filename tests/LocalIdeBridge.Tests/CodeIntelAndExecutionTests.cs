@@ -124,6 +124,25 @@ public sealed class CodeIntelAndExecutionTests
     }
 
     [Fact]
+    public async Task MultiLiteralSearchScansOnceAndCentersMatchesOnLongLines()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "extension.js"),
+            new string('x', 9000) + " firstMarker " + new string('y', 9000) + " secondMarker");
+        var result = await sb.Host.Registry.InvokeAsync("text_search", new JsonObject
+        {
+            ["queries"] = new JsonArray("firstMarker", "secondMarker"), ["filePattern"] = "*.js"
+        });
+        Assert.True(result.Success, result.ErrorMessage);
+        var data = JsonSerializer.SerializeToElement(result.Data);
+        Assert.Equal(1, data.GetProperty("filesScanned").GetInt32());
+        Assert.Equal(2, data.GetProperty("count").GetInt32());
+        foreach (var match in data.GetProperty("matches").EnumerateArray())
+            Assert.Contains(match.GetProperty("query").GetString()!, match.GetProperty("text").GetString()!);
+        Assert.False(data.GetProperty("truncated").GetBoolean());
+    }
+
+    [Fact]
     public async Task SemanticReferencesIncludeGenericTypeNameSyntax()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);
