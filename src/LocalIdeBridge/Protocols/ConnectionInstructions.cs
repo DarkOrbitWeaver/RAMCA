@@ -66,12 +66,12 @@ public sealed class ConnectionInstructions
         sb.AppendLine();
         sb.AppendLine("## Tool Discovery & Quick Verification");
         sb.AppendLine("1. **Discover tools:** MCP `tools/list`; use `tool_discover` for specialist schemas, `tool_read` for specialist reads, and `execute_once` for mutations. HTTP and CLI can list the full catalog.");
-        sb.AppendLine("2. **Inspect active workspace:** Call `workspace_status` and `repo_tree` (or `POST /api/v1/tools/workspace_status/invoke` with `{}`).");
-        sb.AppendLine("3. **Test & edit loop:** `project_discover` -> `read_file` (note `sha256`) -> `apply_patch` / `replace_range` -> `dotnet_build` -> `dotnet_test` -> `git_commit`.");
+        sb.AppendLine("2. **Orient once:** Prefer `project_context`; use focused search and `read_context` to batch related source. Reuse known hashes and read only changed or missing ranges.");
+        sb.AppendLine("3. **Work in batches:** Use `workflow_run` with selected `returnPointers` for independent reads and dependent actions. Guard edits with versions. Verify proportionately to risk; do not run the full suite after every small edit.");
         sb.AppendLine();
         sb.AppendLine("## Asynchronous Jobs & Logs");
         sb.AppendLine("- For long builds, test suites, or workflows, call `job_start` with `{ \"tool\": \"dotnet_test\", \"arguments\": {} }`.");
-        sb.AppendLine("- Poll `job_status` and `job_events` (`afterEventId` for incremental updates); cancel anytime with `job_cancel`.");
+        sb.AppendLine("- Wait with `job_events` (`afterEventId`, `waitMs:25000`, `waitForTerminal:true`, `includeResult:true`); avoid repeated status polls. Cancel with `job_cancel`.");
         sb.AppendLine("- Command outputs return concise excerpts plus `executionId`; call `read_log` with `{ \"execId\": \"...\", \"startLine\": 1, \"maxLines\": 150 }` for full paginated output.");
         sb.AppendLine();
         sb.AppendLine($"## Available Tools ({_registry.All.Count})");

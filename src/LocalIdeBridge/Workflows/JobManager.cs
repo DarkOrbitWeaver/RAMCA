@@ -82,8 +82,8 @@ public sealed class JobManager : IDisposable
 
         var tool = _registry.Find(toolName)
             ?? throw new ArgumentException($"Unknown tool '{toolName}'.");
-        if (tool.Name.Equals("job_start", StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("Cannot recursively nest job_start inside job_start.");
+        if (tool.Name is "job_start" or "workspace_select" or "session_switch")
+            throw new ArgumentException("Jobs cannot nest job_start or change the selected workspace/session.");
 
         var jobId = $"job_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
         var sessionId = pinnedSessionId ?? _db.InvocationSessionId;

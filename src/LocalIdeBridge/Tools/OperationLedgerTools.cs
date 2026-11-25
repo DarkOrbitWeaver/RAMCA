@@ -55,6 +55,8 @@ public static class OperationLedgerTools
                 var definition = registry.Find(name);
                 if (definition is null)
                     return ToolResult.Fail("unknown_tool", $"Unknown tool '{name}'.");
+                if (definition.Name is "workspace_select" or "session_switch")
+                    return ToolResult.Fail("invalid_arguments", "Select the workspace or session directly, not inside a replay envelope.");
                 // Registry names are case-insensitive; store the canonical spelling
                 // for newly reserved operations.
                 var inner = args["arguments"] as JsonObject ?? new JsonObject();
