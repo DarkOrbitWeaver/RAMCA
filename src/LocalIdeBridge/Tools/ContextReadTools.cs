@@ -118,7 +118,7 @@ public static class ContextReadTools
                         // the same bytes that the decoder consumes.
                         byte[] bytes;
                         using (var stream = new FileStream(full, FileMode.Open, FileAccess.Read,
-                                   FileShare.ReadWrite | FileShare.Delete, 16_384, FileOptions.SequentialScan))
+                                   FileShare.Read, 16_384, FileOptions.SequentialScan))
                         {
                             using var buffer = new MemoryStream((int)info.Length);
                             var chunk = new byte[16_384];

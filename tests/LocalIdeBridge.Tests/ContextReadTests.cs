@@ -145,6 +145,28 @@ public sealed class ContextReadTests
     }
 
     [Fact]
+    public async Task RangeReadRejectsOversizedLinesAndRetainsExactLineNumbers()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "range.txt"),
+            "first\r\n" + new string('x', 100_000) + "\rthird\n");
+        var tooLarge = await sb.Host.Registry.InvokeAsync("read_range", new JsonObject
+        {
+            ["path"] = "range.txt", ["startLine"] = 2, ["endLine"] = 2, ["maxChars"] = 1024
+        });
+        Assert.Equal("range_too_large", tooLarge.ErrorCode);
+        var small = await sb.Host.Registry.InvokeAsync("read_range", new JsonObject
+        {
+            ["path"] = "range.txt", ["startLine"] = 3, ["endLine"] = 3, ["format"] = "formatted"
+        });
+        Assert.True(small.Success, small.ErrorMessage);
+        var data = Data(small.Data);
+        Assert.Equal(3, data.GetProperty("totalLines").GetInt32());
+        Assert.Equal("    3: third", data.GetProperty("formatted").GetString());
+        Assert.False(data.TryGetProperty("lines", out _));
+    }
+
+    [Fact]
     public async Task RejectsTooManyRangesBeforeAnyRead()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);

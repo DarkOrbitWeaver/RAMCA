@@ -91,7 +91,8 @@ public static partial class EditingTools
                 }
                 else if (loaded.Content.Length > maxChars)
                 {
-                    text = loaded.Content[..maxChars];
+                    var end = char.IsHighSurrogate(loaded.Content[maxChars - 1]) ? maxChars - 1 : maxChars;
+                    text = loaded.Content[..end];
                     truncated = true;
                 }
                 else
@@ -127,7 +128,8 @@ public static partial class EditingTools
                 new("path", "string", "Relative file path inside the workspace.", Required: true),
                 new("startLine", "integer", "1-based starting line number.", Required: true),
                 new("endLine", "integer", "1-based inclusive ending line number.", Required: true),
-                new("format", "string", "formatted (compact), lines (structured), or both (legacy default).", Default: "both", EnumValues: ["formatted", "lines", "both"])
+                new("format", "string", "formatted, lines, or both (legacy default).", Default: "both", EnumValues: ["formatted", "lines", "both"]),
+                new("maxChars", "integer", "Maximum source characters (1024..128000); larger ranges are rejected, not silently shortened.", Default: 32000)
             ],
             Handler: (args, _, ct) =>
             {
@@ -137,35 +139,44 @@ public static partial class EditingTools
                     throw new FileNotFoundException($"File not found: {args.RequireString("path")}");
 
                 var start = Math.Max(1, args.OptionalInt("startLine", 1));
-                var end = Math.Max(start, args.OptionalInt("endLine", start + 99));
+                var end = Math.Max(start, args.OptionalInt("endLine", (int)Math.Min(int.MaxValue, (long)start + 99)));
                 if (end - start > 1000) end = start + 1000;
 
                 var format = args.OptionalString("format", "both");
                 if (format is not ("formatted" or "lines" or "both"))
                     throw new ArgumentException("format must be formatted, lines, or both.");
-                var sha256 = ComputeFileSha256(full);
+                var maxChars = Math.Clamp(args.OptionalInt("maxChars", 32_000), 1024, 128_000);
                 var lines = new List<object>();
                 var sb = new StringBuilder();
-                var totalLines = 0;
-
-                using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 8192))
-                using (var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                int totalLines;
+                string sha256;
+                // Use the same handle for the range and its version. Windows sharing
+                // prevents an external writer from changing it between the two passes.
+                using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, FileOptions.SequentialScan))
                 {
-                    string? line;
-                    while ((line = sr.ReadLine()) is not null)
+                    using (var sr = new StreamReader(fs, new UTF8Encoding(false, true),
+                               detectEncodingFromByteOrderMarks: true, leaveOpen: true))
                     {
-                        ct.ThrowIfCancellationRequested();
-                        totalLines++;
-                        if (totalLines >= start && totalLines <= end)
+                        var range = ReadBoundedRange(sr, start, end, maxChars, ct);
+                        if (range is null)
+                            return Task.FromResult(ToolResult.Fail("range_too_large",
+                                "Requested source exceeds maxChars. Narrow the range or use read_context with continuation."));
+                        totalLines = range.Value.TotalLines;
+                        for (var i = 0; i < range.Value.Lines.Count; i++)
                         {
-                            if (format != "formatted") lines.Add(new { line = totalLines, text = line });
+                            var number = start + i;
+                            var line = range.Value.Lines[i];
+                            if (format != "formatted") lines.Add(new { line = number, text = line });
                             if (format != "lines")
                             {
                                 if (sb.Length > 0) sb.Append('\n');
-                                sb.Append($"{totalLines,5}: {line}");
+                                sb.Append($"{number,5}: {line}");
                             }
                         }
                     }
+                    fs.Position = 0;
+                    ct.ThrowIfCancellationRequested();
+                    sha256 = Convert.ToHexStringLower(SHA256.HashData(fs));
                 }
 
                 var rel = guard.GetRelativePathUnix(ws, full);
@@ -1162,6 +1173,62 @@ public static partial class EditingTools
                     new { editId, undoEditId = undoId, path = edit.RelativePath, restoredSha256 = restoredHash,
                           changedFiles = new[] { edit.RelativePath } }));
             });
+    }
+
+    // ReadLine can allocate an entire minified file. Scan fixed-size chunks and
+    // retain only the requested lines under one aggregate source budget.
+    private static (List<string> Lines, int TotalLines)? ReadBoundedRange(
+        StreamReader reader, int start, int end, int maxChars, CancellationToken ct)
+    {
+        var selected = new List<string>();
+        var current = new StringBuilder();
+        var buffer = new char[8192];
+        var total = 0;
+        var used = 0;
+        var hasContent = false;
+        var previousCr = false;
+
+        void FinishLine()
+        {
+            total++;
+            if (total >= start && total <= end)
+            {
+                selected.Add(current.ToString());
+                current.Clear();
+            }
+            hasContent = false;
+        }
+
+        int count;
+        while ((count = reader.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            for (var i = 0; i < count; i++)
+            {
+                var ch = buffer[i];
+                if (previousCr)
+                {
+                    previousCr = false;
+                    if (ch == '\n') continue;
+                }
+                var inRange = total >= start - 1 && total < end;
+                if (ch is '\r' or '\n')
+                {
+                    if (inRange && ++used > maxChars) return null;
+                    FinishLine();
+                    previousCr = ch == '\r';
+                    continue;
+                }
+                hasContent = true;
+                if (inRange)
+                {
+                    if (++used > maxChars) return null;
+                    current.Append(ch);
+                }
+            }
+        }
+        if (hasContent) FinishLine();
+        return (selected, total);
     }
 
     public static LoadedTextFile LoadTextFile(string fullPath)
