@@ -56,7 +56,7 @@ public sealed class McpServer
         _registry = registry;
         _instructions = instructions;
         _logger = logger;
-        _toolCatalog = BuildToolCatalog(registry);
+        _toolCatalog = BuildToolCatalog(registry, config.Integrations.AdvertiseAgentBoardTools);
 
         _registry.OnToolCompleted += (toolName, result, ms) =>
         {
@@ -84,11 +84,15 @@ public sealed class McpServer
 
     // Registration finishes before the MCP server is constructed. Cache the schema
     // tree once; clone per response because JsonNode has single-parent ownership.
-    private static JsonArray BuildToolCatalog(ToolRegistry registry)
+    private static JsonArray BuildToolCatalog(ToolRegistry registry, bool advertiseBoard)
     {
         var toolsArr = new JsonArray();
         foreach (var t in registry.All)
         {
+            // Discovery preference only: the registry still exposes the full
+            // authorized capability set to HTTP, CLI and existing direct calls.
+            if (!advertiseBoard && t.Name.StartsWith("board_", StringComparison.Ordinal))
+                continue;
             toolsArr.Add(new JsonObject
             {
                 ["name"] = t.Name,

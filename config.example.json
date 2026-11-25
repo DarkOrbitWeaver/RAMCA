@@ -91,6 +91,7 @@
     "enableRoslynSemantic": true,
     "enableOpenApi": true,
     "enableMcpSseStream": true,
-    "mcpResultMode": "auto"
+    "mcpResultMode": "auto",
+    "advertiseAgentBoardTools": false
   }
 }

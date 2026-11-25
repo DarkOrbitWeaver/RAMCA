@@ -222,6 +222,8 @@ public sealed class IntegrationSettings
     public bool EnableMcpSseStream { get; set; } = true;
     /// <summary>auto preserves legacy clients; text or structured sends one full result.</summary>
     public string McpResultMode { get; set; } = "auto";
+    /// <summary>Opt in to advertising multi-agent tools in the MCP catalog.</summary>
+    public bool AdvertiseAgentBoardTools { get; set; }
 }
 
 /// <summary>

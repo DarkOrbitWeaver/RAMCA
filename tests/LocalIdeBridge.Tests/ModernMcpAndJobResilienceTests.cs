@@ -98,6 +98,55 @@ public sealed class ModernMcpAndJobResilienceTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AgentBoardDiscoveryIsOptIn(bool advertiseBoard)
+    {
+        await using var sb = await TestSandbox.CreateAsync(
+            cfg => cfg.Integrations.AdvertiseAgentBoardTools = advertiseBoard);
+        using var client = sb.CreateClient();
+        using var request = Post(Request("tools/list"));
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+        var tools = body["result"]!["tools"]!.AsArray();
+        Assert.Equal(advertiseBoard, tools.Any(t =>
+            t?["name"]?.GetValue<string>().StartsWith("board_", StringComparison.Ordinal) == true));
+        Assert.NotNull(sb.Host.Registry.Find("board_join"));
+        Assert.Contains(tools, t => t?["name"]?.GetValue<string>() == "read_context");
+    }
+
+    [Theory]
+    [InlineData("text")]
+    [InlineData("structured")]
+    public async Task CompactResultModePreservesFullSourceExactlyOnce(string mode)
+    {
+        await using var sb = await TestSandbox.CreateAsync(cfg => cfg.Integrations.McpResultMode = mode);
+        const string marker = "unique_source_payload_9382";
+        await File.WriteAllTextAsync(Path.Combine(sb.WorkspaceDir, "source.txt"), marker);
+        using var client = sb.CreateClient();
+        using var request = Post(Request("tools/call", new JsonObject
+        {
+            ["name"] = "read_file", ["arguments"] = new JsonObject { ["path"] = "source.txt" }
+        }), routeName: "read_file");
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var raw = await response.Content.ReadAsStringAsync();
+        Assert.Equal(2, raw.Split(marker, StringSplitOptions.None).Length);
+        var result = JsonNode.Parse(raw)!["result"]!;
+        if (mode == "text")
+        {
+            Assert.Null(result["structuredContent"]);
+            var data = JsonNode.Parse(result["content"]![0]!["text"]!.GetValue<string>())!;
+            Assert.Equal(marker, data["data"]!["content"]!.GetValue<string>());
+        }
+        else
+        {
+            Assert.Equal(marker, result["structuredContent"]!["data"]!["content"]!.GetValue<string>());
+        }
+    }
+
     [Fact]
     public async Task ModernRequestRejectsMissingCapabilityMetadataWithoutExecutingTools()
     {

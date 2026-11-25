@@ -51,3 +51,5 @@ See [Execution Continuity](EXECUTION_CONTINUITY.md).
 Set `integrations.mcpResultMode` in `config.json` to `text` for clients that consume text or `structured` for clients verified to consume structuredContent. `auto` retains existing protocol behavior. No capability is removed. Use a single result representation when supported; do not assume the model sees both wire copies.
 
 For repeated reads, supply `ifSha256` for each file only when you already have the requested content at that version. An unchanged file returns metadata without source. Duplicate paths and overlapping ranges are combined. Use the returned version to guard edits.
+
+Single-agent MCP discovery is the default: the ten `board_*` schemas are omitted without removing their registry implementations. To use the multi-chat board, set `integrations.advertiseAgentBoardTools` to `true`, restart RAMCA, and refresh the client's tools. HTTP/CLI discovery remains complete. This is a context optimization, not a security boundary.
