@@ -12,8 +12,8 @@ namespace LocalIdeBridge.Tools;
 /// </summary>
 public static class ContextReadTools
 {
-    private sealed record RequestedRange(int Start, int End);
-    private sealed record RequestedFile(string Path, List<RequestedRange> Ranges, string? IfSha256);
+    private sealed record RequestedRange(int Start, int End, int Column = 1);
+    private sealed record RequestedFile(string Path, List<RequestedRange> Ranges, string? IfSha256, string? ExpectedSha256);
 
     public static IEnumerable<ToolDefinition> Create(WorkspaceGuard guard, AppConfig config)
     {
@@ -26,7 +26,7 @@ public static class ContextReadTools
             SideEffects: "None; snapshot-like read with per-file version and partial-read reporting.",
             Parameters:
             [
-                new("items", "array", "[{path, ranges?:[[startLine,endLine], ...], ifSha256?:knownVersion}]. Unchanged files return metadata only. Omit ranges to read from line 1.", Required: true,
+                new("items", "array", "[{path,ranges?:[[startLine,endLine,startColumn?],...],ifSha256?:knownVersion,expectedSha256?:requiredVersion}]. Omit ranges for the whole file; follow nextRange if truncated.", Required: true,
                     ItemsSchema: new JsonObject { ["type"] = "object" }),
                 new("maxBytes", "integer", "Hard cap on serialized tool data, 2048..65536 bytes. Defaults to 24000.", Default: 24000),
                 new("includeVersion", "boolean", "Include the SHA-256 of each exact byte buffer, usable as an edit precondition.", Default: true),
@@ -74,9 +74,16 @@ public static class ContextReadTools
 
                     if (mapped.TryGetValue(relative, out var existing))
                     {
+                        if (existing.ExpectedSha256 is not null && entry.ExpectedSha256 is not null &&
+                            !string.Equals(existing.ExpectedSha256, entry.ExpectedSha256, StringComparison.OrdinalIgnoreCase))
+                            return Task.FromResult(ToolResult.Fail("invalid_arguments", "Conflicting expected versions for one file."));
                         existing.Ranges.AddRange(entry.Ranges);
-                        if (!string.Equals(existing.IfSha256, entry.IfSha256, StringComparison.OrdinalIgnoreCase))
-                            mapped[relative] = existing with { IfSha256 = null };
+                        mapped[relative] = existing with
+                        {
+                            IfSha256 = string.Equals(existing.IfSha256, entry.IfSha256, StringComparison.OrdinalIgnoreCase)
+                                ? existing.IfSha256 : null,
+                            ExpectedSha256 = existing.ExpectedSha256 ?? entry.ExpectedSha256
+                        };
                     }
                     else
                     {
@@ -135,10 +142,18 @@ public static class ContextReadTools
                             data["complete"] = false;
                             continue;
                         }
-                        var sha256 = includeVersion || entry.IfSha256 is not null
+                        var sha256 = includeVersion || entry.IfSha256 is not null || entry.ExpectedSha256 is not null
                             ? Convert.ToHexStringLower(SHA256.HashData(bytes)) : null;
                         if (includeVersion) fileEntry["sha256"] = sha256;
                         fileEntry["sizeBytes"] = bytes.Length;
+                        if (entry.ExpectedSha256 is not null &&
+                            !string.Equals(sha256, entry.ExpectedSha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            fileEntry["status"] = "stale_file";
+                            fileEntry["sha256"] = sha256;
+                            data["complete"] = false;
+                            continue;
+                        }
                         if (!includeTotal && entry.IfSha256 is not null &&
                             string.Equals(sha256, entry.IfSha256, StringComparison.OrdinalIgnoreCase))
                         {
@@ -177,6 +192,12 @@ public static class ContextReadTools
                             // Bound the intermediate string before serializing, even for minified files.
                             var block = new StringBuilder(Math.Min(maxBytes, 4096));
                             var truncated = false;
+                            if (startIndex < stopExclusive &&
+                                (range.Column > lines[startIndex].Length + 1 ||
+                                 (range.Column > 1 && range.Column <= lines[startIndex].Length &&
+                                  char.IsLowSurrogate(lines[startIndex][range.Column - 1]) &&
+                                  char.IsHighSurrogate(lines[startIndex][range.Column - 2]))))
+                                throw new ArgumentException("Invalid starting column.");
                             for (var i = startIndex; i < stopExclusive; i++)
                             {
                                 ct.ThrowIfCancellationRequested();
@@ -186,24 +207,33 @@ public static class ContextReadTools
                                     block.Append('\n');
                                 }
                                 var remaining = maxBytes - block.Length;
-                                var length = Math.Min(remaining, lines[i].Length);
-                                if (length < lines[i].Length)
+                                var offset = i == startIndex ? range.Column - 1 : 0;
+                                var available = lines[i].Length - offset;
+                                var length = Math.Min(remaining, available);
+                                if (length < available)
                                 {
-                                    if (length > 0 && char.IsHighSurrogate(lines[i][length - 1])) length--;
+                                    if (length > 0 && char.IsHighSurrogate(lines[i][offset + length - 1])) length--;
                                     truncated = true;
                                 }
-                                block.Append(lines[i].AsSpan(0, length));
+                                block.Append(lines[i].AsSpan(offset, length));
                                 if (truncated) break;
                             }
-                            ranges.Add(new JsonObject
+                            var resultRange = new JsonObject
                             {
                                 ["startLine"] = range.Start,
+                                ["startColumn"] = range.Column,
                                 ["endLine"] = stopExclusive,
                                 ["content"] = block.ToString(),
                                 ["truncated"] = truncated,
                                 ["pastEof"] = range.Start > lines.Length
-                            });
-                            if (truncated) data["complete"] = false;
+                            };
+                            ranges.Add(resultRange);
+                            if (truncated)
+                            {
+                                SetContinuation(resultRange);
+                                fileEntry["status"] = "partial";
+                                data["complete"] = false;
+                            }
                             totalRanges++;
                         }
                     }
@@ -225,7 +255,7 @@ public static class ContextReadTools
 
                 data["rangeCount"] = totalRanges;
                 // Entire *data* is capped, including metadata and JSON escaping.
-                // Trim large ranges in reverse, not only the first requested file.
+                // Trim the largest payloads while preserving exact continuation coordinates.
                 var partial = false;
                 var iterations = 0;
                 while (JsonSerializer.SerializeToUtf8Bytes(data, AppConfig.JsonOptions).Length > maxBytes)
@@ -234,6 +264,7 @@ public static class ContextReadTools
                         return Task.FromResult(ToolResult.Fail("budget_too_small",
                             "The context request metadata exceeds its maxBytes; request fewer files or a larger cap."));
                     JsonObject? selected = null;
+                    JsonObject? selectedFile = null;
                     var largest = 0;
                     foreach (var f in files.OfType<JsonObject>())
                         if (f["ranges"] is JsonArray arr)
@@ -242,6 +273,7 @@ public static class ContextReadTools
                                 var size = r["content"]?.GetValue<string>().Length ?? 0;
                                 if (size <= largest) continue;
                                 selected = r;
+                                selectedFile = f;
                                 largest = size;
                             }
                     if (selected is null || largest == 0)
@@ -252,6 +284,9 @@ public static class ContextReadTools
                     if (target > 0 && char.IsHighSurrogate(text[target - 1])) target--;
                     selected["content"] = text[..target];
                     selected["truncated"] = true;
+                    SetContinuation(selected);
+                    selectedFile!["status"] = "partial";
+                    data["complete"] = false;
                     partial = true;
                 }
                 if (partial) data["complete"] = false;
@@ -279,27 +314,31 @@ public static class ContextReadTools
                 if (given.Count == 0) throw new ArgumentException("ranges cannot be an empty array.");
                 foreach (var value in given)
                 {
-                    if (value is not JsonArray pair || pair.Count != 2 ||
-                        pair[0]?.GetValueKind() != JsonValueKind.Number ||
-                        pair[1]?.GetValueKind() != JsonValueKind.Number)
-                        throw new ArgumentException("Every range must be [startLine,endLine] with integer values.");
-                    var start = pair[0]!.GetValue<int>();
-                    var end = pair[1]!.GetValue<int>();
-                    if (start < 1 || end < start || end - start > 2000)
-                        throw new ArgumentException("Each context range must be positive and no longer than 2001 lines.");
-                    ranges.Add(new RequestedRange(start, end));
+                    if (value is not JsonArray pair || pair.Count is < 2 or > 3 ||
+                        pair[0] is not JsonValue first || !first.TryGetValue<int>(out var start) ||
+                        pair[1] is not JsonValue last || !last.TryGetValue<int>(out var end))
+                        throw new ArgumentException("Every range must be [startLine,endLine,startColumn?] with integer values.");
+                    var column = 1;
+                    if (pair.Count == 3 && (pair[2] is not JsonValue col || !col.TryGetValue<int>(out column)))
+                        throw new ArgumentException("The optional startColumn must be an integer.");
+                    if (start < 1 || end < start || column < 1)
+                        throw new ArgumentException("Context range lines and columns must be positive and ordered.");
+                    ranges.Add(new RequestedRange(start, end, column));
                 }
             }
             else if (obj.ContainsKey("ranges") && obj["ranges"] is not null)
                 throw new ArgumentException("ranges must be an array.");
             else
-                ranges.Add(new RequestedRange(1, 2000));
+                ranges.Add(new RequestedRange(1, int.MaxValue));
             totalRanges += ranges.Count;
             if (totalRanges > 64) throw new ArgumentException("At most 64 ranges are allowed per context request.");
             var ifSha256 = obj.OptionalString("ifSha256");
             if (ifSha256 is not null && (ifSha256.Length != 64 || !ifSha256.All(Uri.IsHexDigit)))
                 throw new ArgumentException("ifSha256 must be a 64-character SHA-256 hex digest.");
-            files.Add(new RequestedFile(path, ranges, ifSha256));
+            var expectedSha256 = obj.OptionalString("expectedSha256");
+            if (expectedSha256 is not null && (expectedSha256.Length != 64 || !expectedSha256.All(Uri.IsHexDigit)))
+                throw new ArgumentException("expectedSha256 must be a 64-character SHA-256 hex digest.");
+            files.Add(new RequestedFile(path, ranges, ifSha256, expectedSha256));
         }
         return files;
     }
@@ -308,11 +347,11 @@ public static class ContextReadTools
     private static IEnumerable<RequestedRange> MergeOverlaps(List<RequestedRange> ranges)
     {
         RequestedRange? pending = null;
-        foreach (var range in ranges.OrderBy(r => r.Start).ThenBy(r => r.End))
+        foreach (var range in ranges.OrderBy(r => r.Start).ThenBy(r => r.Column).ThenBy(r => r.End))
         {
             if (pending is null) pending = range;
             else if (range.Start <= pending.End)
-                pending = new RequestedRange(pending.Start, Math.Max(pending.End, range.End));
+                pending = new RequestedRange(pending.Start, Math.Max(pending.End, range.End), pending.Column);
             else
             {
                 yield return pending;
@@ -320,6 +359,21 @@ public static class ContextReadTools
             }
         }
         if (pending is not null) yield return pending;
+    }
+
+    // The next page starts at the exact character after the returned normalized
+    // prefix. At a line boundary, length+1 is valid and preserves the newline
+    // between the old page and the next. Columns are 1-based UTF-16 code units.
+    private static void SetContinuation(JsonObject range)
+    {
+        var line = range["startLine"]!.GetValue<int>();
+        var column = range["startColumn"]!.GetValue<int>();
+        foreach (var ch in range["content"]!.GetValue<string>())
+        {
+            if (ch == '\n') { line++; column = 1; }
+            else column++;
+        }
+        range["nextRange"] = new JsonArray(line, range["endLine"]!.GetValue<int>(), column);
     }
 
     private static bool LooksBinary(byte[] bytes)

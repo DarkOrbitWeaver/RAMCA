@@ -103,6 +103,48 @@ public sealed class ContextReadTests
     }
 
     [Fact]
+    public async Task ContextContinuationReconstructsSourceWithoutDuplicatingCharacters()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var source = "header\n" + new string('x', 7000) + "\nfooter";
+        var path = Path.Combine(sb.WorkspaceDir, "long.txt");
+        await File.WriteAllTextAsync(path, source);
+        var assembled = new System.Text.StringBuilder();
+        JsonArray? next = null;
+        string? version = null;
+        for (var page = 0; page < 20; page++)
+        {
+            var item = new JsonObject { ["path"] = "long.txt" };
+            if (next is not null) item["ranges"] = new JsonArray(next);
+            if (version is not null) item["expectedSha256"] = version;
+            var result = await sb.Host.Registry.InvokeAsync("read_context", new JsonObject
+            {
+                ["items"] = new JsonArray(item), ["maxBytes"] = 2048
+            });
+            Assert.True(result.Success, result.ErrorMessage);
+            var data = Data(result.Data);
+            var file = data.GetProperty("files")[0];
+            version ??= file.GetProperty("sha256").GetString();
+            var range = file.GetProperty("ranges")[0];
+            var content = range.GetProperty("content").GetString()!;
+            Assert.NotEmpty(content);
+            assembled.Append(content);
+            if (!range.GetProperty("truncated").GetBoolean()) break;
+            next = JsonNode.Parse(range.GetProperty("nextRange").GetRawText())!.AsArray();
+        }
+        Assert.Equal(source, assembled.ToString());
+        await File.AppendAllTextAsync(path, "changed");
+        var stale = await sb.Host.Registry.InvokeAsync("read_context", new JsonObject
+        {
+            ["items"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "long.txt", ["expectedSha256"] = version
+            })
+        });
+        Assert.Equal("stale_file", Data(stale.Data).GetProperty("files")[0].GetProperty("status").GetString());
+    }
+
+    [Fact]
     public async Task RejectsTooManyRangesBeforeAnyRead()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);
