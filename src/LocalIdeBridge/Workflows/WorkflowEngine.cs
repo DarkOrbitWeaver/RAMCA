@@ -224,7 +224,10 @@ public sealed class WorkflowEngine
 
                 if (readSteps.Count > 0)
                 {
-                    var tasks = readSteps.Select(async step =>
+                    // Many registry reads complete synchronously (filesystem/Roslyn).
+                    // Schedule only the already-bounded read wave on workers so one
+                    // synchronous handler cannot serialize the entire wave.
+                    var tasks = readSteps.Select(step => Task.Run(async () =>
                     {
                         await readGate.WaitAsync(wfCts.Token).ConfigureAwait(false);
                         try
@@ -237,7 +240,7 @@ public sealed class WorkflowEngine
                         {
                             readGate.Release();
                         }
-                    });
+                    }, wfCts.Token));
                     await Task.WhenAll(tasks).ConfigureAwait(false);
                     foreach (var rs in readSteps) remaining.Remove(rs.Id);
                     PersistCheckpoint("running");

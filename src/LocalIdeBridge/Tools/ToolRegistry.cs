@@ -129,21 +129,25 @@ public sealed class ToolRegistry
         string toolName, JsonObject? arguments, string? workspace, string? operationId,
         CancellationToken ct = default, Action<string>? workspaceSelection = null)
     {
+        var definition = Find(toolName);
+        if (definition is null)
+            return Task.FromResult(ToolResult.Fail("unknown_tool", $"Unknown tool '{toolName}'."));
         string? root;
         try
         {
-            root = workspace is null
-                ? (workspaceSelection is null ? _guard.ActiveWorkspace : null)
-                : _guard.ResolveTrustedWorkspace(workspace);
+            // Selection must recover even if the previously bound directory was
+            // moved, deleted, or untrusted. The target itself is validated by
+            // workspace_select, not by resolving the old binding.
+            root = definition.Name == "workspace_select" ? null :
+                workspace is null
+                    ? (workspaceSelection is null ? _guard.ActiveWorkspace : null)
+                    : _guard.ResolveTrustedWorkspace(workspace);
         }
         catch (WorkspaceViolationException ex)
         {
             return Task.FromResult(ToolResult.Fail("workspace_violation", _credentials.Redact(ex.Message)));
         }
         var context = new ToolExecutionContext(_db.ActiveSessionId, WorkspaceRoot: root, WorkspaceSelection: workspaceSelection);
-        var definition = Find(toolName);
-        if (definition is null)
-            return Task.FromResult(ToolResult.Fail("unknown_tool", $"Unknown tool '{toolName}'."));
         if (workspaceSelection is not null && root is null &&
             definition.Name is not ("workspace_select" or "workspace_list" or "tool_discover" or "tool_performance" or "tool_doctor"))
             return Task.FromResult(ToolResult.Fail("workspace_required", "This connection has no selected workspace. Call workspace_select."));
@@ -193,7 +197,8 @@ public sealed class ToolRegistry
 
         var ctx = context ?? new ToolExecutionContext(_db.ActiveSessionId);
         using var sessionScope = _db.UseInvocationSession(ctx.SessionId);
-        var workspace = ctx.WorkspaceRoot ?? (ctx.WorkspaceSelection is null ? _guard.ActiveWorkspace : null);
+        var workspace = tool.Name == "workspace_select" ? null :
+            ctx.WorkspaceRoot ?? (ctx.WorkspaceSelection is null ? _guard.ActiveWorkspace : null);
         ctx = ctx with { WorkspaceRoot = workspace };
         ToolResult result;
 

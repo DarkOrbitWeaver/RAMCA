@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using LocalIdeBridge.Workflows;
+using LocalIdeBridge.Tools;
 using Xunit;
 
 namespace LocalIdeBridge.Tests;
@@ -67,6 +68,30 @@ public sealed class WorkflowBindingRegressionTests
         Assert.Equal(64, result.Outputs["read"]["values"]!["/data/sha256"]!.GetValue<string>().Length);
         Assert.Equal("pointer_not_found", result.Outputs["write"]["errors"]![0]!["code"]!.GetValue<string>());
         Assert.True(File.Exists(Path.Combine(sb.WorkspaceDir, "b.txt")));
+    }
+
+    [Fact]
+    public async Task IndependentSynchronousReadHandlersActuallyOverlap()
+    {
+        await using var sb = await TestSandbox.CreateAsync(
+            cfg => cfg.Resources.MaxParallelReadSteps = 2, startListener: false);
+        using var barrier = new Barrier(2);
+        sb.Host.Registry.Register(new ToolDefinition(
+            "test_sync_read", "test", "Synchronous read overlap probe.", true, true, "None.", [],
+            (_, _, ct) => Task.FromResult(barrier.SignalAndWait(TimeSpan.FromSeconds(10), ct)
+                ? ToolResult.Ok("Overlapped.")
+                : ToolResult.Fail("serialized", "Independent reads did not overlap."))));
+        var result = await sb.Host.Workflows.ExecuteAsync(new WorkflowDefinition
+        {
+            MaxParallelism = 2,
+            Steps =
+            [
+                new WorkflowStepSpec { Id = "a", Tool = "test_sync_read" },
+                new WorkflowStepSpec { Id = "b", Tool = "test_sync_read" }
+            ]
+        });
+        Assert.Equal("succeeded", result.Status);
+        Assert.Equal(2, result.SucceededSteps);
     }
 
     [Fact]

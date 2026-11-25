@@ -169,6 +169,55 @@ public sealed class ModernMcpAndJobResilienceTests
     }
 
     [Fact]
+    public async Task LegacyMcpWorkspaceSelectionIsIsolatedAndCanRecoverAfterDirectoryRemoval()
+    {
+        await using var sb = await TestSandbox.CreateAsync();
+        var other = Path.Combine(sb.BaseDir, "OtherProject");
+        Directory.CreateDirectory(other);
+        sb.Config.AddTrustedWorkspace(other, "other");
+        using var client = sb.CreateClient();
+
+        async Task<string> Connect()
+        {
+            using var response = await client.PostAsync("mcp", TestSandbox.JsonBody(new
+            {
+                jsonrpc = "2.0", id = 1, method = "initialize",
+                @params = new { protocolVersion = "2025-06-18", capabilities = new { },
+                    clientInfo = new { name = "scope-test", version = "1" } }
+            }));
+            response.EnsureSuccessStatusCode();
+            return response.Headers.GetValues("Mcp-Session-Id").Single();
+        }
+
+        async Task<JsonNode> Call(string sid, string tool, object args)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "mcp")
+            {
+                Content = TestSandbox.JsonBody(new { jsonrpc = "2.0", id = 2, method = "tools/call",
+                    @params = new { name = tool, arguments = args } })
+            };
+            request.Headers.Add("Mcp-Session-Id", sid);
+            using var response = await client.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            return JsonNode.Parse(await response.Content.ReadAsStringAsync())!["result"]!;
+        }
+
+        var a = await Connect();
+        var b = await Connect();
+        Assert.False((await Call(b, "workspace_select", new { workspace = "other" }))["isError"]!.GetValue<bool>());
+        Assert.Equal(sb.WorkspaceDir, sb.Host.Guard.ActiveWorkspace);
+        Assert.False((await Call(a, "create_file", new { path = "a.txt", content = "A" }))["isError"]!.GetValue<bool>());
+        Assert.False((await Call(b, "create_file", new { path = "b.txt", content = "B" }))["isError"]!.GetValue<bool>());
+        Assert.True(File.Exists(Path.Combine(sb.WorkspaceDir, "a.txt")));
+        Assert.True(File.Exists(Path.Combine(other, "b.txt")));
+        Assert.False(File.Exists(Path.Combine(other, "a.txt")));
+        Assert.False(File.Exists(Path.Combine(sb.WorkspaceDir, "b.txt")));
+        Directory.Delete(other, recursive: true);
+        Assert.False((await Call(b, "workspace_select", new { workspace = "disposable" }))["isError"]!.GetValue<bool>());
+        Assert.False((await Call(b, "read_file", new { path = "a.txt" }))["isError"]!.GetValue<bool>());
+    }
+
+    [Fact]
     public async Task RemoteOperationMetadataPinsWorkspaceAndReplaysWithoutRepeatingWrite()
     {
         await using var sb = await TestSandbox.CreateAsync();
