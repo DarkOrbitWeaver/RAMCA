@@ -220,6 +220,8 @@ public sealed class IntegrationSettings
     public bool EnableRoslynSemantic { get; set; } = true;
     public bool EnableOpenApi { get; set; } = true;
     public bool EnableMcpSseStream { get; set; } = true;
+    /// <summary>auto preserves legacy clients; text or structured sends one full result.</summary>
+    public string McpResultMode { get; set; } = "auto";
 }
 
 /// <summary>

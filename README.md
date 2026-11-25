@@ -13,7 +13,7 @@ This repository is published as **RAMCA**. The executable and C# namespaces reta
 
 - **Single portable folder:** `LocalIdeBridge.exe`, `config.json`, `data/` (SQLite WAL `state.db`, `secret.key`, `sessions/`), `logs/`, `cache/`, `temp/`, `sandbox/`, `tools/`, and `docs/`. Nothing written to `%APPDATA%`, `%PROGRAMDATA%`, or the Windows Registry.
 - **No mandatory paid APIs, cloud accounts, or bundled LLM:** Provider-independent; works with any compatible MCP, HTTP, or CLI agent.
-- **Three universal interfaces sharing one execution engine (52 tools):**
+- **Three universal interfaces sharing one execution engine (68 tools):**
   1. **MCP Streamable HTTP** (`/mcp`) + local **MCP stdio** (`LocalIdeBridge.exe mcp-stdio`).
   2. **Authenticated HTTP/HTTPS JSON API** (`/api/v1/*`) + live **OpenAPI 3.1.0** schema (`/openapi.json`).
   3. **Lightweight CLI client** (`LocalIdeBridge.exe cli ...`) with structured JSON output and explicit exit codes.
@@ -73,7 +73,7 @@ Scripted non-interactive setup is also built in:
 
 - [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) — First launch & complete disposable-project walkthrough
 - [`docs/CONNECTING_AI_CLIENTS.md`](docs/CONNECTING_AI_CLIENTS.md) — MCP, HTTPS API, CLI, and client setup matrix
-- [`docs/TOOLS.md`](docs/TOOLS.md) — Complete reference for all 52 tools, parameters, and error codes
+- [`docs/TOOLS.md`](docs/TOOLS.md) — Tool reference (live registry is authoritative for the current catalog)
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — All `config.json` and `.localidebridge.json` settings
 - [`docs/SECURITY.md`](docs/SECURITY.md) — Authentication, trust boundaries, credential rotation, and threat model
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Internal design, lifecycle, storage, and extension points

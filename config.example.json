@@ -90,6 +90,7 @@
   "integrations": {
     "enableRoslynSemantic": true,
     "enableOpenApi": true,
-    "enableMcpSseStream": true
+    "enableMcpSseStream": true,
+    "mcpResultMode": "auto"
   }
 }

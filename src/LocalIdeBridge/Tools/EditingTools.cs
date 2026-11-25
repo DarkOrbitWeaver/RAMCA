@@ -126,7 +126,8 @@ public static partial class EditingTools
             [
                 new("path", "string", "Relative file path inside the workspace.", Required: true),
                 new("startLine", "integer", "1-based starting line number.", Required: true),
-                new("endLine", "integer", "1-based inclusive ending line number.", Required: true)
+                new("endLine", "integer", "1-based inclusive ending line number.", Required: true),
+                new("format", "string", "formatted (compact), lines (structured), or both (legacy default).", Default: "both", EnumValues: ["formatted", "lines", "both"])
             ],
             Handler: (args, _, ct) =>
             {
@@ -139,6 +140,9 @@ public static partial class EditingTools
                 var end = Math.Max(start, args.OptionalInt("endLine", start + 99));
                 if (end - start > 1000) end = start + 1000;
 
+                var format = args.OptionalString("format", "both");
+                if (format is not ("formatted" or "lines" or "both"))
+                    throw new ArgumentException("format must be formatted, lines, or both.");
                 var sha256 = ComputeFileSha256(full);
                 var lines = new List<object>();
                 var sb = new StringBuilder();
@@ -154,9 +158,12 @@ public static partial class EditingTools
                         totalLines++;
                         if (totalLines >= start && totalLines <= end)
                         {
-                            lines.Add(new { line = totalLines, text = line });
-                            if (sb.Length > 0) sb.Append('\n');
-                            sb.Append($"{totalLines,5}: {line}");
+                            if (format != "formatted") lines.Add(new { line = totalLines, text = line });
+                            if (format != "lines")
+                            {
+                                if (sb.Length > 0) sb.Append('\n');
+                                sb.Append($"{totalLines,5}: {line}");
+                            }
                         }
                     }
                 }
@@ -171,8 +178,8 @@ public static partial class EditingTools
                         startLine = start,
                         endLine = Math.Min(end, totalLines),
                         totalLines,
-                        formatted = sb.ToString(),
-                        lines
+                        formatted = format == "lines" ? null : sb.ToString(),
+                        lines = format == "formatted" ? null : lines
                     }));
             });
 

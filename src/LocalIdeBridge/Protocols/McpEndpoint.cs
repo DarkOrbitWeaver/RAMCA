@@ -34,6 +34,7 @@ public sealed class McpServer
     private readonly ToolRegistry _registry;
     private readonly ConnectionInstructions _instructions;
     private readonly RedactingLogger _logger;
+    private readonly JsonArray _toolCatalog;
     private readonly BoundedLruCache<string, McpSessionInfo> _mcpSessions = new(128, 256 * 1024, StringComparer.Ordinal);
     private readonly BoundedRingBuffer<string> _sseNotifications = new(128);
     private readonly object _sseSubLock = new();
@@ -55,6 +56,7 @@ public sealed class McpServer
         _registry = registry;
         _instructions = instructions;
         _logger = logger;
+        _toolCatalog = BuildToolCatalog(registry);
 
         _registry.OnToolCompleted += (toolName, result, ms) =>
         {
@@ -78,6 +80,34 @@ public sealed class McpServer
             _sseNotifications.Push(note.ToJsonString());
             SignalSseWaiters();
         };
+    }
+
+    // Registration finishes before the MCP server is constructed. Cache the schema
+    // tree once; clone per response because JsonNode has single-parent ownership.
+    private static JsonArray BuildToolCatalog(ToolRegistry registry)
+    {
+        var toolsArr = new JsonArray();
+        foreach (var t in registry.All)
+        {
+            toolsArr.Add(new JsonObject
+            {
+                ["name"] = t.Name,
+                ["description"] = t.Description,
+                ["inputSchema"] = t.BuildJsonSchema(),
+                ["annotations"] = new JsonObject
+                {
+                    ["title"] = t.Name,
+                    ["readOnlyHint"] = t.IsReadOnly,
+                    ["idempotentHint"] = t.IsIdempotent,
+                    // Fail conservative: a tool which can mutate state must not claim
+                    // to be non-destructive merely because it has an undo path.
+                    ["destructiveHint"] = !t.IsReadOnly,
+                    ["openWorldHint"] = t.Category is "execution" or "build" or "test" or "git" or "jobs" ||
+                        t.Name == "board_work"
+                }
+            });
+        }
+        return toolsArr;
     }
 
     public void MapEndpoints(WebApplication app)
@@ -614,28 +644,7 @@ public sealed class McpServer
 
             case "tools/list":
             {
-                var toolsArr = new JsonArray();
-                foreach (var t in _registry.All)
-                {
-                    toolsArr.Add(new JsonObject
-                    {
-                        ["name"] = t.Name,
-                        ["description"] = t.Description,
-                        ["inputSchema"] = t.BuildJsonSchema(),
-                        ["annotations"] = new JsonObject
-                        {
-                            ["title"] = t.Name,
-                            ["readOnlyHint"] = t.IsReadOnly,
-                            ["idempotentHint"] = t.IsIdempotent,
-                            // Fail conservative: a tool which can mutate state must not claim
-                            // to be non-destructive merely because it has an undo path.
-                            ["destructiveHint"] = !t.IsReadOnly,
-                            ["openWorldHint"] = t.Category is "execution" or "build" or "test" or "git" or "jobs" ||
-                                t.Name == "board_work"
-                        }
-                    });
-                }
-                var toolListResult = new JsonObject { ["tools"] = toolsArr };
+                var toolListResult = new JsonObject { ["tools"] = _toolCatalog.DeepClone() };
                 if (isStateless2026)
                 {
                     toolListResult["ttlMs"] = 30000;
@@ -675,10 +684,15 @@ public sealed class McpServer
                     _pendingToolCalls.TryRemove(requestKey, out _);
                 }
                 var structuredNode = JsonSerializer.SerializeToNode(res, AppConfig.JsonOptions) as JsonObject ?? new JsonObject();
-                // Legacy clients may only read text. Modern clients can use
-                // structuredContent, so avoid sending the same large payload twice.
-                var textPayload = structuredNode.ToJsonString();
-                if (isStateless2026 && textPayload.Length > 2_000)
+                // Explicit modes avoid duplicate data without guessing what a client
+                // can parse. Auto preserves the existing legacy protocol contract.
+                var mode = _config.Integrations.McpResultMode;
+                var textOnly = string.Equals(mode, "text", StringComparison.OrdinalIgnoreCase);
+                var structuredOnly = string.Equals(mode, "structured", StringComparison.OrdinalIgnoreCase);
+                var textPayload = structuredOnly
+                    ? new JsonObject { ["summary"] = res.Summary, ["fullResultInStructuredContent"] = true }.ToJsonString()
+                    : structuredNode.ToJsonString();
+                if (!textOnly && !structuredOnly && isStateless2026 && textPayload.Length > 2_000)
                 {
                     textPayload = new JsonObject
                     {
@@ -691,15 +705,12 @@ public sealed class McpServer
                 {
                     ["content"] = new JsonArray
                     {
-                        new JsonObject
-                        {
-                            ["type"] = "text",
-                            ["text"] = textPayload
-                        }
+                        new JsonObject { ["type"] = "text", ["text"] = textPayload }
                     },
-                    ["structuredContent"] = structuredNode,
                     ["isError"] = !res.Success
                 };
+                if (!textOnly)
+                    callResult["structuredContent"] = structuredNode;
                 return (MakeResult(idNode, callResult), null, DefaultProtocolVersion);
             }
 
