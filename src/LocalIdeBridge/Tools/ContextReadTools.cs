@@ -13,7 +13,7 @@ namespace LocalIdeBridge.Tools;
 public static class ContextReadTools
 {
     private sealed record RequestedRange(int Start, int End);
-    private sealed record RequestedFile(string Path, List<RequestedRange> Ranges);
+    private sealed record RequestedFile(string Path, List<RequestedRange> Ranges, string? IfSha256);
 
     public static IEnumerable<ToolDefinition> Create(WorkspaceGuard guard, AppConfig config)
     {
@@ -26,7 +26,7 @@ public static class ContextReadTools
             SideEffects: "None; snapshot-like read with per-file version and partial-read reporting.",
             Parameters:
             [
-                new("items", "array", "Ordered [{path, ranges?:[[startLine,endLine], ...]}]. Omitted ranges reads from line 1 up to the output cap.", Required: true,
+                new("items", "array", "[{path, ranges?:[[startLine,endLine], ...], ifSha256?:knownVersion}]. Unchanged files return metadata only. Omit ranges to read from line 1.", Required: true,
                     ItemsSchema: new JsonObject { ["type"] = "object" }),
                 new("maxBytes", "integer", "Hard cap on serialized tool data, 2048..65536 bytes. Defaults to 24000.", Default: 24000),
                 new("includeVersion", "boolean", "Include the SHA-256 of each exact byte buffer, usable as an edit precondition.", Default: true),
@@ -51,9 +51,9 @@ public static class ContextReadTools
                     ["complete"] = true,
                     ["maxBytes"] = maxBytes
                 };
-                var mapped = new Dictionary<string, JsonObject>(
+                var mapped = new Dictionary<string, RequestedFile>(
                     OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
-                const long maxFileBytes = 4L * 1024 * 1024;
+                const int maxFileBytes = 4 * 1024 * 1024;
                 var totalRanges = 0;
 
                 foreach (var entry in requested)
@@ -74,18 +74,25 @@ public static class ContextReadTools
 
                     if (mapped.TryGetValue(relative, out var existing))
                     {
-                        // Avoid re-reading the same file; duplicate request is
-                        // reported with a canonical reference, not repeated source.
-                        files.Add(new JsonObject { ["path"] = relative, ["status"] = "duplicate",
-                            ["sameAs"] = existing["path"]?.ToString() });
-                        continue;
+                        existing.Ranges.AddRange(entry.Ranges);
+                        if (!string.Equals(existing.IfSha256, entry.IfSha256, StringComparison.OrdinalIgnoreCase))
+                            mapped[relative] = existing with { IfSha256 = null };
                     }
+                    else
+                    {
+                        mapped.Add(relative, entry with { Path = relative });
+                    }
+                }
 
+                foreach (var entry in mapped.Values)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var relative = entry.Path;
                     var fileEntry = new JsonObject { ["path"] = relative };
-                    mapped[relative] = fileEntry;
                     files.Add(fileEntry);
                     try
                     {
+                        var full = guard.ResolvePath(relative);
                         if (!File.Exists(full))
                         {
                             fileEntry["status"] = "not_found";
@@ -107,7 +114,17 @@ public static class ContextReadTools
                                    FileShare.ReadWrite | FileShare.Delete, 16_384, FileOptions.SequentialScan))
                         {
                             using var buffer = new MemoryStream((int)info.Length);
-                            stream.CopyTo(buffer);
+                            var chunk = new byte[16_384];
+                            while (true)
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                var count = stream.Read(chunk, 0, Math.Min(chunk.Length,
+                                    maxFileBytes + 1 - (int)buffer.Length));
+                                if (count == 0) break;
+                                buffer.Write(chunk, 0, count);
+                                if (buffer.Length > maxFileBytes)
+                                    throw new IOException("File grew beyond the context-read cap.");
+                            }
                             bytes = buffer.ToArray();
                         }
                         if (bytes.Length > maxFileBytes)
@@ -118,6 +135,17 @@ public static class ContextReadTools
                             data["complete"] = false;
                             continue;
                         }
+                        var sha256 = includeVersion || entry.IfSha256 is not null
+                            ? Convert.ToHexStringLower(SHA256.HashData(bytes)) : null;
+                        if (includeVersion) fileEntry["sha256"] = sha256;
+                        fileEntry["sizeBytes"] = bytes.Length;
+                        if (!includeTotal && entry.IfSha256 is not null &&
+                            string.Equals(sha256, entry.IfSha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            fileEntry["status"] = "unchanged";
+                            continue;
+                        }
+
                         string[] lines;
                         using (var sr = new StreamReader(new MemoryStream(bytes, writable: false),
                                    new UTF8Encoding(false, true), detectEncodingFromByteOrderMarks: true))
@@ -131,31 +159,60 @@ public static class ContextReadTools
                                 lines = normalized.EndsWith('\n') ? split[..^1] : split;
                             }
                         }
-                        if (includeVersion)
-                            fileEntry["sha256"] = Convert.ToHexStringLower(SHA256.HashData(bytes));
-                        fileEntry["sizeBytes"] = bytes.Length;
                         if (includeTotal) fileEntry["totalLines"] = lines.Length;
+                        if (entry.IfSha256 is not null &&
+                            string.Equals(sha256, entry.IfSha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            fileEntry["status"] = "unchanged";
+                            continue;
+                        }
                         fileEntry["status"] = "complete";
                         var ranges = new JsonArray();
                         fileEntry["ranges"] = ranges;
-                        foreach (var range in entry.Ranges)
+                        foreach (var range in MergeOverlaps(entry.Ranges))
                         {
                             ct.ThrowIfCancellationRequested();
                             var startIndex = Math.Min(lines.Length, range.Start - 1);
                             var stopExclusive = Math.Min(lines.Length, range.End);
-                            var block = stopExclusive > startIndex
-                                ? string.Join("\n", lines[startIndex..stopExclusive])
-                                : "";
+                            // Bound the intermediate string before serializing, even for minified files.
+                            var block = new StringBuilder(Math.Min(maxBytes, 4096));
+                            var truncated = false;
+                            for (var i = startIndex; i < stopExclusive; i++)
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                if (i > startIndex)
+                                {
+                                    if (block.Length == maxBytes) { truncated = true; break; }
+                                    block.Append('\n');
+                                }
+                                var remaining = maxBytes - block.Length;
+                                var length = Math.Min(remaining, lines[i].Length);
+                                if (length < lines[i].Length)
+                                {
+                                    if (length > 0 && char.IsHighSurrogate(lines[i][length - 1])) length--;
+                                    truncated = true;
+                                }
+                                block.Append(lines[i].AsSpan(0, length));
+                                if (truncated) break;
+                            }
                             ranges.Add(new JsonObject
                             {
                                 ["startLine"] = range.Start,
                                 ["endLine"] = stopExclusive,
-                                ["content"] = block,
-                                ["truncated"] = false,
+                                ["content"] = block.ToString(),
+                                ["truncated"] = truncated,
                                 ["pastEof"] = range.Start > lines.Length
                             });
+                            if (truncated) data["complete"] = false;
                             totalRanges++;
                         }
+                    }
+                    catch (WorkspaceViolationException)
+                    {
+                        fileEntry.Clear();
+                        fileEntry["path"] = "denied";
+                        fileEntry["status"] = "denied";
+                        data["complete"] = false;
                     }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DecoderFallbackException or ArgumentException)
                     {
@@ -239,9 +296,30 @@ public static class ContextReadTools
                 ranges.Add(new RequestedRange(1, 2000));
             totalRanges += ranges.Count;
             if (totalRanges > 64) throw new ArgumentException("At most 64 ranges are allowed per context request.");
-            files.Add(new RequestedFile(path, ranges));
+            var ifSha256 = obj.OptionalString("ifSha256");
+            if (ifSha256 is not null && (ifSha256.Length != 64 || !ifSha256.All(Uri.IsHexDigit)))
+                throw new ArgumentException("ifSha256 must be a 64-character SHA-256 hex digest.");
+            files.Add(new RequestedFile(path, ranges, ifSha256));
         }
         return files;
+    }
+
+    // Overlapping ranges share source; adjacent independent ranges retain their boundaries.
+    private static IEnumerable<RequestedRange> MergeOverlaps(List<RequestedRange> ranges)
+    {
+        RequestedRange? pending = null;
+        foreach (var range in ranges.OrderBy(r => r.Start).ThenBy(r => r.End))
+        {
+            if (pending is null) pending = range;
+            else if (range.Start <= pending.End)
+                pending = new RequestedRange(pending.Start, Math.Max(pending.End, range.End));
+            else
+            {
+                yield return pending;
+                pending = range;
+            }
+        }
+        if (pending is not null) yield return pending;
     }
 
     private static bool LooksBinary(byte[] bytes)

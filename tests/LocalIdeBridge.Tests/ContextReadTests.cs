@@ -68,6 +68,41 @@ public sealed class ContextReadTests
     }
 
     [Fact]
+    public async Task DuplicatePathsCombineRangesAndKnownVersionSkipsSource()
+    {
+        await using var sb = await TestSandbox.CreateAsync(startListener: false);
+        var path = Path.Combine(sb.WorkspaceDir, "source.txt");
+        await File.WriteAllTextAsync(path, "A\nB\nC\nD\nE\n");
+        var first = await sb.Host.Registry.InvokeAsync("read_context", new JsonObject
+        {
+            ["items"] = new JsonArray(
+                new JsonObject { ["path"] = "source.txt", ["ranges"] = new JsonArray(new JsonArray(1, 3)) },
+                new JsonObject { ["path"] = "source.txt", ["ranges"] = new JsonArray(new JsonArray(2, 4)) })
+        });
+        Assert.True(first.Success, first.ErrorMessage);
+        var file = Data(first.Data).GetProperty("files")[0];
+        Assert.Equal("A\nB\nC\nD", file.GetProperty("ranges")[0].GetProperty("content").GetString());
+        Assert.Equal(1, Data(first.Data).GetProperty("files").GetArrayLength());
+        var args = new JsonObject
+        {
+            ["items"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "source.txt", ["ifSha256"] = file.GetProperty("sha256").GetString()
+            })
+        };
+        var unchanged = await sb.Host.Registry.InvokeAsync("read_context", args);
+        Assert.True(unchanged.Success, unchanged.ErrorMessage);
+        var unchangedFile = Data(unchanged.Data).GetProperty("files")[0];
+        Assert.Equal("unchanged", unchangedFile.GetProperty("status").GetString());
+        Assert.False(unchangedFile.TryGetProperty("ranges", out _));
+        await File.AppendAllTextAsync(path, "F\n");
+        var changed = await sb.Host.Registry.InvokeAsync("read_context", args);
+        Assert.True(changed.Success, changed.ErrorMessage);
+        Assert.Equal("A\nB\nC\nD\nE\nF", Data(changed.Data).GetProperty("files")[0]
+            .GetProperty("ranges")[0].GetProperty("content").GetString());
+    }
+
+    [Fact]
     public async Task RejectsTooManyRangesBeforeAnyRead()
     {
         await using var sb = await TestSandbox.CreateAsync(startListener: false);
