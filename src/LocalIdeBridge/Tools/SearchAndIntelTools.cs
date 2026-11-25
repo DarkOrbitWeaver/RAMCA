@@ -270,8 +270,18 @@ public sealed class SearchAndIntelTools
                 var usedRoslyn = false;
                 var usedFallback = false;
                 var pattern = args.OptionalString("filePattern");
-                var glob = string.IsNullOrWhiteSpace(pattern) ? null : WorkspaceTools.PatternToMatcher(pattern);
-                bool MatchesFile(string path) => glob is null || glob.IsMatch(path) || glob.IsMatch(Path.GetFileName(path));
+                var normalizedPattern = string.IsNullOrWhiteSpace(pattern) ? null : pattern.Replace('\\', '/');
+                var glob = normalizedPattern is null ? null : WorkspaceTools.PatternToMatcher(normalizedPattern);
+                bool MatchesFile(string path)
+                {
+                    if (normalizedPattern is null) return true;
+                    var name = Path.GetFileName(path);
+                    if (glob is not null) return glob.IsMatch(path) || glob.IsMatch(name);
+                    // PatternToMatcher returns null for literal filenames, not just
+                    // an absent filter. A literal path must still restrict results.
+                    return string.Equals(path, normalizedPattern, StringComparison.OrdinalIgnoreCase) ||
+                           string.Equals(name, normalizedPattern, StringComparison.OrdinalIgnoreCase);
+                }
 
                 if (_config.Integrations.EnableRoslynSemantic)
                 {
