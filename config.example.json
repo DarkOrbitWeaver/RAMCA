@@ -92,6 +92,7 @@
     "enableOpenApi": true,
     "enableMcpSseStream": true,
     "mcpResultMode": "auto",
-    "advertiseAgentBoardTools": false
+    "advertiseAgentBoardTools": false,
+    "mcpToolProfile": "compact"
   }
 }

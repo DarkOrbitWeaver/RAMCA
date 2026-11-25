@@ -117,6 +117,27 @@ public sealed class ModernMcpAndJobResilienceTests
         Assert.Contains(tools, t => t?["name"]?.GetValue<string>() == "read_context");
     }
 
+    [Fact]
+    public async Task CompactDiscoveryKeepsSpecialistsReachableWithoutAdvertisingTheirSchemas()
+    {
+        await using var sb = await TestSandbox.CreateAsync(
+            cfg => cfg.Integrations.McpToolProfile = "compact");
+        using var client = sb.CreateClient();
+        using var request = Post(Request("tools/list"));
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var tools = JsonNode.Parse(await response.Content.ReadAsStringAsync())!["result"]!["tools"]!.AsArray();
+        Assert.Equal(18, tools.Count);
+        Assert.DoesNotContain(tools, t => t?["name"]?.GetValue<string>() == "inspect_type");
+        var schema = await sb.Host.Registry.InvokeAsync("tool_discover", new JsonObject { ["query"] = "inspect_type" });
+        Assert.True(schema.Success, schema.ErrorMessage);
+        Assert.Contains("inputSchema", JsonSerializer.Serialize(schema.Data));
+        var read = await sb.Host.Registry.InvokeAsync("tool_read", new JsonObject { ["tool"] = "workspace_status" });
+        Assert.True(read.Success, read.ErrorMessage);
+        var refused = await sb.Host.Registry.InvokeAsync("tool_read", new JsonObject { ["tool"] = "delete_file" });
+        Assert.Equal("read_only_required", refused.ErrorCode);
+    }
+
     [Theory]
     [InlineData("text")]
     [InlineData("structured")]

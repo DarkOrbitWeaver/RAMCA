@@ -65,7 +65,7 @@ public sealed class ConnectionInstructions
         sb.AppendLine("- The secret key is intentionally omitted from these instructions; obtain it via **Copy Key** and store it in your client's secret/env configuration.");
         sb.AppendLine();
         sb.AppendLine("## Tool Discovery & Quick Verification");
-        sb.AppendLine("1. **Discover tools:** MCP `tools/list` on `/mcp`, `GET /api/v1/tools`, or `LocalIdeBridge cli tools --json`.");
+        sb.AppendLine("1. **Discover tools:** MCP `tools/list`; use `tool_discover` for specialist schemas, `tool_read` for specialist reads, and `execute_once` for mutations. HTTP and CLI can list the full catalog.");
         sb.AppendLine("2. **Inspect active workspace:** Call `workspace_status` and `repo_tree` (or `POST /api/v1/tools/workspace_status/invoke` with `{}`).");
         sb.AppendLine("3. **Test & edit loop:** `project_discover` -> `read_file` (note `sha256`) -> `apply_patch` / `replace_range` -> `dotnet_build` -> `dotnet_test` -> `git_commit`.");
         sb.AppendLine();

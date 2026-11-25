@@ -224,6 +224,8 @@ public sealed class IntegrationSettings
     public string McpResultMode { get; set; } = "auto";
     /// <summary>Opt in to advertising multi-agent tools in the MCP catalog.</summary>
     public bool AdvertiseAgentBoardTools { get; set; }
+    /// <summary>standard preserves direct tool discovery; compact exposes routine tools plus on-demand discovery.</summary>
+    public string McpToolProfile { get; set; } = "standard";
 }
 
 /// <summary>

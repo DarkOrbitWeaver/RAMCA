@@ -4,7 +4,7 @@ Copy this document (or press **`I`** in LocalIdeBridge / run `LocalIdeBridge.exe
 
 ## What You Are Connected To
 
-`LocalIdeBridge` exposes 68 software-engineering tools confined to a user-trusted workspace folder on a Windows PC.
+`LocalIdeBridge` exposes 70 software-engineering tools confined to a user-trusted workspace folder on a Windows PC.
 
 - **MCP Streamable HTTP:** `<BASE_URL>/mcp` (`POST` JSON-RPC 2.0, `GET` SSE, `DELETE` session)
 - **HTTP/HTTPS JSON API:** `<BASE_URL>/api/v1` (OpenAPI 3.1 schema at `<BASE_URL>/openapi.json`)
@@ -53,3 +53,7 @@ Set `integrations.mcpResultMode` in `config.json` to `text` for clients that con
 For repeated reads, supply `ifSha256` for each file only when you already have the requested content at that version. An unchanged file returns metadata without source. Duplicate paths and overlapping ranges are combined. Use the returned version to guard edits.
 
 Single-agent MCP discovery is the default: the ten `board_*` schemas are omitted without removing their registry implementations. To use the multi-chat board, set `integrations.advertiseAgentBoardTools` to `true`, restart RAMCA, and refresh the client's tools. HTTP/CLI discovery remains complete. This is a context optimization, not a security boundary.
+
+## Compact MCP discovery
+
+Set `integrations.mcpToolProfile` to `compact` and restart RAMCA to advertise only 18 routine tools (plus the board if enabled). Use `tool_discover` with an exact name to obtain its schema; `tool_read` invokes discovered read-only operations; `execute_once` or `job_start` runs specialist mutations. No tools are removed from the registry. The existing `standard` profile preserves direct discovery and remains the default for existing configurations. Refresh the client catalog after changing profiles.
