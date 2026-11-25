@@ -431,10 +431,10 @@ public sealed class SearchAndIntelTools
                 {
                     var escaped = Regex.Escape(symbolName);
                     var rx = new Regex($@"\b(?:class|interface|struct|record|enum|function|def|type)\s+{escaped}\b", RegexOptions.None, TimeSpan.FromMilliseconds(300));
-                    var (fallback, _, _) = ScanLines(ws, null, 20, l => { var m = rx.Match(l); return m.Success ? m.Index + 1 : -1; }, ct);
+                    var (fallback, _, truncated) = ScanRegexFallback(ws, rx, 20, ct);
                     return Task.FromResult(ToolResult.Ok(
                         $"Found {fallback.Count} candidate definition(s) via text fallback.",
-                        new { engine = "text-fallback", isSemantic = false, count = fallback.Count, definitions = fallback }));
+                        new { engine = "text-fallback", isSemantic = false, count = fallback.Count, truncated, definitions = fallback }));
                 }
 
                 return Task.FromResult(ToolResult.Ok("No definition found at specified location.",
@@ -540,7 +540,7 @@ public sealed class SearchAndIntelTools
                 if (!string.IsNullOrWhiteSpace(fallbackName))
                 {
                     var rx = new Regex($@"\b{Regex.Escape(fallbackName)}\b", RegexOptions.None, TimeSpan.FromMilliseconds(300));
-                    var (matches, _, truncated) = ScanLines(ws, null, maxResults, l => { var m = rx.Match(l); return m.Success ? m.Index + 1 : -1; }, ct);
+                    var (matches, _, truncated) = ScanRegexFallback(ws, rx, maxResults, ct);
                     return Task.FromResult(ToolResult.Ok(
                         $"Found {matches.Count} whole-word text match(es) (non-semantic fallback).",
                         new { engine = "text-fallback", isSemantic = false, count = matches.Count, truncated, references = matches }));
@@ -817,6 +817,23 @@ public sealed class SearchAndIntelTools
                     : ToolResult.Fail(exec.TimedOut ? "timeout" : exec.Cancelled ? "cancelled" : "build_failed",
                         summary, diagnosticPayload, exec.ExecutionId);
             });
+    }
+
+    private (List<object> Matches, int FilesScanned, bool Truncated) ScanRegexFallback(
+        string workspace, Regex regex, int maxResults, CancellationToken ct)
+    {
+        var timedOut = false;
+        Func<string, int> match = line =>
+        {
+            try
+            {
+                var hit = regex.Match(line);
+                return hit.Success ? hit.Index + 1 : -1;
+            }
+            catch (RegexMatchTimeoutException) { timedOut = true; return -1; }
+        };
+        return ScanLines(workspace, null, maxResults, [(null, match)],
+            allowLongLines: false, ct, () => timedOut);
     }
 
     private (List<object> Matches, int FilesScanned, bool Truncated) ScanLines(
