@@ -32,18 +32,19 @@ public sealed class JobManager : IDisposable
 
     private void SignalChange(string jobId)
     {
-        _jobSignals.AddOrUpdate(jobId, _ => NewSignal(),
-            (_, previous) =>
-            {
-                previous.TrySetResult(true);
-                return NewSignal();
-            });
+        // Never recreate a signal after a completed job has been retired.
+        while (_jobSignals.TryGetValue(jobId, out var previous))
+        {
+            if (!_jobSignals.TryUpdate(jobId, NewSignal(), previous)) continue;
+            previous.TrySetResult(true);
+            return;
+        }
     }
 
     /// <summary>Waits without polling; caller must recheck durable state before and after registration.</summary>
     public async Task<bool> WaitForChangeAsync(string jobId, Func<bool> hasUpdate, int waitMs, CancellationToken ct)
     {
-        var observed = _jobSignals.GetOrAdd(jobId, _ => NewSignal());
+        if (!_jobSignals.TryGetValue(jobId, out var observed)) return hasUpdate();
         if (hasUpdate()) return true; // Covers notification before registration.
         if (waitMs <= 0) return false;
         try
@@ -113,8 +114,8 @@ public sealed class JobManager : IDisposable
                 if (_active.Count >= capacity)
                     throw new InvalidOperationException($"queue_full: {capacity} background jobs are already admitted.");
                 _db.CreateJob(jobId, sessionId, ws, tool.Name, serializedArgs, tool.IsIdempotent);
+                _jobSignals[jobId] = NewSignal();
                 _active[jobId] = new RunningJob(jobId, cts, completion.Task);
-                SignalChange(jobId);
             }
         }
         catch
@@ -194,8 +195,8 @@ public sealed class JobManager : IDisposable
         }
         finally
         {
-            SignalChange(jobId);
-            _jobSignals.TryRemove(jobId, out _); // No per-completed-job resident waiter.
+            if (_jobSignals.TryRemove(jobId, out var finalSignal))
+                finalSignal.TrySetResult(true); // Wake waiters without retaining completed IDs.
             if (gateAcquired)
             {
                 try { _concurrencyGate.Release(); }

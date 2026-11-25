@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using LocalIdeBridge.Core;
@@ -61,14 +62,16 @@ public static class JobAndWorkflowTools
             SideEffects: "None.",
             Parameters:
             [
-                new("jobId", "string", "Job identifier returned by job_start.", Required: true)
+                new("jobId", "string", "Job identifier returned by job_start.", Required: true),
+                new("includeResult", "boolean", "Include final result payload; false for lightweight status.", Default: true)
             ],
             Handler: (args, _, _) =>
             {
                 var jobId = args.RequireString("jobId");
-                var job = db.GetJob(jobId) ?? throw new KeyNotFoundException($"Job '{jobId}' not found.");
+                var includeResult = args.OptionalBool("includeResult", true);
+                var job = db.GetJob(jobId, includeResult) ?? throw new KeyNotFoundException($"Job '{jobId}' not found.");
                 JsonNode? parsedResult = null;
-                if (!string.IsNullOrWhiteSpace(job.ResultJson))
+                if (includeResult && !string.IsNullOrWhiteSpace(job.ResultJson))
                 {
                     try { parsedResult = JsonNode.Parse(job.ResultJson); } catch { }
                 }
@@ -111,7 +114,7 @@ public static class JobAndWorkflowTools
                 var part = db.ReadJobResultSlice(jobId, args.OptionalInt("offset", 0), args.OptionalInt("maxChars", 16000));
                 return Task.FromResult(ToolResult.Ok("Returned a paginated job-result slice.", new
                 {
-                    jobId, offset = part.Offset, hasMore = part.HasMore, content = part.Content
+                    jobId, offset = part.Offset, hasMore = part.HasMore, nextOffset = part.HasMore ? (int?)(part.Offset + part.Content.Length) : null, content = part.Content
                 }));
             });
 
@@ -163,7 +166,9 @@ public static class JobAndWorkflowTools
                 new("jobId", "string", "Job identifier.", Required: true),
                 new("afterEventId", "integer", "Return only events strictly greater than this ID.", Default: 0),
                 new("limit", "integer", "Maximum events returned (1-200).", Default: 100),
-                new("waitMs", "integer", "Optional event-driven wait for progress or completion, 0..25000 milliseconds.", Default: 0)
+                new("waitMs", "integer", "Event-driven wait, 0..25000 milliseconds.", Default: 0),
+                new("waitForTerminal", "boolean", "Wait for completion rather than each progress event.", Default: false),
+                new("includeResult", "boolean", "Include final result when terminal, avoiding another status call.", Default: false)
             ],
             Handler: async (args, _, ct) =>
             {
@@ -171,27 +176,42 @@ public static class JobAndWorkflowTools
                 var after = Math.Max(0, args.OptionalLong("afterEventId", 0));
                 var limit = args.OptionalInt("limit", 100);
                 var wait = Math.Clamp(args.OptionalInt("waitMs", 0), 0, 25_000);
-                var job = db.GetJob(jobId) ?? throw new KeyNotFoundException($"Job '{jobId}' not found.");
+                var waitForTerminal = args.OptionalBool("waitForTerminal", false);
+                var includeResult = args.OptionalBool("includeResult", false);
+                var job = db.GetJob(jobId, includeResult: false) ?? throw new KeyNotFoundException($"Job '{jobId}' not found.");
                 var evts = db.ListJobEvents(jobId, after, limit);
                 static bool Terminal(string status) => status is "succeeded" or "failed" or "timed_out" or
                     "cancelled" or "interrupted_restart";
-                if (evts.Count == 0 && !Terminal(job.Status) && wait > 0)
+                var start = Stopwatch.GetTimestamp();
+                while (!Terminal(job.Status) && (waitForTerminal || evts.Count == 0))
                 {
-                    // Registration before this repeated read closes the missed-wake race.
-                    await jobs.WaitForChangeAsync(jobId, () =>
+                    var remaining = wait - (int)Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                    if (remaining <= 0) break;
+                    // Register before checking durable state to avoid missing the terminal signal.
+                    var changed = await jobs.WaitForChangeAsync(jobId, () =>
                     {
-                        var latest = db.GetJob(jobId);
+                        var latest = db.GetJob(jobId, includeResult: false);
                         return latest is null || Terminal(latest.Status) ||
-                            db.ListJobEvents(jobId, after, 1).Count > 0;
-                    }, wait, ct).ConfigureAwait(false);
-                    job = db.GetJob(jobId) ?? throw new KeyNotFoundException($"Job '{jobId}' expired while waiting.");
-                    evts = db.ListJobEvents(jobId, after, limit);
+                            (!waitForTerminal && db.ListJobEvents(jobId, after, 1).Count > 0);
+                    }, remaining, ct).ConfigureAwait(false);
+                    job = db.GetJob(jobId, includeResult: false) ?? throw new KeyNotFoundException($"Job '{jobId}' expired while waiting.");
+                    if (!waitForTerminal || Terminal(job.Status))
+                        evts = db.ListJobEvents(jobId, after, limit);
+                    if (!changed) break;
+                }
+                if (waitForTerminal) evts = db.ListJobEvents(jobId, after, limit);
+                JsonNode? result = null;
+                if (includeResult && Terminal(job.Status))
+                {
+                    var completed = db.GetJob(jobId);
+                    if (!string.IsNullOrWhiteSpace(completed?.ResultJson))
+                        result = JsonNode.Parse(completed.ResultJson);
                 }
                 var lastId = evts.Count > 0 ? evts[^1].Id : after;
                 return ToolResult.Ok(
                     $"Retrieved {evts.Count} event(s) for job '{jobId}' (status={job.Status}).",
                     new { jobId, jobStatus = job.Status, lastEventId = lastId, changed = evts.Count > 0,
-                        terminal = Terminal(job.Status), count = evts.Count, events = evts, logExecId = job.LogExecId });
+                        terminal = Terminal(job.Status), count = evts.Count, events = evts, logExecId = job.LogExecId, result });
             });
 
         yield return new ToolDefinition(

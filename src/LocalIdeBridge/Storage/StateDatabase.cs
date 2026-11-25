@@ -768,7 +768,7 @@ public sealed class StateDatabase : IDisposable
 
     public (string Content, int Offset, int TotalChars, bool HasMore) ReadJobResultSlice(string jobId, int offset, int limit)
     {
-        if (GetJob(jobId) is null) throw new KeyNotFoundException($"Job '{jobId}' not found.");
+        if (GetJob(jobId, includeResult: false) is null) throw new KeyNotFoundException($"Job '{jobId}' not found.");
         var path = Path.Combine(_paths.DataDir, "job-results", PortablePaths.SanitizeId(jobId) + ".json");
         if (!File.Exists(path)) throw new FileNotFoundException("No spilled result exists for this job.");
         offset = Math.Max(0, offset);
@@ -795,15 +795,17 @@ public sealed class StateDatabase : IDisposable
         return (new string(chars, 0, Math.Min(limit, read)), offset, -1, read > limit);
     }
 
-    public JobRecord? GetJob(string jobId)
+    public JobRecord? GetJob(string jobId, bool includeResult = true)
     {
         using var conn = OpenConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, session_id, workspace, tool_name, status, is_idempotent, created_at, started_at, completed_at, result_json, error_message, log_exec_id
+            SELECT id, session_id, workspace, tool_name, status, is_idempotent, created_at, started_at, completed_at,
+                   CASE WHEN $includeResult = 1 THEN result_json ELSE NULL END, error_message, log_exec_id
             FROM jobs WHERE id = $id;
             """;
         cmd.Parameters.AddWithValue("$id", jobId);
+        cmd.Parameters.AddWithValue("$includeResult", includeResult ? 1 : 0);
         using var r = cmd.ExecuteReader();
         return r.Read() ? ReadJob(r) : null;
     }
